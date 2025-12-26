@@ -53,10 +53,10 @@ chatForm.addEventListener('submit', async (e) => {
   promptInput.value = '';
 
   const isUrl = /^https?:\/\//i.test(text);
-  const action = isUrl ? 'navigate' : 'navigate'; // you can expand to parse commands
+  const action = isUrl ? 'navigate' : 'ai'; // use AI brain for natural language commands
 
   try {
-    const res = await api.execute(action, isUrl ? { url: text } : {});
+    const res = await api.execute(action, isUrl ? { url: text } : { prompt: text });
     if (res.screenshot) {
       screenshotImg.src = res.screenshot;
       screenshotImg.hidden = false;
