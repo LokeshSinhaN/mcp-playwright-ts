@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>MCP Playwright UI</title>
+    <script type="module" crossorigin src="/assets/index-7mErr2Fz.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-CR8X-yJk.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="app-logo">MCP Playwright</div>
+        <div class="app-header-meta">
+          <div id="ws-status-dot" class="status-dot disconnected"></div>
+          <span id="ws-status-text" class="ws-status-text">Connecting...</span>
+        </div>
+        <div class="app-header-actions">
+          <span class="pill pill-muted">v1.0.0</span>
+        </div>
+      </header>
+
+      <main class="app-main">
+        <section class="panel panel-chat">
+          <div class="panel-inner">
+            <div class="section-header">
+              <div class="section-icon">💬</div>
+              <div>
+                <div class="section-title">Execution Stream</div>
+                <div class="section-subtitle">Playwright + Selenium code generation</div>
+              </div>
+            </div>
+
+            <div class="prompt-card">
+              <div class="prompt-label">Prompt</div>
+              <div class="prompt-body">Type a URL or high-level command.</div>
+            </div>
+
+            <div id="chat-log" class="chat-log"></div>
+
+            <form id="chat-form" class="chat-input">
+              <div class="chat-input-wrapper">
+                <textarea
+                  id="prompt-input"
+                  class="chat-textarea"
+                  placeholder="https://example.com or 'click login button'"
+                  rows="3"
+                ></textarea>
+                <button type="submit" class="chat-send-btn">
+                  <span class="chat-send-icon">→</span>
+                </button>
+              </div>
+              <div class="chat-hint">Enter to send, Shift+Enter for newline</div>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel panel-preview">
+          <div class="panel-inner">
+            <div class="browser-toolbar">
+              <div class="browser-controls">
+                <div class="dot dot-red"></div>
+                <div class="dot dot-amber"></div>
+                <div class="dot dot-green"></div>
+              </div>
+              <div class="browser-url-bar">
+                <span class="browser-lock">🔒</span>
+                <input
+                  class="browser-url-input"
+                  placeholder="https://example.com"
+                  type="text"
+                />
+              </div>
+              <div class="browser-actions">
+                <button id="take-screenshot-btn" class="toolbar-btn">📸</button>
+                <button id="close-session-btn" class="toolbar-btn toolbar-btn-danger">
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div class="browser-content">
+              <div id="browser-placeholder" class="browser-placeholder">
+                <div class="placeholder-title">Browser Preview</div>
+                <div class="placeholder-text">
+                  Navigate to a page to see live Playwright screenshots and extracted selectors.
+                </div>
+              </div>
+              <img
+                id="browser-screenshot"
+                class="browser-screenshot"
+                alt="Browser screenshot"
+                hidden
+              />
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+  </body>
+</html>
