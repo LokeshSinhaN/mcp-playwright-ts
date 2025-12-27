@@ -14,7 +14,9 @@ export function createServer(port: number, chromePath?: string) {
   const browser = new BrowserManager({
     headless: true,
     timeoutMs: 30000,
-    viewport: { width: 1280, height: 720 },
+    // Use a larger viewport to approximate a maximized browser window in
+    // the preview UI.
+    viewport: { width: 1600, height: 900 },
     chromePath
   });
   const tools = new McpTools(browser);

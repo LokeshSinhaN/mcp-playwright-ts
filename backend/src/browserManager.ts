@@ -15,7 +15,9 @@ export class BrowserManager {
     this.config = {
       headless: config.headless ?? true,
       timeoutMs: config.timeoutMs ?? 30000,
-      viewport: config.viewport ?? { width: 1280, height: 720 },
+      // Use a larger default viewport so screenshots look less "zoomed out"
+      // in the preview UI, and more like a maximized browser window.
+      viewport: config.viewport ?? { width: 1600, height: 900 },
       chromePath: config.chromePath
     };
   }
@@ -63,7 +65,10 @@ export class BrowserManager {
 
   async screenshot(): Promise<string> {
     const page = this.getPage();
-    const buf = await page.screenshot({ fullPage: true });
+    // Capture only the current viewport at a larger size instead of a full-page
+    // tall image. This makes the preview appear closer to a maximized view
+    // instead of a shrunk-down full-page thumbnail.
+    const buf = await page.screenshot({ fullPage: false });
     const base64 = buf.toString('base64');
     const dataUrl = `data:image/png;base64,${base64}`;
     this.state.lastScreenshot = dataUrl;
