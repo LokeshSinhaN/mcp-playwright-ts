@@ -32,13 +32,15 @@ body {
 }
 
 .app-shell {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 1.5rem;
+  width: 100%;
+  max-width: none; /* let layout span full viewport width */
+  margin: 0; /* remove centering margins */
+  padding: 1.25rem 1.5rem 1.5rem;
   display: flex;
   flex-direction: column;
   gap: 1.25rem;
   height: 100%;
+  box-sizing: border-box;
 }
 
 .app-header {
