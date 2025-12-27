@@ -59,6 +59,10 @@ export function createServer(port: number, chromePath?: string) {
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: `type in ${selector}` });
           result = await tools.type(selector, text);
           break;
+        case 'handle_cookie_banner':
+          broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'handle_cookie_banner' });
+          result = await tools.handleCookieBanner();
+          break;
         case 'extract_selectors':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'extract_selectors' });
           result = await tools.extractSelectors(selector);

@@ -9,6 +9,11 @@ export class McpTools {
   async navigate(url: string): Promise<ExecutionResult> {
     await this.browser.init();
     await this.browser.goto(url);
+
+    // Best-effort cookie/consent banner handling so subsequent
+    // clicks (e.g. LOGIN, ACCEPT) are less likely to time out.
+    await this.browser.handleCookieBanner();
+
     const screenshot = await this.browser.screenshot();
     return { success: true, message: `Navigated to ${url}`, screenshot };
   }
@@ -23,6 +28,16 @@ export class McpTools {
     await this.browser.type(selector, text);
     const screenshot = await this.browser.screenshot();
     return { success: true, message: `Typed into ${selector}`, screenshot };
+  }
+
+  async handleCookieBanner(): Promise<ExecutionResult> {
+    const dismissed = await this.browser.handleCookieBanner();
+    const screenshot = await this.browser.screenshot();
+    return {
+      success: true,
+      message: dismissed ? 'Cookie banner dismissed' : 'No cookie banner detected',
+      screenshot
+    };
   }
 
   async extractSelectors(targetSelector?: string): Promise<ExecutionResult> {

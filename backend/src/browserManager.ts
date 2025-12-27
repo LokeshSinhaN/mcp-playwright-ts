@@ -20,6 +20,10 @@ export class BrowserManager {
     };
   }
 
+  private get defaultTimeout(): number {
+    return this.config.timeoutMs;
+  }
+
   async init(): Promise<void> {
     if (this.browser) return; // idempotent
 
@@ -53,7 +57,7 @@ export class BrowserManager {
 
   async goto(url: string): Promise<void> {
     const page = this.getPage();
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.goto(url, { waitUntil: 'networkidle' });
     this.state.currentUrl = page.url();
   }
 
@@ -66,25 +70,67 @@ export class BrowserManager {
     return dataUrl;
   }
 
+  /**
+   * Clicks an element in a more robust way than page.click:
+   *  - waits for it to become visible
+   *  - scrolls it into view
+   *  - then performs the click
+   */
   async click(selector: string): Promise<void> {
     const page = this.getPage();
-    await page.click(selector);
+    const locator = page.locator(selector).first();
+
+    await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
+    await locator.scrollIntoViewIfNeeded();
+    await locator.click({ timeout: this.defaultTimeout });
   }
 
   async type(selector: string, text: string): Promise<void> {
     const page = this.getPage();
-    await page.fill(selector, '');
-    await page.type(selector, text);
+    const locator = page.locator(selector).first();
+
+    await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
+    await locator.fill('');
+    await locator.type(text, { timeout: this.defaultTimeout });
   }
 
   async waitFor(selector: string, timeoutMs = 5000): Promise<void> {
     const page = this.getPage();
-    await page.waitForSelector(selector, { timeout: timeoutMs });
+    await page.waitForSelector(selector, { timeout: timeoutMs, state: 'visible' });
   }
 
   async pageSource(): Promise<string> {
     const page = this.getPage();
     return page.content();
+  }
+
+  /**
+   * Best-effort handler for common cookie/consent banners.
+   * It silently does nothing if no banner is found.
+   * Returns true if a banner was detected and dismissed.
+   */
+  async handleCookieBanner(): Promise<boolean> {
+    const page = this.getPage();
+
+    const candidates = [
+      page.getByRole('button', { name: /accept( all)? cookies/i }),
+      page.getByRole('button', { name: /i agree/i }),
+      page.locator('button', { hasText: /accept cookies/i })
+    ];
+
+    for (const locator of candidates) {
+      try {
+        if (await locator.isVisible({ timeout: 2000 })) {
+          await locator.scrollIntoViewIfNeeded();
+          await locator.click({ timeout: 5000 });
+          return true;
+        }
+      } catch {
+        // Ignore individual locator timeouts; move to next candidate.
+      }
+    }
+
+    return false;
   }
 
   isOpen(): boolean {
