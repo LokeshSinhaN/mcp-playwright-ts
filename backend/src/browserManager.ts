@@ -72,14 +72,43 @@ export class BrowserManager {
 
   /**
    * Clicks an element in a more robust way than page.click:
-   *  - waits for it to become visible
-   *  - scrolls it into view
-   *  - then performs the click
+   *  - for plain CSS/XPath selectors: waits for visibility and clicks the first match
+   *  - for Playwright text selectors (e.g. "text=LOGIN"): prefers ARIA roles
+   *    like button/link with that accessible name, to avoid hitting headings
    */
   async click(selector: string): Promise<void> {
     const page = this.getPage();
-    const locator = page.locator(selector).first();
 
+    // Heuristic: if the selector is of the form `text=Something`, try to
+    // resolve it as a button/link first. This avoids cases like headings
+    // that contain the same text but are not actually clickable.
+    const textPrefix = 'text=';
+    if (selector.startsWith(textPrefix)) {
+      const rawText = selector.slice(textPrefix.length).replace(/^['"]|['"]$/g, '');
+      const escaped = rawText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const nameRegex = new RegExp(`^${escaped}$`, 'i');
+
+      const candidates = [
+        page.getByRole('button', { name: nameRegex }),
+        page.getByRole('link', { name: nameRegex }),
+        page.getByText(rawText, { exact: true })
+      ];
+
+      for (const loc of candidates) {
+        try {
+          if ((await loc.count()) === 0) continue;
+          await loc.first().waitFor({ state: 'visible', timeout: this.defaultTimeout });
+          await loc.first().scrollIntoViewIfNeeded();
+          await loc.first().click({ timeout: this.defaultTimeout });
+          return;
+        } catch {
+          // If this candidate fails, fall through to the next one.
+        }
+      }
+      // If all heuristics fail, fall back to the generic locator logic below.
+    }
+
+    const locator = page.locator(selector).first();
     await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
     await locator.scrollIntoViewIfNeeded();
     await locator.click({ timeout: this.defaultTimeout });
