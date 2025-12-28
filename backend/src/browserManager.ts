@@ -1,5 +1,6 @@
 import { chromium, Browser, BrowserContext, Page, Locator } from 'playwright';
 import { BrowserConfig, ElementInfo, SessionState } from './types';
+import { SelectorExtractor } from './selectorExtractor';
 
 export class BrowserManager {
   private browser: Browser | null = null;
@@ -79,8 +80,9 @@ export class BrowserManager {
    * Smart locator resolution that:
    * 1. Parses "engine-like" selectors (text=, label=, etc.)
    * 2. Handles AI-generated CSS (input[placeholder=...]) with fuzzy matching
-   * 3. Searches across ALL frames (iframes), not just the main page
-   * 4. Returns the first Locator that is visible, or the "best guess" to wait on.
+   * 3. Handles plain semantic text like "Login" or "Search diseases and conditions"
+   * 4. Searches across ALL frames (iframes), not just the main page
+   * 5. Returns the first Locator that is visible, or the "best guess" to wait on.
    */
   private async smartLocate(selector: string, timeoutMs: number): Promise<Locator> {
     const page = this.getPage();
@@ -90,8 +92,11 @@ export class BrowserManager {
     const getCandidates = (scope: Page | typeof frames[0]) => {
       const candidates: Locator[] = [];
 
+      // Normalize selector for regex use
+      const raw = selector.trim();
+
       // 1. Smart Inputs (placeholder/aria-label) with fuzzy matching
-      const placeholderCss = selector.match(/input\[placeholder=(['\"])(.*?)\1\]/i);
+      const placeholderCss = raw.match(/input\[placeholder=(['\"])(.*?)\1\]/i);
       if (placeholderCss) {
         const value = placeholderCss[2].trim();
         const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -99,7 +104,7 @@ export class BrowserManager {
         candidates.push(scope.getByPlaceholder(new RegExp(escaped, 'i')));
       }
 
-      const ariaLabelCss = selector.match(/input\[aria-label=(['\"])(.*?)\1\]/i);
+      const ariaLabelCss = raw.match(/input\[aria-label=(['\"])(.*?)\1\]/i);
       if (ariaLabelCss) {
         const value = ariaLabelCss[2].trim();
         const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -107,41 +112,59 @@ export class BrowserManager {
       }
 
       // 2. Engine-style prefixes (text=, label=, etc.)
-      const engineLike = /^[a-zA-Z]+=/i.test(selector) && !selector.includes('>>');
+      const engineLike = /^[a-zA-Z]+=/i.test(raw) && !raw.includes('>>');
       if (engineLike) {
-        const parts = selector.split('=');
+        const parts = raw.split('=');
         const prefix = parts[0].trim().toLowerCase();
         const value = parts.slice(1).join('=').trim().replace(/^['\"]|['\"]$/g, '');
         const fuzzyRegex = new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
 
         switch (prefix) {
           case 'text':
-             // Try exact, then button/link role, then fuzzy text
-             candidates.push(scope.getByRole('button', { name: fuzzyRegex }));
-             candidates.push(scope.getByRole('link', { name: fuzzyRegex }));
-             candidates.push(scope.getByText(fuzzyRegex));
-             break;
+            // Try exact, then button/link role, then fuzzy text
+            candidates.push(scope.getByRole('button', { name: fuzzyRegex }));
+            candidates.push(scope.getByRole('link', { name: fuzzyRegex }));
+            candidates.push(scope.getByText(fuzzyRegex));
+            break;
           case 'label':
-             candidates.push(scope.getByLabel(fuzzyRegex));
-             break;
+            candidates.push(scope.getByLabel(fuzzyRegex));
+            break;
           case 'placeholder':
-             candidates.push(scope.getByPlaceholder(fuzzyRegex));
-             break;
+            candidates.push(scope.getByPlaceholder(fuzzyRegex));
+            break;
           case 'alt':
-             candidates.push(scope.getByAltText(fuzzyRegex));
-             break;
+            candidates.push(scope.getByAltText(fuzzyRegex));
+            break;
           case 'title':
-             candidates.push(scope.getByTitle(fuzzyRegex));
-             break;
+            candidates.push(scope.getByTitle(fuzzyRegex));
+            break;
           case 'testid':
-             candidates.push(scope.getByTestId(value)); // testid usually strict
-             break;
+            candidates.push(scope.getByTestId(value)); // testid usually strict
+            break;
         }
       }
 
-      // 3. Fallback / Standard selector
+      // 3. Plain semantic text like "Login" or "Search diseases and conditions"
+      const looksLikePlainText = !/[#.[\]=:>]/.test(raw) && !engineLike;
+      if (looksLikePlainText && raw.length > 0) {
+        const fuzzy = new RegExp(
+          raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'),
+          'i'
+        );
+
+        // buttons/links labeled with this text
+        candidates.push(scope.getByRole('button', { name: fuzzy }));
+        candidates.push(scope.getByRole('link', { name: fuzzy }));
+        // search fields or inputs associated with this text
+        candidates.push(scope.getByPlaceholder(fuzzy));
+        candidates.push(scope.getByLabel(fuzzy));
+        // final text search fallback
+        candidates.push(scope.getByText(fuzzy));
+      }
+
+      // 4. Fallback / Standard selector
       // If we haven't matched a special pattern, or just as a fallback, treat as standard selector
-      candidates.push(scope.locator(selector));
+      candidates.push(scope.locator(raw));
 
       return candidates;
     };
@@ -152,11 +175,11 @@ export class BrowserManager {
       for (const loc of candidates) {
         try {
           // Check if attached & visible without waiting too long
-          if (await loc.first().isVisible({ timeout: 100 })) {
+          if (await loc.first().isVisible({ timeout: Math.min(250, timeoutMs) })) {
             return loc.first();
           }
         } catch {
-           // Ignore errors during scan
+          // Ignore errors during scan
         }
       }
     }
@@ -165,7 +188,26 @@ export class BrowserManager {
     // main page using the "best" candidate.
     // We prioritize the fuzzy matcher if we generated one, otherwise the raw selector.
     const mainCandidates = getCandidates(page);
-    return mainCandidates[0].first();
+    const primary = mainCandidates[0].first();
+
+    // Special-case heuristic: if the selector mentions "search" and the primary
+    // candidate resolves to nothing, fall back to any visible search-like input.
+    try {
+      if (/search/i.test(selector) && (await primary.count()) === 0) {
+        const searchLike = page
+          .locator('input, textarea, [role="textbox"], [type="search"]')
+          .filter({
+            has: page.locator('text=/search/i')
+          });
+        if (await searchLike.count()) {
+          return searchLike.first();
+        }
+      }
+    } catch {
+      // ignore and fall back to primary
+    }
+
+    return primary;
   }
 
   /**
@@ -202,19 +244,43 @@ export class BrowserManager {
     return base;
   }
 
-  async click(selector: string): Promise<void> {
+  async click(selector: string): Promise<ElementInfo> {
     // 1. Find best locator (frames, fuzzy, etc.)
     const locator = await this.smartLocate(selector, this.defaultTimeout);
 
     // 2. Wait for it to be ready
     await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
     await locator.scrollIntoViewIfNeeded();
-    
+
+    // 3. Extract robust info before clicking (in case click navigates away)
+    let info: ElementInfo | undefined;
+    try {
+      const handle = await locator.elementHandle();
+      if (handle) {
+        const extractor = new SelectorExtractor(this.getPage());
+        info = await extractor.extractFromHandle(handle);
+      }
+    } catch (e) {
+      // ignore extraction errors, proceed to click
+    }
+
     // 3. Click
     await locator.click({ timeout: this.defaultTimeout });
+
+    // Re-resolve if we failed to extract before? No, strict flow.
+    // If we couldn't extract, we return a dummy info or throw?
+    // We'll return the info if we got it, or a basic one.
+    if (info) return info;
+    
+    // Fallback if extraction failed (shouldn't happen often)
+    return {
+      tagName: 'unknown',
+      attributes: {},
+      cssSelector: selector // better than nothing
+    };
   }
 
-  async type(selector: string, text: string): Promise<void> {
+  async type(selector: string, text: string): Promise<ElementInfo> {
     // 1. Find best locator
     const base = await this.smartLocate(selector, this.defaultTimeout);
     
@@ -223,6 +289,17 @@ export class BrowserManager {
 
     // 3. Type
     await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
+    
+    // Extract info
+    let info: ElementInfo | undefined;
+    try {
+      const handle = await locator.elementHandle();
+      if (handle) {
+        const extractor = new SelectorExtractor(this.getPage());
+        info = await extractor.extractFromHandle(handle);
+      }
+    } catch (e) {}
+
     try {
       await locator.fill('');
     } catch (err) {
@@ -230,6 +307,8 @@ export class BrowserManager {
       throw new Error(`Unable to fill element found by "${selector}": ${msg}`);
     }
     await locator.type(text, { timeout: this.defaultTimeout });
+    
+    return info || { tagName: 'input', attributes: {}, cssSelector: selector };
   }
 
   async waitFor(selector: string, timeoutMs = 5000): Promise<void> {

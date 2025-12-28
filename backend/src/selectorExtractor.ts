@@ -11,7 +11,7 @@ export class SelectorExtractor {
 
     const results: ElementInfo[] = [];
     for (const h of handles) {
-      const info = await this.fromHandle(h);
+      const info = await this.extractFromHandle(h);
       results.push(info);
     }
 
@@ -21,10 +21,10 @@ export class SelectorExtractor {
   async extractForSelector(selector: string): Promise<ElementInfo> {
     const handle = await this.page.$(selector);
     if (!handle) throw new Error(`Element not found: ${selector}`);
-    return this.fromHandle(handle);
+    return this.extractFromHandle(handle);
   }
 
-  private async fromHandle(handle: ElementHandle): Promise<ElementInfo> {
+  async extractFromHandle(handle: ElementHandle): Promise<ElementInfo> {
     const base = await handle.evaluate((el: any) => {
       return {
         tagName: el.tagName.toLowerCase(),

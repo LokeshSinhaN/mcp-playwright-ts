@@ -69,8 +69,12 @@ export function createServer(port: number, chromePath?: string) {
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'extract_selectors' });
           result = await tools.extractSelectors(selector);
           break;
+        case 'observe':
+          broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'observe' });
+          result = await tools.observe(selector);
+          break;
         case 'generate_selenium':
-          if (!commands || !Array.isArray(commands)) throw new Error('commands array required');
+          // We allow commands to be optional now, defaulting to session history
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'generate_selenium' });
           result = await tools.generateSelenium(commands);
           break;
