@@ -1,4 +1,4 @@
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
+import { chromium, Browser, BrowserContext, Page, Locator } from 'playwright';
 import { BrowserConfig, ElementInfo, SessionState } from './types';
 
 export class BrowserManager {
@@ -76,63 +76,166 @@ export class BrowserManager {
   }
 
   /**
-   * Clicks an element in a more robust way than page.click:
-   *  - for plain CSS/XPath selectors: waits for visibility and clicks the first match
-   *  - for Playwright text selectors (e.g. "text=LOGIN"): prefers ARIA roles
-   *    like button/link with that accessible name, to avoid hitting headings
+   * Smart locator resolution that:
+   * 1. Parses "engine-like" selectors (text=, label=, etc.)
+   * 2. Handles AI-generated CSS (input[placeholder=...]) with fuzzy matching
+   * 3. Searches across ALL frames (iframes), not just the main page
+   * 4. Returns the first Locator that is visible, or the "best guess" to wait on.
    */
-  async click(selector: string): Promise<void> {
+  private async smartLocate(selector: string, timeoutMs: number): Promise<Locator> {
     const page = this.getPage();
+    const frames = [page, ...page.frames().filter(f => f !== page.mainFrame())];
 
-    // Heuristic: if the selector is of the form `text=Something`, try to
-    // resolve it as a button/link first. This avoids cases like headings
-    // that contain the same text but are not actually clickable.
-    const textPrefix = 'text=';
-    if (selector.startsWith(textPrefix)) {
-      const rawText = selector.slice(textPrefix.length).replace(/^['"]|['"]$/g, '');
-      const escaped = rawText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const nameRegex = new RegExp(`^${escaped}$`, 'i');
+    // Helper to generate candidate locators for a given frame/page
+    const getCandidates = (scope: Page | typeof frames[0]) => {
+      const candidates: Locator[] = [];
 
-      const candidates = [
-        page.getByRole('button', { name: nameRegex }),
-        page.getByRole('link', { name: nameRegex }),
-        page.getByText(rawText, { exact: true })
-      ];
+      // 1. Smart Inputs (placeholder/aria-label) with fuzzy matching
+      const placeholderCss = selector.match(/input\[placeholder=(['\"])(.*?)\1\]/i);
+      if (placeholderCss) {
+        const value = placeholderCss[2].trim();
+        const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Fuzzy match: contains text, case insensitive
+        candidates.push(scope.getByPlaceholder(new RegExp(escaped, 'i')));
+      }
 
-      for (const loc of candidates) {
-        try {
-          if ((await loc.count()) === 0) continue;
-          await loc.first().waitFor({ state: 'visible', timeout: this.defaultTimeout });
-          await loc.first().scrollIntoViewIfNeeded();
-          await loc.first().click({ timeout: this.defaultTimeout });
-          return;
-        } catch {
-          // If this candidate fails, fall through to the next one.
+      const ariaLabelCss = selector.match(/input\[aria-label=(['\"])(.*?)\1\]/i);
+      if (ariaLabelCss) {
+        const value = ariaLabelCss[2].trim();
+        const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        candidates.push(scope.getByLabel(new RegExp(escaped, 'i')));
+      }
+
+      // 2. Engine-style prefixes (text=, label=, etc.)
+      const engineLike = /^[a-zA-Z]+=/i.test(selector) && !selector.includes('>>');
+      if (engineLike) {
+        const parts = selector.split('=');
+        const prefix = parts[0].trim().toLowerCase();
+        const value = parts.slice(1).join('=').trim().replace(/^['\"]|['\"]$/g, '');
+        const fuzzyRegex = new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+
+        switch (prefix) {
+          case 'text':
+             // Try exact, then button/link role, then fuzzy text
+             candidates.push(scope.getByRole('button', { name: fuzzyRegex }));
+             candidates.push(scope.getByRole('link', { name: fuzzyRegex }));
+             candidates.push(scope.getByText(fuzzyRegex));
+             break;
+          case 'label':
+             candidates.push(scope.getByLabel(fuzzyRegex));
+             break;
+          case 'placeholder':
+             candidates.push(scope.getByPlaceholder(fuzzyRegex));
+             break;
+          case 'alt':
+             candidates.push(scope.getByAltText(fuzzyRegex));
+             break;
+          case 'title':
+             candidates.push(scope.getByTitle(fuzzyRegex));
+             break;
+          case 'testid':
+             candidates.push(scope.getByTestId(value)); // testid usually strict
+             break;
         }
       }
-      // If all heuristics fail, fall back to the generic locator logic below.
+
+      // 3. Fallback / Standard selector
+      // If we haven't matched a special pattern, or just as a fallback, treat as standard selector
+      candidates.push(scope.locator(selector));
+
+      return candidates;
+    };
+
+    // Phase 1: Quick Scan - check all frames for immediate visibility
+    for (const frame of frames) {
+      const candidates = getCandidates(frame);
+      for (const loc of candidates) {
+        try {
+          // Check if attached & visible without waiting too long
+          if (await loc.first().isVisible({ timeout: 100 })) {
+            return loc.first();
+          }
+        } catch {
+           // Ignore errors during scan
+        }
+      }
     }
 
-    const locator = page.locator(selector).first();
+    // Phase 2: If nothing found immediately, we default to waiting on the
+    // main page using the "best" candidate.
+    // We prioritize the fuzzy matcher if we generated one, otherwise the raw selector.
+    const mainCandidates = getCandidates(page);
+    return mainCandidates[0].first();
+  }
+
+  /**
+   * Given a base locator that might point at a wrapper element, return a
+   * locator that actually targets a fillable control.
+   */
+  private async resolveFillTarget(base: Locator): Promise<Locator> {
+    // (Existing logic kept, but ensured it's robust)
+    try {
+        const candidate = base.first();
+        if (await candidate.count() === 0) return candidate; // let it fail naturally later
+
+        const handle = await candidate.elementHandle().catch(() => null);
+        if (handle) {
+        const isFillable = await handle.evaluate((el: any) => {
+            const tag = (el.tagName || '').toLowerCase();
+            if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+            if (el.isContentEditable) return true;
+            const role = typeof el.getAttribute === 'function' ? el.getAttribute('role') : null;
+            return role === 'textbox' || role === 'combobox';
+        });
+        if (isFillable) return candidate;
+        }
+
+        const descendant = base.locator(
+        'input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]'
+        );
+        if ((await descendant.count()) > 0) {
+        return descendant.first();
+        }
+    } catch {
+        // ignore errors during resolution
+    }
+    return base;
+  }
+
+  async click(selector: string): Promise<void> {
+    // 1. Find best locator (frames, fuzzy, etc.)
+    const locator = await this.smartLocate(selector, this.defaultTimeout);
+
+    // 2. Wait for it to be ready
     await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
     await locator.scrollIntoViewIfNeeded();
+    
+    // 3. Click
     await locator.click({ timeout: this.defaultTimeout });
   }
 
   async type(selector: string, text: string): Promise<void> {
-    const page = this.getPage();
-    const locator = page.locator(selector).first();
+    // 1. Find best locator
+    const base = await this.smartLocate(selector, this.defaultTimeout);
+    
+    // 2. Drill down to input if it's a wrapper
+    const locator = await this.resolveFillTarget(base);
 
+    // 3. Type
     await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
-    await locator.fill('');
+    try {
+      await locator.fill('');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Unable to fill element found by "${selector}": ${msg}`);
+    }
     await locator.type(text, { timeout: this.defaultTimeout });
   }
 
   async waitFor(selector: string, timeoutMs = 5000): Promise<void> {
-    const page = this.getPage();
-    await page.waitForSelector(selector, { timeout: timeoutMs, state: 'visible' });
+    const locator = await this.smartLocate(selector, timeoutMs);
+    await locator.waitFor({ state: 'visible', timeout: timeoutMs });
   }
-
   async pageSource(): Promise<string> {
     const page = this.getPage();
     return page.content();

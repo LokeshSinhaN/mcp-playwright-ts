@@ -129,7 +129,9 @@ body {
 
 .app-main {
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.2fr);
+  /* Give the browser preview a bit more horizontal space so screenshots
+     appear larger without needing to zoom/crop them. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr);
   gap: 1.25rem;
   flex: 1;
   min-height: 0; /* allow child panels to shrink and scroll */
@@ -384,7 +386,9 @@ body {
   border-radius: 0.8rem;
   background: #020617;
   border: 1px solid rgba(15, 23, 42, 1);
-  overflow-y: auto; /* scroll inside browser preview if content is taller */
+  /* Allow scrolling if the screenshot is taller than the preview area,
+     while keeping the image crisp and not overly zoomed. */
+  overflow-y: auto;
   min-height: 0;
   flex: 1;
   display: flex;
@@ -411,10 +415,12 @@ body {
 }
 
 .browser-screenshot {
+  /* Always stretch the screenshot to the full width of the preview column.
+     The height can exceed the container and will be scrollable. */
   width: 100%;
   height: auto;
   display: block;
-  object-fit: contain; /* show full page screenshot without distortion */
+  object-fit: contain;
 }
 
 @media (max-width: 960px) {
