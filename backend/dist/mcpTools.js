@@ -16,6 +16,28 @@ class McpTools {
     async click(selector, context = {}) {
         // Support multiple fallback selectors in a single string, separated by "||".
         const page = this.browser.getPage();
+        const promptText = context && typeof context.prompt === 'string' ? context.prompt : '';
+        // If the user refers to a previously listed "option N", honor that first by
+        // using the persisted smartMatches from the last ambiguous click.
+        const optionMatch = promptText && promptText.match(/option\s+(\d+)/i);
+        if (optionMatch) {
+            const optionIndex = Number(optionMatch[1]);
+            if (Number.isFinite(optionIndex) && optionIndex > 0) {
+                try {
+                    await this.browser.clickSmartOption(optionIndex);
+                    const screenshot = await this.browser.screenshot();
+                    return {
+                        success: true,
+                        message: `Clicked smart option ${optionIndex} from previous suggestions`,
+                        screenshot
+                    };
+                }
+                catch (err) {
+                    // Fall through to the rest of the logic if the stored options
+                    // are not available or clicking fails.
+                }
+            }
+        }
         const raw = selector == null ? '' : String(selector);
         const candidates = raw
             .split('||')
@@ -36,7 +58,6 @@ class McpTools {
                 lastError = err;
             }
         }
-        const promptText = context && typeof context.prompt === 'string' ? context.prompt : '';
         let extraInfo = '';
         // Intelligent DOM-based fallback using the natural-language prompt, if available.
         if (promptText) {

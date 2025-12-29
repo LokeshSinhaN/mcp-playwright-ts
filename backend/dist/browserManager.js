@@ -9,7 +9,8 @@ class BrowserManager {
         this.page = null;
         this.state = {
             isOpen: false,
-            selectors: new Map()
+            selectors: new Map(),
+            smartMatches: []
         };
         this.config = {
             headless: config.headless ?? true,
@@ -200,7 +201,39 @@ class BrowserManager {
                 if (typeAttr === 'search') {
                     score += 3;
                 }
-                candidates.push({ el, score, meta: describe(el) });
+                const cssPath = (el) => {
+                    if (el.id)
+                        return `#${el.id}`;
+                    const parts = [];
+                    let curr = el;
+                    const doc = el.ownerDocument || document;
+                    while (curr && curr !== doc.body) {
+                        let part = curr.tagName.toLowerCase();
+                        if (curr.id) {
+                            part += `#${curr.id}`;
+                            parts.unshift(part);
+                            break;
+                        }
+                        const classes = (curr.className || '')
+                            .split(/\s+/)
+                            .filter(Boolean)
+                            .slice(0, 2)
+                            .map((c) => `.${c}`);
+                        if (classes.length)
+                            part += classes.join('');
+                        const parent = curr.parentElement;
+                        if (parent) {
+                            const siblings = Array.from(parent.children);
+                            const index = siblings.indexOf(curr) + 1;
+                            if (index > 0)
+                                part += `:nth-child(${index})`;
+                        }
+                        parts.unshift(part);
+                        curr = parent;
+                    }
+                    return parts.join(' > ');
+                };
+                candidates.push({ el, score, meta: Object.assign(Object.assign({}, describe(el)), { cssSelector: cssPath(el) }) });
             }
             if (!candidates.length) {
                 return { clicked: false, matches: [] };
@@ -219,6 +252,9 @@ class BrowserManager {
                 matches: candidates.map((c, idx) => (Object.assign({ index: idx + 1, score: c.score }, c.meta)))
             };
         }, terms);
+        // Persist the last smart matches so a follow-up command like "option 1" can
+        // directly reference them without relying on the LLM.
+        this.state.smartMatches = Array.isArray(result === null || result === void 0 ? void 0 : result.matches) ? result.matches : [];
         return result;
     }
     async type(selector, text) {
@@ -236,6 +272,19 @@ class BrowserManager {
     }
     isOpen() {
         return this.state.isOpen && !!this.page;
+    }
+    async clickSmartOption(index) {
+        const page = this.getPage();
+        const matches = Array.isArray(this.state.smartMatches) ? this.state.smartMatches : [];
+        const match = matches.find((m) => m.index === index);
+        if (!match) {
+            const available = matches.map((m) => m.index).join(', ') || 'none';
+            throw new Error(`No stored smart option ${index}. Available options: ${available}`);
+        }
+        if (!match.cssSelector) {
+            throw new Error(`Stored smart option ${index} is missing a cssSelector`);
+        }
+        await page.click(match.cssSelector);
     }
     storeSelector(key, info) {
         this.state.selectors.set(key, info);
