@@ -163,10 +163,21 @@ class McpTools {
         const page = this.browser.getPage();
         const promptText = context && typeof context.prompt === 'string' ? context.prompt : '';
         const raw = selector == null ? '' : String(selector);
-        const candidates = raw
+        const state = this.browser.getState ? this.browser.getState() : null;
+        const fromContext = state && typeof state.lastFocusedSelector === 'string'
+            ? state.lastFocusedSelector
+            : null;
+        const candidatesFromSelector = raw
             .split('||')
             .map((s) => s.trim())
             .filter((s) => s.length > 0);
+        const candidates = [];
+        if (fromContext)
+            candidates.push(fromContext);
+        for (const sel of candidatesFromSelector) {
+            if (!candidates.includes(sel))
+                candidates.push(sel);
+        }
         const tried = [];
         let lastError = null;
         const toTry = candidates.length ? candidates : (raw ? [raw] : []);

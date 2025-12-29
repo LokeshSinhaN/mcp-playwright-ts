@@ -10,7 +10,8 @@ class BrowserManager {
         this.state = {
             isOpen: false,
             selectors: new Map(),
-            smartMatches: []
+            smartMatches: [],
+            lastFocusedSelector: undefined
         };
         this.config = {
             headless: config.headless ?? true,
@@ -255,6 +256,16 @@ class BrowserManager {
         // Persist the last smart matches so a follow-up command like "option 1" can
         // directly reference them without relying on the LLM.
         this.state.smartMatches = Array.isArray(result === null || result === void 0 ? void 0 : result.matches) ? result.matches : [];
+        // If we uniquely clicked something, prefer that element for subsequent type
+        // commands by storing its selector as the last focused control.
+        if (result && result.clicked && Array.isArray(result.matches) && result.matches.length) {
+            const chosen = typeof result.chosenIndex === 'number'
+                ? result.matches.find((m) => m.index === result.chosenIndex) || result.matches[0]
+                : result.matches[0];
+            if (chosen && chosen.cssSelector) {
+                this.state.lastFocusedSelector = chosen.cssSelector;
+            }
+        }
         return result;
     }
     async type(selector, text) {
@@ -285,6 +296,9 @@ class BrowserManager {
             throw new Error(`Stored smart option ${index} is missing a cssSelector`);
         }
         await page.click(match.cssSelector);
+        // Remember which element we interacted with so follow-up "type" commands
+        // can reuse the same control without re-discovering it.
+        this.state.lastFocusedSelector = match.cssSelector;
     }
     storeSelector(key, info) {
         this.state.selectors.set(key, info);
