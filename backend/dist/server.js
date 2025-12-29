@@ -164,7 +164,7 @@ function createServer(port, chromePath) {
                                     if (!step.selector || step.text == null)
                                         throw new Error(`Step ${idx} missing selector or text`);
                                     broadcast({ type: 'action', timestamp: ts, message: `type in ${step.selector}` });
-                                    lastResult = await tools.type(step.selector, step.text);
+                                    lastResult = await tools.type(step.selector, step.text, { prompt });
                                     break;
                                 case 'wait':
                                     {
