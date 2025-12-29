@@ -62,6 +62,165 @@ class BrowserManager {
         const page = this.getPage();
         await page.click(selector);
     }
+    async smartClickFromPrompt(prompt) {
+        const page = this.getPage();
+        const raw = typeof prompt === 'string' ? prompt : '';
+        const lower = raw.toLowerCase();
+        const words = lower.match(/[a-z0-9]+/g) || [];
+        const seen = new Set();
+        const stopWords = new Set([
+            'click',
+            'tap',
+            'press',
+            'the',
+            'a',
+            'an',
+            'on',
+            'into',
+            'in',
+            'to',
+            'of',
+            'box',
+            'field',
+            'input',
+            'button',
+            'link',
+            'icon',
+            'text',
+            'textbox',
+            'type',
+            'open',
+            'page',
+            'tab'
+        ]);
+        const terms = [];
+        for (const w of words) {
+            if (w.length < 3)
+                continue;
+            if (stopWords.has(w))
+                continue;
+            if (seen.has(w))
+                continue;
+            seen.add(w);
+            terms.push(w);
+        }
+        if (lower.includes('search') && !terms.includes('search')) {
+            terms.push('search');
+        }
+        if (!terms.length) {
+            return { clicked: false, matches: [] };
+        }
+        const result = await page.evaluate((searchTerms) => {
+            const lowerTerms = searchTerms.map((t) => t.toLowerCase());
+            const interactiveSelectors = 'input, button, a, textarea, select, [role=button], [role=link], [onclick]';
+            const els = Array.from(document.querySelectorAll(interactiveSelectors));
+            const candidates = [];
+            const combinedText = (el) => {
+                const aria = el.getAttribute('aria-label') || '';
+                const placeholder = el.getAttribute('placeholder') || '';
+                const title = el.getAttribute('title') || '';
+                const nameAttr = el.getAttribute('name') || '';
+                const text = (el.innerText || el.textContent || '');
+                return (aria + ' ' + placeholder + ' ' + title + ' ' + nameAttr + ' ' + text).toLowerCase();
+            };
+            const isVisible = (el) => {
+                const style = window.getComputedStyle(el);
+                if (style.visibility === 'hidden' || style.display === 'none') {
+                    return false;
+                }
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) {
+                    return false;
+                }
+                return true;
+            };
+            const describe = (el) => {
+                const rect = el.getBoundingClientRect();
+                const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                const horiz = cx < vw / 3 ? 'left' : cx > (2 * vw) / 3 ? 'right' : 'center';
+                const vert = cy < vh / 3 ? 'top' : cy > (2 * vh) / 3 ? 'bottom' : 'middle';
+                const positionDescription = `${vert} ${horiz}`.trim();
+                const ariaLabel = el.getAttribute('aria-label') || '';
+                const placeholder = el.getAttribute('placeholder') || '';
+                const nameAttr = el.getAttribute('name') || '';
+                const ownText = (el.textContent || '').trim();
+                let label = ariaLabel || placeholder || nameAttr || ownText;
+                if (!label && el.tagName) {
+                    label = el.tagName.toLowerCase();
+                }
+                let context = '';
+                let ancestor = el.parentElement;
+                while (ancestor && !context) {
+                    const t = (ancestor.innerText || '').trim();
+                    if (t) {
+                        context = t;
+                        break;
+                    }
+                    ancestor = ancestor.parentElement;
+                }
+                if (context.length > 80) {
+                    context = context.slice(0, 77) + '...';
+                }
+                const summaryParts = [];
+                if (label)
+                    summaryParts.push(`"${label}"`);
+                if (positionDescription)
+                    summaryParts.push(`at ${positionDescription} of page`);
+                return {
+                    positionDescription,
+                    label,
+                    context,
+                    summary: summaryParts.join(' ')
+                };
+            };
+            for (const el of els) {
+                if (!isVisible(el))
+                    continue;
+                const full = combinedText(el);
+                let score = 0;
+                for (const term of lowerTerms) {
+                    const idx = full.indexOf(term);
+                    if (idx >= 0) {
+                        score += 10;
+                        if (idx === 0 || /\s/.test(full[idx - 1])) {
+                            score += 5;
+                        }
+                    }
+                }
+                if (!score)
+                    continue;
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'input' || tag === 'textarea') {
+                    score += 4;
+                }
+                const typeAttr = (el.getAttribute('type') || '').toLowerCase();
+                if (typeAttr === 'search') {
+                    score += 3;
+                }
+                candidates.push({ el, score, meta: describe(el) });
+            }
+            if (!candidates.length) {
+                return { clicked: false, matches: [] };
+            }
+            // Sort by descending score so the best options are first.
+            candidates.sort((a, b) => b.score - a.score);
+            const shouldClick = candidates.length === 1;
+            const best = candidates[0];
+            if (shouldClick && best && best.el) {
+                best.el.scrollIntoView({ block: 'center', inline: 'center' });
+                best.el.click();
+            }
+            return {
+                clicked: shouldClick && !!best,
+                chosenIndex: shouldClick ? 1 : null,
+                matches: candidates.map((c, idx) => (Object.assign({ index: idx + 1, score: c.score }, c.meta)))
+            };
+        }, terms);
+        return result;
+    }
     async type(selector, text) {
         const page = this.getPage();
         await page.fill(selector, '');

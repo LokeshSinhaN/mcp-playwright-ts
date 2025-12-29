@@ -56,7 +56,9 @@ async function callGeminiSteps(prompt) {
         'Use as few steps as possible (1-4).',
         'Supported actions: "navigate", "click", "type", "wait".',
         'For navigate, set "url".',
-        'For click/type, set "selector" to a Playwright selector. Prefer text selectors like `text=Login`.',
+        'For click/type, set "selector" to a Playwright selector string.',
+        'When the target element is ambiguous (e.g. "search box", "login field"), you may include up to 3 fallback selectors separated by "||" in the same selector string, ordered from most specific/robust to most generic.',
+        'Prefer text/role/label based selectors over raw tag/attribute guesses.',
         'For type, also set "text".',
         'For wait, set "waitMs" (milliseconds).',
         'Respond with ONLY JSON in this exact shape and nothing else:',
@@ -156,7 +158,7 @@ function createServer(port, chromePath) {
                                     if (!step.selector)
                                         throw new Error(`Step ${idx} missing selector`);
                                     broadcast({ type: 'action', timestamp: ts, message: `click ${step.selector}` });
-                                    lastResult = await tools.click(step.selector);
+                                    lastResult = await tools.click(step.selector, { prompt });
                                     break;
                                 case 'type':
                                     if (!step.selector || step.text == null)
