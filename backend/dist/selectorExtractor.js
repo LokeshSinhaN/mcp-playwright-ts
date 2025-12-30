@@ -9,7 +9,7 @@ class SelectorExtractor {
         const handles = await this.page.$$('button, a, input, textarea, select, [role=button], [role=link], [onclick]');
         const results = [];
         for (const h of handles) {
-            const info = await this.fromHandle(h);
+            const info = await this.extractFromHandle(h);
             results.push(info);
         }
         return results;
@@ -18,16 +18,47 @@ class SelectorExtractor {
         const handle = await this.page.$(selector);
         if (!handle)
             throw new Error(`Element not found: ${selector}`);
-        return this.fromHandle(handle);
+        return this.extractFromHandle(handle);
     }
-    async fromHandle(handle) {
+    async extractFromHandle(handle) {
         const base = await handle.evaluate((el) => {
+            const win = el.ownerDocument && el.ownerDocument.defaultView;
+            const rect = el.getBoundingClientRect();
+            const style = win ? win.getComputedStyle(el) : null;
+            const visible = !!el.offsetParent &&
+                rect.width > 0 &&
+                rect.height > 0 &&
+                (!style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
+            const tagName = (el.tagName || '').toLowerCase();
+            let roleHint = 'other';
+            if (tagName === 'button')
+                roleHint = 'button';
+            else if (tagName === 'a')
+                roleHint = 'link';
+            else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select')
+                roleHint = 'input';
+            const typeAttr = (el.getAttribute && el.getAttribute('type')) || '';
+            const placeholder = (el.getAttribute && el.getAttribute('placeholder')) || '';
+            const ariaLabel = (el.getAttribute && el.getAttribute('aria-label')) || '';
+            const isSearchField = tagName === 'input' &&
+                (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
+            const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
+            let region = 'main';
+            if (rect.top < viewportHeight * 0.25)
+                region = 'header';
+            else if (rect.top > viewportHeight * 0.75)
+                region = 'footer';
             return {
-                tagName: el.tagName.toLowerCase(),
+                tagName,
                 id: el.id || undefined,
                 className: el.className || undefined,
                 text: el.textContent?.trim() || undefined,
-                ariaLabel: el.getAttribute('aria-label') || undefined,
+                ariaLabel,
+                visible,
+                roleHint,
+                searchField: isSearchField,
+                region,
+                boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
                 attrs: Array.from(el.attributes).map((a) => [a.name, a.value])
             };
         });
@@ -41,6 +72,11 @@ class SelectorExtractor {
             ariaLabel: base.ariaLabel,
             cssSelector,
             xpath,
+            visible: base.visible,
+            roleHint: base.roleHint,
+            searchField: base.searchField,
+            region: base.region,
+            boundingBox: base.boundingBox,
             attributes: Object.fromEntries(base.attrs)
         };
     }

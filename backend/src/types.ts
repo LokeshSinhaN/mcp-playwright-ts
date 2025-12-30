@@ -13,6 +13,16 @@ export interface ElementInfo {
   ariaLabel?: string;
   cssSelector?: string;
   xpath?: string;
+  // Rough visibility heuristic so the AI can ignore hidden elements.
+  visible?: boolean;
+  // High-level role hint to help reasoning about elements.
+  roleHint?: 'button' | 'link' | 'input' | 'other';
+  // True if this looks like a search input field.
+  searchField?: boolean;
+  // Approximate vertical region of the page.
+  region?: 'header' | 'main' | 'footer';
+  // Bounding box (CSS pixels, viewport-relative).
+  boundingBox?: { x: number; y: number; width: number; height: number };
   attributes: Record<string, string | undefined>;
 }
 

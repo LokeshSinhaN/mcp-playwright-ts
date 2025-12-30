@@ -6,294 +6,109 @@ const seleniumGenerator_1 = require("./seleniumGenerator");
 class McpTools {
     constructor(browser) {
         this.browser = browser;
+        this.sessionHistory = [];
     }
     async navigate(url) {
         await this.browser.init();
         await this.browser.goto(url);
+        this.sessionHistory.push({ action: 'navigate', target: url });
+        // Best-effort cookie/consent banner handling so subsequent
+        // clicks (e.g. LOGIN, ACCEPT) are less likely to time out.
+        await this.browser.handleCookieBanner();
         const screenshot = await this.browser.screenshot();
         return { success: true, message: `Navigated to ${url}`, screenshot };
     }
-    async click(selector, context = {}) {
-        // Support multiple fallback selectors in a single string, separated by "||".
+    /**
+     * Click an element, always returning a structured result.
+     * On failure we include the latest screenshot and a snapshot of
+     * interactive elements so the LLM can retry or ask clarifying questions.
+     */
+    async click(selector) {
         const page = this.browser.getPage();
-        const promptText = context && typeof context.prompt === 'string' ? context.prompt : '';
-        // If the user refers to a previously listed "option N", honor that first by
-        // using the persisted smartMatches from the last ambiguous click.
-        const optionMatch = promptText && promptText.match(/option\s+(\d+)/i);
-        if (optionMatch) {
-            const optionIndex = Number(optionMatch[1]);
-            if (Number.isFinite(optionIndex) && optionIndex > 0) {
-                try {
-                    await this.browser.clickSmartOption(optionIndex);
-                    const screenshot = await this.browser.screenshot();
-                    return {
-                        success: true,
-                        message: `Clicked smart option ${optionIndex} from previous suggestions`,
-                        screenshot
-                    };
-                }
-                catch (err) {
-                    // Fall through to the rest of the logic if the stored options
-                    // are not available or clicking fails.
-                }
-            }
+        const extractor = new selectorExtractor_1.SelectorExtractor(page);
+        try {
+            const info = await this.browser.click(selector);
+            // Use the robust CSS from the extraction if available, otherwise fallback
+            const robustSelector = info.cssSelector || selector;
+            this.sessionHistory.push({ action: 'click', target: robustSelector });
+            const screenshot = await this.browser.screenshot();
+            return {
+                success: true,
+                message: `Clicked ${selector}`,
+                screenshot,
+                selectors: [info]
+            };
         }
-        const raw = selector == null ? '' : String(selector);
-        const candidates = raw
-            .split('||')
-            .map((s) => s.trim())
-            .filter((s) => s.length > 0);
-        const tried = [];
-        let lastError = null;
-        const toTry = candidates.length ? candidates : (raw ? [raw] : []);
-        for (const sel of toTry) {
-            tried.push(sel);
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const screenshot = await this.browser.screenshot().catch(() => undefined);
+            let selectors;
             try {
-                await page.click(sel);
-                const screenshot = await this.browser.screenshot();
-                const suffix = toTry.length > 1 ? ` (matched using \"${sel}\")` : '';
-                return { success: true, message: `Clicked ${sel}${suffix}`, screenshot };
+                selectors = await extractor.extractAllInteractive();
             }
-            catch (err) {
-                lastError = err;
+            catch {
+                selectors = undefined;
             }
+            return {
+                success: false,
+                message: msg,
+                error: msg,
+                screenshot,
+                selectors
+            };
         }
-        let extraInfo = '';
-        // Intelligent DOM-based fallback using the natural-language prompt, if available.
-        if (promptText) {
-            try {
-                const smart = await this.browser.smartClickFromPrompt(promptText);
-                if (smart && smart.clicked) {
-                    const screenshot = await this.browser.screenshot();
-                    const chosen = smart.chosenIndex && Array.isArray(smart.matches)
-                        ? smart.matches.find((m) => m.index === smart.chosenIndex)
-                        : null;
-                    const desc = chosen
-                        ? ` Smart-selected option ${smart.chosenIndex}: ${chosen.label || chosen.summary || ''}.`
-                        : '';
-                    return {
-                        success: true,
-                        message: `Smart-clicked element based on prompt \"${promptText}\".${desc}`,
-                        screenshot,
-                        smart
-                    };
-                }
-                if (smart && Array.isArray(smart.matches) && smart.matches.length) {
-                    const lines = smart.matches.map((m) => {
-                        const parts = [];
-                        if (m.label)
-                            parts.push(`labeled \"${m.label}\"`);
-                        if (m.context)
-                            parts.push(`inside section containing text \"${m.context}\"`);
-                        if (m.positionDescription)
-                            parts.push(`around the ${m.positionDescription} of the page`);
-                        return `${m.index}. ${parts.join(', ')}`;
-                    });
-                    extraInfo =
-                        ` Could not uniquely identify an element from the description. Possible matches based on the page DOM:\n` +
-                            lines.join('\n');
-                }
-            }
-            catch (_a) {
-                // Best-effort only; ignore errors from smart DOM analysis.
-            }
-        }
-        // If we still haven't helped the user, fall back to selector-based introspection.
-        if (!extraInfo && tried.length) {
-            try {
-                const lastSelector = tried[tried.length - 1];
-                const handles = await page.$$(lastSelector);
-                if (handles.length > 0) {
-                    const descriptions = [];
-                    for (let i = 0; i < handles.length; i++) {
-                        const h = handles[i];
-                        const data = await h.evaluate((el) => {
-                            const rect = el.getBoundingClientRect();
-                            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
-                            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-                            const cx = rect.left + rect.width / 2;
-                            const cy = rect.top + rect.height / 2;
-                            const horiz = cx < vw / 3 ? 'left' : cx > (2 * vw) / 3 ? 'right' : 'center';
-                            const vert = cy < vh / 3 ? 'top' : cy > (2 * vh) / 3 ? 'bottom' : 'middle';
-                            const positionDescription = `${vert} ${horiz}`.trim();
-                            const ariaLabel = el.getAttribute('aria-label') || '';
-                            const placeholder = el.getAttribute('placeholder') || '';
-                            const nameAttr = el.getAttribute('name') || '';
-                            const ownText = (el.textContent || '').trim();
-                            let label = ariaLabel || placeholder || nameAttr || ownText;
-                            if (!label && el.tagName) {
-                                label = el.tagName.toLowerCase();
-                            }
-                            let context = '';
-                            let ancestor = el.parentElement;
-                            while (ancestor && !context) {
-                                const t = (ancestor.innerText || '').trim();
-                                if (t) {
-                                    context = t;
-                                    break;
-                                }
-                                ancestor = ancestor.parentElement;
-                            }
-                            if (context.length > 80) {
-                                context = context.slice(0, 77) + '...';
-                            }
-                            return { positionDescription, label, context };
-                        });
-                        const parts = [];
-                        if (data.label) {
-                            parts.push(`labeled \"${data.label}\"`);
-                        }
-                        if (data.context) {
-                            parts.push(`inside section containing text \"${data.context}\"`);
-                        }
-                        parts.push(`around the ${data.positionDescription} of the page`);
-                        descriptions.push(`${i + 1}. ${parts.join(', ')}`);
-                    }
-                    extraInfo = ` Possible targets for selector \"${lastSelector}\":\n` + descriptions.join('\n');
-                }
-            }
-            catch (_b) {
-                // Best-effort only; ignore errors from introspection.
-            }
-        }
-        const baseMsg = lastError instanceof Error ? lastError.message : String(lastError || 'Unknown click error');
-        throw new Error(`Failed to click any of the selectors: ${tried.join(', ')}. ${baseMsg}${extraInfo}`);
     }
-    async type(selector, text, context = {}) {
+    /**
+     * Type into an element. Similar to click(), we always return a rich
+     * ExecutionResult and never throw for normal locator issues.
+     */
+    async type(selector, text) {
         const page = this.browser.getPage();
-        const promptText = context && typeof context.prompt === 'string' ? context.prompt : '';
-        const raw = selector == null ? '' : String(selector);
-        const state = this.browser.getState ? this.browser.getState() : null;
-        const fromContext = state && typeof state.lastFocusedSelector === 'string'
-            ? state.lastFocusedSelector
-            : null;
-        const candidatesFromSelector = raw
-            .split('||')
-            .map((s) => s.trim())
-            .filter((s) => s.length > 0);
-        const candidates = [];
-        if (fromContext)
-            candidates.push(fromContext);
-        for (const sel of candidatesFromSelector) {
-            if (!candidates.includes(sel))
-                candidates.push(sel);
+        const extractor = new selectorExtractor_1.SelectorExtractor(page);
+        try {
+            const info = await this.browser.type(selector, text);
+            const robustSelector = info.cssSelector || selector;
+            this.sessionHistory.push({ action: 'type', target: robustSelector, value: text });
+            const screenshot = await this.browser.screenshot();
+            return {
+                success: true,
+                message: `Typed into ${selector}`,
+                screenshot,
+                selectors: [info]
+            };
         }
-        const tried = [];
-        let lastError = null;
-        const toTry = candidates.length ? candidates : (raw ? [raw] : []);
-        for (const sel of toTry) {
-            tried.push(sel);
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const screenshot = await this.browser.screenshot().catch(() => undefined);
+            let selectors;
             try {
-                await this.browser.type(sel, text);
-                const screenshot = await this.browser.screenshot();
-                const suffix = toTry.length > 1 ? ` (matched using \"${sel}\")` : '';
-                return {
-                    success: true,
-                    message: `Typed into ${sel}${suffix}`,
-                    screenshot
-                };
+                selectors = await extractor.extractAllInteractive();
             }
-            catch (err) {
-                lastError = err;
+            catch {
+                selectors = undefined;
             }
+            return {
+                success: false,
+                message: msg,
+                error: msg,
+                screenshot,
+                selectors
+            };
         }
-        let extraInfo = '';
-        // Intelligent DOM-based fallback using the natural-language prompt, if available.
-        if (promptText) {
-            try {
-                const smart = await this.browser.smartClickFromPrompt(promptText);
-                if (smart && Array.isArray(smart.matches) && smart.matches.length) {
-                    const best = smart.matches[0];
-                    if (best && best.cssSelector) {
-                        await this.browser.type(best.cssSelector, text);
-                        const screenshot = await this.browser.screenshot();
-                        return {
-                            success: true,
-                            message: `Smart-typed into element based on prompt \"${promptText}\"`,
-                            screenshot,
-                            smart
-                        };
-                    }
-                    const lines = smart.matches.map((m) => {
-                        const parts = [];
-                        if (m.label)
-                            parts.push(`labeled \"${m.label}\"`);
-                        if (m.context)
-                            parts.push(`inside section containing text \"${m.context}\"`);
-                        if (m.positionDescription)
-                            parts.push(`around the ${m.positionDescription} of the page`);
-                        return `${m.index}. ${parts.join(', ')}`;
-                    });
-                    extraInfo =
-                        ` Could not uniquely identify an input from the description. Possible matches based on the page DOM:\n` +
-                            lines.join('\n');
-                }
-            }
-            catch (_a) {
-                // Best-effort only; ignore errors from smart DOM analysis.
-            }
-        }
-        // If we still haven't helped the user, fall back to selector-based introspection.
-        if (!extraInfo && tried.length) {
-            try {
-                const lastSelector = tried[tried.length - 1];
-                const handles = await page.$$(lastSelector);
-                if (handles.length > 0) {
-                    const descriptions = [];
-                    for (let i = 0; i < handles.length; i++) {
-                        const h = handles[i];
-                        const data = await h.evaluate((el) => {
-                            const rect = el.getBoundingClientRect();
-                            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
-                            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-                            const cx = rect.left + rect.width / 2;
-                            const cy = rect.top + rect.height / 2;
-                            const horiz = cx < vw / 3 ? 'left' : cx > (2 * vw) / 3 ? 'right' : 'center';
-                            const vert = cy < vh / 3 ? 'top' : cy > (2 * vh) / 3 ? 'bottom' : 'middle';
-                            const positionDescription = `${vert} ${horiz}`.trim();
-                            const ariaLabel = el.getAttribute('aria-label') || '';
-                            const placeholder = el.getAttribute('placeholder') || '';
-                            const nameAttr = el.getAttribute('name') || '';
-                            const ownText = (el.textContent || '').trim();
-                            let label = ariaLabel || placeholder || nameAttr || ownText;
-                            if (!label && el.tagName) {
-                                label = el.tagName.toLowerCase();
-                            }
-                            let context = '';
-                            let ancestor = el.parentElement;
-                            while (ancestor && !context) {
-                                const t = (ancestor.innerText || '').trim();
-                                if (t) {
-                                    context = t;
-                                    break;
-                                }
-                                ancestor = ancestor.parentElement;
-                            }
-                            if (context.length > 80) {
-                                context = context.slice(0, 77) + '...';
-                            }
-                            return { positionDescription, label, context };
-                        });
-                        const parts = [];
-                        if (data.label) {
-                            parts.push(`labeled \"${data.label}\"`);
-                        }
-                        if (data.context) {
-                            parts.push(`inside section containing text \"${data.context}\"`);
-                        }
-                        parts.push(`around the ${data.positionDescription} of the page`);
-                        descriptions.push(`${i + 1}. ${parts.join(', ')}`);
-                    }
-                    extraInfo = ` Possible targets for selector \"${lastSelector}\":\n` + descriptions.join('\n');
-                }
-            }
-            catch (_b) {
-                // Best-effort only; ignore errors from introspection.
-            }
-        }
-        const baseMsg = lastError instanceof Error ? lastError.message : String(lastError || 'Unknown type error');
-        throw new Error(`Failed to type into any of the selectors: ${tried.join(', ')}. ${baseMsg}${extraInfo}`);
     }
+    async handleCookieBanner() {
+        const dismissed = await this.browser.handleCookieBanner();
+        const screenshot = await this.browser.screenshot();
+        return {
+            success: true,
+            message: dismissed ? 'Cookie banner dismissed' : 'No cookie banner detected',
+            screenshot
+        };
+    }
+    /**
+     * Extract selectors for either a specific target or all interactive elements.
+     * This is the primary way for the LLM to "observe" the page structure.
+     */
     async extractSelectors(targetSelector) {
         const page = this.browser.getPage();
         const extractor = new selectorExtractor_1.SelectorExtractor(page);
@@ -307,16 +122,38 @@ class McpTools {
             selectors
         };
     }
+    /**
+     * Convenience helper for the agent: capture both screenshot and a selector
+     * snapshot in a single call, without performing any action.
+     */
+    async observe(targetSelector) {
+        const page = this.browser.getPage();
+        const extractor = new selectorExtractor_1.SelectorExtractor(page);
+        const selectors = targetSelector
+            ? [await extractor.extractForSelector(targetSelector)]
+            : await extractor.extractAllInteractive();
+        selectors.forEach((s, idx) => this.browser.storeSelector(`observe_${idx}`, s));
+        const screenshot = await this.browser.screenshot();
+        return {
+            success: true,
+            message: `Observed ${selectors.length} interactive elements`,
+            screenshot,
+            selectors
+        };
+    }
     async generateSelenium(commands) {
         const gen = new seleniumGenerator_1.SeleniumGenerator({
             language: 'python',
             testName: 'test_flow',
             chromeDriverPath: 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe'
         });
-        const code = gen.generate(commands);
+        const cmdsToUse = (commands && commands.length > 0) ? commands : this.sessionHistory;
+        // If we're using history, we might want to filter out non-essential steps if needed,
+        // but usually exact replay is desired.
+        const code = gen.generate(cmdsToUse);
         return {
             success: true,
-            message: 'Generated selenium code',
+            message: `Generated selenium code from ${cmdsToUse.length} steps`,
             seleniumCode: code
         };
     }

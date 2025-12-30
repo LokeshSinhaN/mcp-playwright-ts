@@ -60,7 +60,23 @@ export class BrowserManager {
 
   async goto(url: string): Promise<void> {
     const page = this.getPage();
-    await page.goto(url, { waitUntil: 'networkidle' });
+
+    try {
+      // Use a more forgiving load state and explicit timeout. Some sites
+      // (including large, analytics-heavy ones) never truly reach
+      // "networkidle" but are still fully interactive much earlier.
+      await page.goto(url, { waitUntil: 'load', timeout: this.defaultTimeout });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/Timeout/i.test(msg)) {
+        // Treat navigation timeouts as soft failures: keep whatever URL
+        // the page reached so the rest of the flow can continue.
+        console.warn('goto timeout, proceeding with current page:', msg);
+      } else {
+        throw err;
+      }
+    }
+
     this.state.currentUrl = page.url();
   }
 
