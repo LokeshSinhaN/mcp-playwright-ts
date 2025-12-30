@@ -43,65 +43,6 @@ const cors_1 = __importDefault(require("cors"));
 const ws_1 = __importStar(require("ws"));
 const browserManager_1 = require("./browserManager");
 const mcpTools_1 = require("./mcpTools");
-async function callGeminiSteps(prompt) {
-    var _a, _b, _c, _d;
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-        throw new Error('GEMINI_API_KEY is not set');
-    }
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-    const systemInstructions = [
-        'You control a Playwright browser for UI testing.',
-        'Given a single user command, produce a SHORT JSON-only plan for how to operate the browser.',
-        'Use as few steps as possible (1-4).',
-        'Supported actions: "navigate", "click", "type", "wait".',
-        'For navigate, set "url".',
-        'For click/type, set "selector" to a Playwright selector string.',
-        'When the target element is ambiguous (e.g. "search box", "login field"), you may include up to 3 fallback selectors separated by "||" in the same selector string, ordered from most specific/robust to most generic.',
-        'Prefer text/role/label based selectors over raw tag/attribute guesses.',
-        'For type, also set "text".',
-        'For wait, set "waitMs" (milliseconds).',
-        'Respond with ONLY JSON in this exact shape and nothing else:',
-        '{"steps":[{"action":"navigate|click|type|wait","url?":"...","selector?":"...","text?":"...","waitMs?":1000}]}'
-    ].join(' ');
-    const fullPrompt = `${systemInstructions}\n\nUser command: ${prompt}`;
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-    const body = {
-        contents: [
-            {
-                role: 'user',
-                parts: [{ text: fullPrompt }]
-            }
-        ]
-    };
-    const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
-    if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`Gemini API error ${resp.status}: ${text}`);
-    }
-    const data = await resp.json();
-    const text = (_d = (_c = (_b = (_a = data.candidates) === null || _a === void 0 ? void 0 : _a[0]) === null || _b === void 0 ? void 0 : _b.content) === null || _c === void 0 ? void 0 : _c.parts[0]) === null || _d === void 0 ? void 0 : _d.text;
-    if (!text) {
-        throw new Error('Gemini response missing text content');
-    }
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    const jsonString = jsonMatch ? jsonMatch[0] : text;
-    let parsed;
-    try {
-        parsed = JSON.parse(jsonString);
-    }
-    catch (err) {
-        throw new Error('Failed to parse Gemini JSON: ' + (err instanceof Error ? err.message : String(err)));
-    }
-    if (!parsed.steps || !Array.isArray(parsed.steps)) {
-        throw new Error('Gemini JSON missing "steps" array');
-    }
-    return parsed.steps;
-}
 function createServer(port, chromePath) {
     const app = (0, express_1.default)();
     const server = http_1.default.createServer(app);
@@ -109,7 +50,9 @@ function createServer(port, chromePath) {
     const browser = new browserManager_1.BrowserManager({
         headless: true,
         timeoutMs: 30000,
-        viewport: { width: 1280, height: 720 },
+        // Use a larger viewport to approximate a maximized browser window in
+        // the preview UI.
+        viewport: { width: 1600, height: 900 },
         chromePath
     });
     const tools = new mcpTools_1.McpTools(browser);
@@ -124,7 +67,7 @@ function createServer(port, chromePath) {
         }
     }
     app.post('/api/execute', async (req, res) => {
-        const { action, url, selector, text, commands, prompt } = req.body;
+        const { action, url, selector, text, commands } = req.body;
         let result;
         try {
             switch (action) {
@@ -133,58 +76,6 @@ function createServer(port, chromePath) {
                         throw new Error('url required');
                     broadcast({ type: 'action', timestamp: new Date().toISOString(), message: `navigate ${url}` });
                     result = await tools.navigate(url);
-                    break;
-                case 'ai':
-                    if (!prompt)
-                        throw new Error('prompt required');
-                    broadcast({ type: 'log', timestamp: new Date().toISOString(), message: `AI interpreting command: ${prompt}` });
-                    {
-                        const steps = await callGeminiSteps(prompt);
-                        if (!steps.length) {
-                            throw new Error('AI did not return any steps');
-                        }
-                        let lastResult = null;
-                        for (const [idx, step] of steps.entries()) {
-                            const ts = new Date().toISOString();
-                            const label = step.action || 'unknown';
-                            switch ((step.action || '').toLowerCase()) {
-                                case 'navigate':
-                                    if (!step.url)
-                                        throw new Error(`Step ${idx} missing url`);
-                                    broadcast({ type: 'action', timestamp: ts, message: `navigate ${step.url}` });
-                                    lastResult = await tools.navigate(step.url);
-                                    break;
-                                case 'click':
-                                    if (!step.selector)
-                                        throw new Error(`Step ${idx} missing selector`);
-                                    broadcast({ type: 'action', timestamp: ts, message: `click ${step.selector}` });
-                                    lastResult = await tools.click(step.selector, { prompt });
-                                    break;
-                                case 'type':
-                                    if (!step.selector || step.text == null)
-                                        throw new Error(`Step ${idx} missing selector or text`);
-                                    broadcast({ type: 'action', timestamp: ts, message: `type in ${step.selector}` });
-                                    lastResult = await tools.type(step.selector, step.text, { prompt });
-                                    break;
-                                case 'wait':
-                                    {
-                                        const waitMs = typeof step.waitMs === 'number' && step.waitMs > 0 ? step.waitMs : 1000;
-                                        broadcast({ type: 'log', timestamp: ts, message: `wait ${waitMs}ms` });
-                                        await new Promise((resolve) => setTimeout(resolve, waitMs));
-                                    }
-                                    break;
-                                default:
-                                    broadcast({ type: 'error', timestamp: ts, message: `Unknown AI step action: ${label}` });
-                                    break;
-                            }
-                        }
-                        if (!lastResult) {
-                            result = { success: false, message: 'AI did not execute any browser steps' };
-                        }
-                        else {
-                            result = Object.assign(Object.assign({}, lastResult), { steps });
-                        }
-                    }
                     break;
                 case 'click':
                     if (!selector)
@@ -198,13 +89,20 @@ function createServer(port, chromePath) {
                     broadcast({ type: 'action', timestamp: new Date().toISOString(), message: `type in ${selector}` });
                     result = await tools.type(selector, text);
                     break;
+                case 'handle_cookie_banner':
+                    broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'handle_cookie_banner' });
+                    result = await tools.handleCookieBanner();
+                    break;
                 case 'extract_selectors':
                     broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'extract_selectors' });
                     result = await tools.extractSelectors(selector);
                     break;
+                case 'observe':
+                    broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'observe' });
+                    result = await tools.observe(selector);
+                    break;
                 case 'generate_selenium':
-                    if (!commands || !Array.isArray(commands))
-                        throw new Error('commands array required');
+                    // We allow commands to be optional now, defaulting to session history
                     broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'generate_selenium' });
                     result = await tools.generateSelenium(commands);
                     break;
@@ -213,40 +111,9 @@ function createServer(port, chromePath) {
             }
         }
         catch (err) {
-            const rawMsg = err instanceof Error ? err.message : String(err);
-            // When Playwright (or our smart DOM heuristics) report multiple possible
-            // matches for a described element, the raw error message can be very
-            // long and hard to read. It usually contains a block like:
-            //   "Could not uniquely identify an element from the description.\n"
-            //   "Possible matches based on the page DOM:\n1. ...\n2. ..."
-            // For these specific cases, rewrite the user-facing message so the
-            // chat UI can present the options more clearly, while still keeping
-            // the full raw error in the `error` field for debugging.
-            let userMessage = rawMsg;
-            let extraData = undefined;
-            const multiMatchMarker = 'Possible matches based on the page DOM:';
-            const idx = rawMsg.indexOf(multiMatchMarker);
-            if (idx !== -1) {
-                const optionsText = rawMsg.slice(idx + multiMatchMarker.length).trim();
-                const optionLines = optionsText
-                    .split(/\r?\n+/)
-                    .map((l) => l.trim())
-                    .filter((l) => l.length > 0);
-                if (optionLines.length > 0) {
-                    userMessage = [
-                        'The browser found multiple possible elements matching this description.',
-                        'Here are the options it discovered based on the page preview:',
-                        ...optionLines,
-                        'Reply by choosing an option number (for example: "Click option 1").'
-                    ].join('\n');
-                    extraData = { candidateOptions: optionLines };
-                }
-            }
-            broadcast({ type: 'error', timestamp: new Date().toISOString(), message: userMessage });
-            result = { success: false, message: userMessage, error: rawMsg };
-            if (extraData) {
-                result.data = Object.assign(Object.assign({}, (result.data || {})), extraData);
-            }
+            const msg = err instanceof Error ? err.message : String(err);
+            broadcast({ type: 'error', timestamp: new Date().toISOString(), message: msg });
+            result = { success: false, message: msg, error: msg };
         }
         broadcast({
             type: result.success ? 'success' : 'error',
