@@ -270,8 +270,118 @@ class BrowserManager {
     }
     async type(selector, text) {
         const page = this.getPage();
-        await page.fill(selector, '');
-        await page.type(selector, text);
+        const sel = selector;
+        let handle = null;
+        try {
+            handle = await page.$(sel);
+        }
+        catch (_a) {
+            // If selector lookup itself fails we will fall back to direct fill below.
+        }
+        if (handle) {
+            const info = await handle.evaluate((el) => {
+                const tag = el.tagName.toLowerCase();
+                const typeAttr = (el.getAttribute('type') || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                return { tag, typeAttr, role };
+            });
+            const isTextInput = info.tag === 'input' || info.tag === 'textarea';
+            if (isTextInput) {
+                // Directly type into real input/textarea elements.
+                await page.fill(sel, '');
+                await page.type(sel, text);
+                this.state.lastFocusedSelector = sel;
+                return;
+            }
+            // Non-input trigger (button/div/icon). Follow click-to-focus strategy:
+            // click it, wait briefly, then find the best visible input field.
+            await handle.click();
+            await page.waitForTimeout(500);
+            const inputHandles = await page.$$('input:not([type="hidden"]), textarea');
+            let best = null;
+            let bestScore = -1;
+            for (const h of inputHandles) {
+                const meta = await h.evaluate((el) => {
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === 'hidden' || style.display === 'none')
+                        return null;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0)
+                        return null;
+                    const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                    const nameAttr = (el.getAttribute('name') || '').toLowerCase();
+                    const typeAttr = (el.getAttribute('type') || '').toLowerCase();
+                    return { placeholder, ariaLabel, nameAttr, typeAttr };
+                });
+                if (!meta)
+                    continue;
+                let score = 0;
+                if (meta.typeAttr === 'search')
+                    score += 20;
+                if (meta.placeholder.includes('search'))
+                    score += 15;
+                if (meta.ariaLabel.includes('search'))
+                    score += 15;
+                if (meta.nameAttr.includes('search'))
+                    score += 10;
+                // Generic preference for any visible text input.
+                score += 1;
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = h;
+                }
+            }
+            if (best) {
+                await best.fill('');
+                await best.type(text);
+                try {
+                    const css = await best.evaluate((el) => {
+                        if (el.id)
+                            return `#${el.id}`;
+                        const parts = [];
+                        let curr = el;
+                        const doc = el.ownerDocument || document;
+                        while (curr && curr !== doc.body) {
+                            let part = curr.tagName.toLowerCase();
+                            if (curr.id) {
+                                part += `#${curr.id}`;
+                                parts.unshift(part);
+                                break;
+                            }
+                            const classes = (curr.className || '')
+                                .split(/\s+/)
+                                .filter(Boolean)
+                                .slice(0, 2)
+                                .map((c) => `.${c}`);
+                            if (classes.length)
+                                part += classes.join('');
+                            const parent = curr.parentElement;
+                            if (parent) {
+                                const siblings = Array.from(parent.children);
+                                const index = siblings.indexOf(curr) + 1;
+                                if (index > 0)
+                                    part += `:nth-child(${index})`;
+                            }
+                            parts.unshift(part);
+                            curr = parent;
+                        }
+                        return parts.join(' > ');
+                    });
+                    if (css)
+                        this.state.lastFocusedSelector = css;
+                }
+                catch (_b) {
+                    // Storing selector is best-effort only.
+                }
+                return;
+            }
+            // If we clicked a trigger but could not find any input, fall through
+            // to a simple attempt using the original selector so the error is visible.
+        }
+        await page.fill(sel, '');
+        await page.type(sel, text);
+        this.state.lastFocusedSelector = sel;
     }
     async waitFor(selector, timeoutMs = 5000) {
         const page = this.getPage();
