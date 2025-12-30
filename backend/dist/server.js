@@ -213,9 +213,40 @@ function createServer(port, chromePath) {
             }
         }
         catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            broadcast({ type: 'error', timestamp: new Date().toISOString(), message: msg });
-            result = { success: false, message: msg, error: msg };
+            const rawMsg = err instanceof Error ? err.message : String(err);
+            // When Playwright (or our smart DOM heuristics) report multiple possible
+            // matches for a described element, the raw error message can be very
+            // long and hard to read. It usually contains a block like:
+            //   "Could not uniquely identify an element from the description.\n"
+            //   "Possible matches based on the page DOM:\n1. ...\n2. ..."
+            // For these specific cases, rewrite the user-facing message so the
+            // chat UI can present the options more clearly, while still keeping
+            // the full raw error in the `error` field for debugging.
+            let userMessage = rawMsg;
+            let extraData = undefined;
+            const multiMatchMarker = 'Possible matches based on the page DOM:';
+            const idx = rawMsg.indexOf(multiMatchMarker);
+            if (idx !== -1) {
+                const optionsText = rawMsg.slice(idx + multiMatchMarker.length).trim();
+                const optionLines = optionsText
+                    .split(/\r?\n+/)
+                    .map((l) => l.trim())
+                    .filter((l) => l.length > 0);
+                if (optionLines.length > 0) {
+                    userMessage = [
+                        'The browser found multiple possible elements matching this description.',
+                        'Here are the options it discovered based on the page preview:',
+                        ...optionLines,
+                        'Reply by choosing an option number (for example: "Click option 1").'
+                    ].join('\n');
+                    extraData = { candidateOptions: optionLines };
+                }
+            }
+            broadcast({ type: 'error', timestamp: new Date().toISOString(), message: userMessage });
+            result = { success: false, message: userMessage, error: rawMsg };
+            if (extraData) {
+                result.data = Object.assign(Object.assign({}, (result.data || {})), extraData);
+            }
         }
         broadcast({
             type: result.success ? 'success' : 'error',
