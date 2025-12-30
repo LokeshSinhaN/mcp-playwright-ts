@@ -164,6 +164,12 @@ export class BrowserManager {
 
       // 4. Fallback / Standard selector
       // If we haven't matched a special pattern, or just as a fallback, treat as standard selector
+      // For generic selectors (no explicit id/hash or locator chaining), prioritize visible elements
+      // by first trying a `visible=true` constrained locator, then the raw selector as a fallback.
+      const hasIdOrChain = raw.includes('#') || raw.includes('>>');
+      if (!hasIdOrChain) {
+        candidates.push(scope.locator(`${raw} >> visible=true`));
+      }
       candidates.push(scope.locator(raw));
 
       return candidates;
@@ -264,8 +270,14 @@ export class BrowserManager {
       // ignore extraction errors, proceed to click
     }
 
-    // 3. Click
-    await locator.click({ timeout: this.defaultTimeout });
+    // 4. Click with fallback for sticky headers/overlays
+    try {
+      await locator.click({ timeout: this.defaultTimeout });
+    } catch (err) {
+      // If a standard click fails (e.g., due to overlays or strict visibility),
+      // immediately retry with a forced click to bypass strict checks.
+      await locator.click({ force: true, timeout: this.defaultTimeout });
+    }
 
     // Re-resolve if we failed to extract before? No, strict flow.
     // If we couldn't extract, we return a dummy info or throw?

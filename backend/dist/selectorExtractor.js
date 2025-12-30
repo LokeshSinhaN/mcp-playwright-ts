@@ -9,7 +9,7 @@ class SelectorExtractor {
         const handles = await this.page.$$('button, a, input, textarea, select, [role=button], [role=link], [onclick]');
         const results = [];
         for (const h of handles) {
-            const info = await this.fromHandle(h);
+            const info = await this.extractFromHandle(h);
             results.push(info);
         }
         return results;
@@ -18,9 +18,9 @@ class SelectorExtractor {
         const handle = await this.page.$(selector);
         if (!handle)
             throw new Error(`Element not found: ${selector}`);
-        return this.fromHandle(handle);
+        return this.extractFromHandle(handle);
     }
-    async fromHandle(handle) {
+    async extractFromHandle(handle) {
         const base = await handle.evaluate((el) => {
             return {
                 tagName: el.tagName.toLowerCase(),

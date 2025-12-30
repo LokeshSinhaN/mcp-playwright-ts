@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.BrowserManager = void 0;
 const playwright_1 = require("playwright");
+const selectorExtractor_1 = require("./selectorExtractor");
 class BrowserManager {
     constructor(config = {}) {
         this.browser = null;
@@ -9,16 +10,19 @@ class BrowserManager {
         this.page = null;
         this.state = {
             isOpen: false,
-            selectors: new Map(),
-            smartMatches: [],
-            lastFocusedSelector: undefined
+            selectors: new Map()
         };
         this.config = {
             headless: config.headless ?? true,
             timeoutMs: config.timeoutMs ?? 30000,
-            viewport: config.viewport ?? { width: 1280, height: 720 },
+            // Use a larger default viewport so screenshots look less "zoomed out"
+            // in the preview UI, and more like a maximized browser window.
+            viewport: config.viewport ?? { width: 1600, height: 900 },
             chromePath: config.chromePath
         };
+    }
+    get defaultTimeout() {
+        return this.config.timeoutMs;
     }
     async init() {
         if (this.browser)
@@ -49,382 +53,280 @@ class BrowserManager {
     }
     async goto(url) {
         const page = this.getPage();
-        await page.goto(url, { waitUntil: 'domcontentloaded' });
+        await page.goto(url, { waitUntil: 'networkidle' });
         this.state.currentUrl = page.url();
     }
     async screenshot() {
         const page = this.getPage();
-        const buf = await page.screenshot({ fullPage: true });
+        // Capture only the current viewport at a larger size instead of a full-page
+        // tall image. This makes the preview appear closer to a maximized view
+        // instead of a shrunk-down full-page thumbnail.
+        const buf = await page.screenshot({ fullPage: false });
         const base64 = buf.toString('base64');
         const dataUrl = `data:image/png;base64,${base64}`;
         this.state.lastScreenshot = dataUrl;
         return dataUrl;
     }
-    async click(selector) {
+    /**
+     * Smart locator resolution that:
+     * 1. Parses "engine-like" selectors (text=, label=, etc.)
+     * 2. Handles AI-generated CSS (input[placeholder=...]) with fuzzy matching
+     * 3. Handles plain semantic text like "Login" or "Search diseases and conditions"
+     * 4. Searches across ALL frames (iframes), not just the main page
+     * 5. Returns the first Locator that is visible, or the "best guess" to wait on.
+     */
+    async smartLocate(selector, timeoutMs) {
         const page = this.getPage();
-        await page.click(selector);
-    }
-    async smartClickFromPrompt(prompt) {
-        const page = this.getPage();
-        const raw = typeof prompt === 'string' ? prompt : '';
-        const lower = raw.toLowerCase();
-        const words = lower.match(/[a-z0-9]+/g) || [];
-        const seen = new Set();
-        const stopWords = new Set([
-            'click',
-            'tap',
-            'press',
-            'the',
-            'a',
-            'an',
-            'on',
-            'into',
-            'in',
-            'to',
-            'of',
-            'box',
-            'field',
-            'input',
-            'button',
-            'link',
-            'icon',
-            'text',
-            'textbox',
-            'type',
-            'open',
-            'page',
-            'tab'
-        ]);
-        const terms = [];
-        for (const w of words) {
-            if (w.length < 3)
-                continue;
-            if (stopWords.has(w))
-                continue;
-            if (seen.has(w))
-                continue;
-            seen.add(w);
-            terms.push(w);
-        }
-        if (lower.includes('search') && !terms.includes('search')) {
-            terms.push('search');
-        }
-        if (!terms.length) {
-            return { clicked: false, matches: [] };
-        }
-        const result = await page.evaluate((searchTerms) => {
-            const lowerTerms = searchTerms.map((t) => t.toLowerCase());
-            const interactiveSelectors = 'input, button, a, textarea, select, [role=button], [role=link], [onclick]';
-            const els = Array.from(document.querySelectorAll(interactiveSelectors));
+        const frames = [page, ...page.frames().filter(f => f !== page.mainFrame())];
+        // Helper to generate candidate locators for a given frame/page
+        const getCandidates = (scope) => {
             const candidates = [];
-            const combinedText = (el) => {
-                const aria = el.getAttribute('aria-label') || '';
-                const placeholder = el.getAttribute('placeholder') || '';
-                const title = el.getAttribute('title') || '';
-                const nameAttr = el.getAttribute('name') || '';
-                const text = (el.innerText || el.textContent || '');
-                return (aria + ' ' + placeholder + ' ' + title + ' ' + nameAttr + ' ' + text).toLowerCase();
-            };
-            const isVisible = (el) => {
-                const style = window.getComputedStyle(el);
-                if (style.visibility === 'hidden' || style.display === 'none') {
-                    return false;
-                }
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) {
-                    return false;
-                }
-                return true;
-            };
-            const describe = (el) => {
-                const rect = el.getBoundingClientRect();
-                const vw = window.innerWidth || document.documentElement.clientWidth || 0;
-                const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-                const cx = rect.left + rect.width / 2;
-                const cy = rect.top + rect.height / 2;
-                const horiz = cx < vw / 3 ? 'left' : cx > (2 * vw) / 3 ? 'right' : 'center';
-                const vert = cy < vh / 3 ? 'top' : cy > (2 * vh) / 3 ? 'bottom' : 'middle';
-                const positionDescription = `${vert} ${horiz}`.trim();
-                const ariaLabel = el.getAttribute('aria-label') || '';
-                const placeholder = el.getAttribute('placeholder') || '';
-                const nameAttr = el.getAttribute('name') || '';
-                const ownText = (el.textContent || '').trim();
-                let label = ariaLabel || placeholder || nameAttr || ownText;
-                if (!label && el.tagName) {
-                    label = el.tagName.toLowerCase();
-                }
-                let context = '';
-                let ancestor = el.parentElement;
-                while (ancestor && !context) {
-                    const t = (ancestor.innerText || '').trim();
-                    if (t) {
-                        context = t;
+            // Normalize selector for regex use
+            const raw = selector.trim();
+            // 1. Smart Inputs (placeholder/aria-label) with fuzzy matching
+            const placeholderCss = raw.match(/input\[placeholder=(['\"])(.*?)\1\]/i);
+            if (placeholderCss) {
+                const value = placeholderCss[2].trim();
+                const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                // Fuzzy match: contains text, case insensitive
+                candidates.push(scope.getByPlaceholder(new RegExp(escaped, 'i')));
+            }
+            const ariaLabelCss = raw.match(/input\[aria-label=(['\"])(.*?)\1\]/i);
+            if (ariaLabelCss) {
+                const value = ariaLabelCss[2].trim();
+                const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                candidates.push(scope.getByLabel(new RegExp(escaped, 'i')));
+            }
+            // 2. Engine-style prefixes (text=, label=, etc.)
+            const engineLike = /^[a-zA-Z]+=/i.test(raw) && !raw.includes('>>');
+            if (engineLike) {
+                const parts = raw.split('=');
+                const prefix = parts[0].trim().toLowerCase();
+                const value = parts.slice(1).join('=').trim().replace(/^['\"]|['\"]$/g, '');
+                const fuzzyRegex = new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+                switch (prefix) {
+                    case 'text':
+                        // Try exact, then button/link role, then fuzzy text
+                        candidates.push(scope.getByRole('button', { name: fuzzyRegex }));
+                        candidates.push(scope.getByRole('link', { name: fuzzyRegex }));
+                        candidates.push(scope.getByText(fuzzyRegex));
                         break;
-                    }
-                    ancestor = ancestor.parentElement;
+                    case 'label':
+                        candidates.push(scope.getByLabel(fuzzyRegex));
+                        break;
+                    case 'placeholder':
+                        candidates.push(scope.getByPlaceholder(fuzzyRegex));
+                        break;
+                    case 'alt':
+                        candidates.push(scope.getByAltText(fuzzyRegex));
+                        break;
+                    case 'title':
+                        candidates.push(scope.getByTitle(fuzzyRegex));
+                        break;
+                    case 'testid':
+                        candidates.push(scope.getByTestId(value)); // testid usually strict
+                        break;
                 }
-                if (context.length > 80) {
-                    context = context.slice(0, 77) + '...';
-                }
-                const summaryParts = [];
-                if (label)
-                    summaryParts.push(`"${label}"`);
-                if (positionDescription)
-                    summaryParts.push(`at ${positionDescription} of page`);
-                return {
-                    positionDescription,
-                    label,
-                    context,
-                    summary: summaryParts.join(' ')
-                };
-            };
-            for (const el of els) {
-                if (!isVisible(el))
-                    continue;
-                const full = combinedText(el);
-                let score = 0;
-                for (const term of lowerTerms) {
-                    const idx = full.indexOf(term);
-                    if (idx >= 0) {
-                        score += 10;
-                        if (idx === 0 || /\s/.test(full[idx - 1])) {
-                            score += 5;
-                        }
-                    }
-                }
-                if (!score)
-                    continue;
-                const tag = el.tagName.toLowerCase();
-                if (tag === 'input' || tag === 'textarea') {
-                    score += 4;
-                }
-                const typeAttr = (el.getAttribute('type') || '').toLowerCase();
-                if (typeAttr === 'search') {
-                    score += 3;
-                }
-                const cssPath = (el) => {
-                    if (el.id)
-                        return `#${el.id}`;
-                    const parts = [];
-                    let curr = el;
-                    const doc = el.ownerDocument || document;
-                    while (curr && curr !== doc.body) {
-                        let part = curr.tagName.toLowerCase();
-                        if (curr.id) {
-                            part += `#${curr.id}`;
-                            parts.unshift(part);
-                            break;
-                        }
-                        const classes = (curr.className || '')
-                            .split(/\s+/)
-                            .filter(Boolean)
-                            .slice(0, 2)
-                            .map((c) => `.${c}`);
-                        if (classes.length)
-                            part += classes.join('');
-                        const parent = curr.parentElement;
-                        if (parent) {
-                            const siblings = Array.from(parent.children);
-                            const index = siblings.indexOf(curr) + 1;
-                            if (index > 0)
-                                part += `:nth-child(${index})`;
-                        }
-                        parts.unshift(part);
-                        curr = parent;
-                    }
-                    return parts.join(' > ');
-                };
-                candidates.push({ el, score, meta: Object.assign(Object.assign({}, describe(el)), { cssSelector: cssPath(el) }) });
             }
-            if (!candidates.length) {
-                return { clicked: false, matches: [] };
+            // 3. Plain semantic text like "Login" or "Search diseases and conditions"
+            const looksLikePlainText = !/[#.[\]=:>]/.test(raw) && !engineLike;
+            if (looksLikePlainText && raw.length > 0) {
+                const fuzzy = new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'), 'i');
+                // buttons/links labeled with this text
+                candidates.push(scope.getByRole('button', { name: fuzzy }));
+                candidates.push(scope.getByRole('link', { name: fuzzy }));
+                // search fields or inputs associated with this text
+                candidates.push(scope.getByPlaceholder(fuzzy));
+                candidates.push(scope.getByLabel(fuzzy));
+                // final text search fallback
+                candidates.push(scope.getByText(fuzzy));
             }
-            // Sort by descending score so the best options are first.
-            candidates.sort((a, b) => b.score - a.score);
-            const shouldClick = candidates.length === 1;
-            const best = candidates[0];
-            if (shouldClick && best && best.el) {
-                best.el.scrollIntoView({ block: 'center', inline: 'center' });
-                best.el.click();
+            // 4. Fallback / Standard selector
+            // If we haven't matched a special pattern, or just as a fallback, treat as standard selector
+            // For generic selectors (no explicit id/hash or locator chaining), prioritize visible elements
+            // by first trying a `visible=true` constrained locator, then the raw selector as a fallback.
+            const hasIdOrChain = raw.includes('#') || raw.includes('>>');
+            if (!hasIdOrChain) {
+                candidates.push(scope.locator(`${raw} >> visible=true`));
             }
-            return {
-                clicked: shouldClick && !!best,
-                chosenIndex: shouldClick ? 1 : null,
-                matches: candidates.map((c, idx) => (Object.assign({ index: idx + 1, score: c.score }, c.meta)))
-            };
-        }, terms);
-        // Persist the last smart matches so a follow-up command like "option 1" can
-        // directly reference them without relying on the LLM.
-        this.state.smartMatches = Array.isArray(result === null || result === void 0 ? void 0 : result.matches) ? result.matches : [];
-        // If we uniquely clicked something, prefer that element for subsequent type
-        // commands by storing its selector as the last focused control.
-        if (result && result.clicked && Array.isArray(result.matches) && result.matches.length) {
-            const chosen = typeof result.chosenIndex === 'number'
-                ? result.matches.find((m) => m.index === result.chosenIndex) || result.matches[0]
-                : result.matches[0];
-            if (chosen && chosen.cssSelector) {
-                this.state.lastFocusedSelector = chosen.cssSelector;
+            candidates.push(scope.locator(raw));
+            return candidates;
+        };
+        // Phase 1: Quick Scan - check all frames for immediate visibility
+        for (const frame of frames) {
+            const candidates = getCandidates(frame);
+            for (const loc of candidates) {
+                try {
+                    // Check if attached & visible without waiting too long
+                    if (await loc.first().isVisible({ timeout: Math.min(250, timeoutMs) })) {
+                        return loc.first();
+                    }
+                }
+                catch {
+                    // Ignore errors during scan
+                }
             }
         }
-        return result;
+        // Phase 2: If nothing found immediately, we default to waiting on the
+        // main page using the "best" candidate.
+        // We prioritize the fuzzy matcher if we generated one, otherwise the raw selector.
+        const mainCandidates = getCandidates(page);
+        const primary = mainCandidates[0].first();
+        // Special-case heuristic: if the selector mentions "search" and the primary
+        // candidate resolves to nothing, fall back to any visible search-like input.
+        try {
+            if (/search/i.test(selector) && (await primary.count()) === 0) {
+                const searchLike = page
+                    .locator('input, textarea, [role="textbox"], [type="search"]')
+                    .filter({
+                    has: page.locator('text=/search/i')
+                });
+                if (await searchLike.count()) {
+                    return searchLike.first();
+                }
+            }
+        }
+        catch {
+            // ignore and fall back to primary
+        }
+        return primary;
+    }
+    /**
+     * Given a base locator that might point at a wrapper element, return a
+     * locator that actually targets a fillable control.
+     */
+    async resolveFillTarget(base) {
+        // (Existing logic kept, but ensured it's robust)
+        try {
+            const candidate = base.first();
+            if (await candidate.count() === 0)
+                return candidate; // let it fail naturally later
+            const handle = await candidate.elementHandle().catch(() => null);
+            if (handle) {
+                const isFillable = await handle.evaluate((el) => {
+                    const tag = (el.tagName || '').toLowerCase();
+                    if (tag === 'input' || tag === 'textarea' || tag === 'select')
+                        return true;
+                    if (el.isContentEditable)
+                        return true;
+                    const role = typeof el.getAttribute === 'function' ? el.getAttribute('role') : null;
+                    return role === 'textbox' || role === 'combobox';
+                });
+                if (isFillable)
+                    return candidate;
+            }
+            const descendant = base.locator('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]');
+            if ((await descendant.count()) > 0) {
+                return descendant.first();
+            }
+        }
+        catch {
+            // ignore errors during resolution
+        }
+        return base;
+    }
+    async click(selector) {
+        // 1. Find best locator (frames, fuzzy, etc.)
+        const locator = await this.smartLocate(selector, this.defaultTimeout);
+        // 2. Wait for it to be ready
+        await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
+        await locator.scrollIntoViewIfNeeded();
+        // 3. Extract robust info before clicking (in case click navigates away)
+        let info;
+        try {
+            const handle = await locator.elementHandle();
+            if (handle) {
+                const extractor = new selectorExtractor_1.SelectorExtractor(this.getPage());
+                info = await extractor.extractFromHandle(handle);
+            }
+        }
+        catch (e) {
+            // ignore extraction errors, proceed to click
+        }
+        // 4. Click with fallback for sticky headers/overlays
+        try {
+            await locator.click({ timeout: this.defaultTimeout });
+        }
+        catch (err) {
+            // If a standard click fails (e.g., due to overlays or strict visibility),
+            // immediately retry with a forced click to bypass strict checks.
+            await locator.click({ force: true, timeout: this.defaultTimeout });
+        }
+        // Re-resolve if we failed to extract before? No, strict flow.
+        // If we couldn't extract, we return a dummy info or throw?
+        // We'll return the info if we got it, or a basic one.
+        if (info)
+            return info;
+        // Fallback if extraction failed (shouldn't happen often)
+        return {
+            tagName: 'unknown',
+            attributes: {},
+            cssSelector: selector // better than nothing
+        };
     }
     async type(selector, text) {
-        const page = this.getPage();
-        const sel = selector;
-        const tryBestVisibleInput = async () => {
-            const inputHandles = await page.$$('input:not([type="hidden"]), textarea');
-            let best = null;
-            let bestScore = -1;
-            for (const h of inputHandles) {
-                const meta = await h.evaluate((el) => {
-                    const style = window.getComputedStyle(el);
-                    if (style.visibility === 'hidden' || style.display === 'none')
-                        return null;
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width === 0 || rect.height === 0)
-                        return null;
-                    const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
-                    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
-                    const nameAttr = (el.getAttribute('name') || '').toLowerCase();
-                    const typeAttr = (el.getAttribute('type') || '').toLowerCase();
-                    return { placeholder, ariaLabel, nameAttr, typeAttr };
-                });
-                if (!meta)
-                    continue;
-                let score = 0;
-                if (meta.typeAttr === 'search')
-                    score += 20;
-                if (meta.placeholder.includes('search'))
-                    score += 15;
-                if (meta.ariaLabel.includes('search'))
-                    score += 15;
-                if (meta.nameAttr.includes('search'))
-                    score += 10;
-                // Generic preference for any visible text input.
-                score += 1;
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = h;
-                }
-            }
-            if (!best)
-                return false;
-            await best.fill('');
-            await best.type(text);
-            try {
-                const css = await best.evaluate((el) => {
-                    if (el.id)
-                        return `#${el.id}`;
-                    const parts = [];
-                    let curr = el;
-                    const doc = el.ownerDocument || document;
-                    while (curr && curr !== doc.body) {
-                        let part = curr.tagName.toLowerCase();
-                        if (curr.id) {
-                            part += `#${curr.id}`;
-                            parts.unshift(part);
-                            break;
-                        }
-                        const classes = (curr.className || '')
-                            .split(/\s+/)
-                            .filter(Boolean)
-                            .slice(0, 2)
-                            .map((c) => `.${c}`);
-                        if (classes.length)
-                            part += classes.join('');
-                        const parent = curr.parentElement;
-                        if (parent) {
-                            const siblings = Array.from(parent.children);
-                            const index = siblings.indexOf(curr) + 1;
-                            if (index > 0)
-                                part += `:nth-child(${index})`;
-                        }
-                        parts.unshift(part);
-                        curr = parent;
-                    }
-                    return parts.join(' > ');
-                });
-                if (css)
-                    this.state.lastFocusedSelector = css;
-            }
-            catch (_a) {
-                // best-effort
-            }
-            return true;
-        };
-        let handle = null;
+        // 1. Find best locator
+        const base = await this.smartLocate(selector, this.defaultTimeout);
+        // 2. Drill down to input if it's a wrapper
+        const locator = await this.resolveFillTarget(base);
+        // 3. Type
+        await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
+        // Extract info
+        let info;
         try {
-            handle = await page.$(sel);
-        }
-        catch (_b) {
-            // If selector lookup itself fails we may still try heuristic input search below.
-        }
-        if (handle) {
-            const info = await handle.evaluate((el) => {
-                const tag = el.tagName.toLowerCase();
-                const typeAttr = (el.getAttribute('type') || '').toLowerCase();
-                const role = (el.getAttribute('role') || '').toLowerCase();
-                return { tag, typeAttr, role };
-            });
-            const isTextInput = info.tag === 'input' || info.tag === 'textarea';
-            if (isTextInput) {
-                // Directly type into real input/textarea elements.
-                await page.fill(sel, '');
-                await page.type(sel, text);
-                this.state.lastFocusedSelector = sel;
-                return;
-            }
-            // Non-input trigger (button/div/icon). Follow click-to-focus strategy:
-            // click it, wait briefly, then find the best visible input field.
-            await handle.click();
-            await page.waitForTimeout(500);
-            if (await tryBestVisibleInput()) {
-                return;
-            }
-            // If we clicked a trigger but could not find any input, fall through
-            // to a simple attempt using the original selector so the error is visible.
-        }
-        else {
-            // Selector did not resolve to an element. If it's search-like, try heuristic
-            // input discovery before giving up.
-            const lowerSel = String(sel).toLowerCase();
-            if (lowerSel.includes('search')) {
-                if (await tryBestVisibleInput()) {
-                    return;
-                }
+            const handle = await locator.elementHandle();
+            if (handle) {
+                const extractor = new selectorExtractor_1.SelectorExtractor(this.getPage());
+                info = await extractor.extractFromHandle(handle);
             }
         }
-        // Fallback: one last direct attempt so any error is surfaced clearly.
-        await page.fill(sel, '');
-        await page.type(sel, text);
-        this.state.lastFocusedSelector = sel;
+        catch (e) { }
+        try {
+            await locator.fill('');
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(`Unable to fill element found by "${selector}": ${msg}`);
+        }
+        await locator.type(text, { timeout: this.defaultTimeout });
+        return info || { tagName: 'input', attributes: {}, cssSelector: selector };
     }
     async waitFor(selector, timeoutMs = 5000) {
-        const page = this.getPage();
-        await page.waitForSelector(selector, { timeout: timeoutMs });
+        const locator = await this.smartLocate(selector, timeoutMs);
+        await locator.waitFor({ state: 'visible', timeout: timeoutMs });
     }
     async pageSource() {
         const page = this.getPage();
         return page.content();
     }
+    /**
+     * Best-effort handler for common cookie/consent banners.
+     * It silently does nothing if no banner is found.
+     * Returns true if a banner was detected and dismissed.
+     */
+    async handleCookieBanner() {
+        const page = this.getPage();
+        const candidates = [
+            page.getByRole('button', { name: /accept( all)? cookies/i }),
+            page.getByRole('button', { name: /i agree/i }),
+            page.locator('button', { hasText: /accept cookies/i })
+        ];
+        for (const locator of candidates) {
+            try {
+                if (await locator.isVisible({ timeout: 2000 })) {
+                    await locator.scrollIntoViewIfNeeded();
+                    await locator.click({ timeout: 5000 });
+                    return true;
+                }
+            }
+            catch {
+                // Ignore individual locator timeouts; move to next candidate.
+            }
+        }
+        return false;
+    }
     isOpen() {
         return this.state.isOpen && !!this.page;
-    }
-    async clickSmartOption(index) {
-        const page = this.getPage();
-        const matches = Array.isArray(this.state.smartMatches) ? this.state.smartMatches : [];
-        const match = matches.find((m) => m.index === index);
-        if (!match) {
-            const available = matches.map((m) => m.index).join(', ') || 'none';
-            throw new Error(`No stored smart option ${index}. Available options: ${available}`);
-        }
-        if (!match.cssSelector) {
-            throw new Error(`Stored smart option ${index} is missing a cssSelector`);
-        }
-        await page.click(match.cssSelector);
-        // Remember which element we interacted with so follow-up "type" commands
-        // can reuse the same control without re-discovering it.
-        this.state.lastFocusedSelector = match.cssSelector;
     }
     storeSelector(key, info) {
         this.state.selectors.set(key, info);
