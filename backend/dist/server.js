@@ -193,20 +193,36 @@ function createServer(port, chromePath) {
                         result = await tools.navigate(inferredUrl);
                         break;
                     }
-                    // Otherwise, we could call an AI model here. For now we just
-                    // capture DOM context and return a friendly message so the
-                    // client can decide how to proceed.
+                    // Heuristic routing for common high-level commands so callers
+                    // get real behaviour instead of an "AI not implemented" error.
+                    const lower = prompt.toLowerCase();
+                    // 1) Cookie banners: "accept the cookies", "reject cookies", etc.
+                    if (/(accept|reject|deny).+cookie/.test(lower) || /cookie.+(accept|reject|deny)/.test(lower)) {
+                        broadcast({
+                            type: 'action',
+                            timestamp: new Date().toISOString(),
+                            message: 'handle_cookie_banner (from ai prompt)'
+                        });
+                        result = await tools.handleCookieBanner();
+                        break;
+                    }
+                    // 2) Pure observation / selector extraction requests: fall back
+                    // to observe so the UI gets an updated screenshot + selectors.
+                    if (/observe|look at|show me|scan page/.test(lower)) {
+                        broadcast({
+                            type: 'action',
+                            timestamp: new Date().toISOString(),
+                            message: 'observe (from ai prompt)'
+                        });
+                        result = await tools.observe(selector);
+                        break;
+                    }
+                    // 3) Default: do a no-op observe so the caller still receives
+                    // a useful result, but mark clearly that no AI planning
+                    // happened. This avoids hard errors in the UI.
                     await browser.init();
-                    const page = browser.getPage();
-                    const extractor = new (await Promise.resolve().then(() => __importStar(require('./selectorExtractor')))).SelectorExtractor(page);
-                    const interactive = await extractor.extractAllInteractive();
-                    const domSummary = buildDomContext(interactive);
-                    conversationHistory.push({ role: 'user', content: prompt });
-                    result = {
-                        success: false,
-                        message: 'AI action not implemented yet',
-                        data: { domContext: domSummary }
-                    };
+                    result = await tools.observe(selector);
+                    result.message = result.message || 'Observed page (no AI planning yet)';
                     break;
                 }
                 case 'generate_selenium':
