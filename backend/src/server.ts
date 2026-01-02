@@ -2,6 +2,7 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 import WebSocket, { WebSocketServer } from 'ws';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { BrowserManager } from './browserManager';
 import { McpTools } from './mcpTools';
 import { ExecutionResult, WebSocketMessage, ExecutionCommand, ElementInfo } from './types';
@@ -106,33 +107,100 @@ export function createServer(port: number, chromePath?: string) {
     }
   }
 
-  // Helper: build a compact DOM context summary for the AI.
-  function buildDomContext(elements: ElementInfo[], maxItems = 80): string {
-    const lines: string[] = [];
+  async function handleAiAction(prompt: string, selector?: string): Promise<ExecutionResult> {
+    const apiKey = process.env.GEMINI_API_KEY;
+    const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-    // Prefer visible elements; if all are hidden, fall back to everything.
-    const visible = elements.filter((el) => el.visible !== false);
-    const pool = visible.length > 0 ? visible : elements;
-
-    for (const [index, el] of pool.slice(0, maxItems).entries()) {
-      const text = (el.text ?? '').replace(/\s+/g, ' ').trim();
-      const aria = el.ariaLabel ?? '';
-      const label = text || aria || '(no text)';
-      const selector = el.cssSelector ?? el.xpath ?? '';
-      const region = el.region ?? 'main';
-      const flags: string[] = [];
-      if (el.searchField) flags.push('searchField');
-      if (el.roleHint && el.roleHint !== 'other') flags.push(el.roleHint);
-      const flagsStr = flags.length ? ` [${flags.join(', ')}]` : '';
-      lines.push(
-        `${index + 1}. (${region}) <${el.tagName}> label="${label.slice(0, 80)}" selector="${selector.slice(
-          0,
-          120
-        )}"${flagsStr}`
-      );
+    if (!apiKey) {
+      return {
+        success: false,
+        message: 'GEMINI_API_KEY is not configured on the server',
+        error: 'Missing GEMINI_API_KEY environment variable'
+      };
     }
 
-    return lines.join('\n');
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: modelName });
+
+    // 1) Look: capture current page state.
+    await browser.init();
+    const observation = await tools.observe(selector);
+    const elements = observation.selectors ?? [];
+    const domSummary = buildDomContext(elements);
+    const domForModel = domSummary.length > 8000 ? domSummary.slice(0, 8000) : domSummary;
+
+    type PlannedAction =
+      | { action: 'navigate'; url: string }
+      | { action: 'click'; selector: string }
+      | { action: 'type'; selector: string; text: string }
+      | { action: 'noop' };
+
+    const heuristicUrl = extractUrlFromPrompt(prompt);
+
+    const lines: string[] = [];
+    lines.push('You are a web automation planner for a headless browser.');
+    lines.push('');
+    lines.push('User request:');
+    lines.push(prompt);
+    lines.push('');
+    lines.push('Heuristic URL parsed from the request (may be empty if none found):');
+    lines.push(heuristicUrl ?? '');
+    lines.push('');
+    lines.push('Current page elements (compact summary):');
+    lines.push(domForModel);
+    lines.push('');
+    lines.push('Decide ONE best next action for the agent.');
+    lines.push('');
+    lines.push('Return ONLY a JSON object with this TypeScript type (no markdown, no extra text):');
+    lines.push('');
+    lines.push('type PlannedAction =');
+    lines.push('  | { "action": "navigate"; "url": string }');
+    lines.push('  | { "action": "click"; "selector": string }');
+    lines.push('  | { "action": "type"; "selector": string; "text": string }');
+    lines.push('  | { "action": "noop" };');
+
+    const planningPrompt = lines.join('\n');
+
+    const response = await model.generateContent(planningPrompt);
+    const rawText = response.response.text();
+
+    let parsed: PlannedAction;
+    try {
+      // Ensure we only parse the JSON object even if the model adds stray text.
+      const firstBrace = rawText.indexOf('{');
+      const lastBrace = rawText.lastIndexOf('}');
+      const jsonSlice =
+        firstBrace >= 0 && lastBrace > firstBrace
+          ? rawText.slice(firstBrace, lastBrace + 1)
+          : rawText;
+      parsed = JSON.parse(jsonSlice) as PlannedAction;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        message: `Failed to parse AI plan: ${msg}`,
+        error: `Failed to parse AI plan: ${msg}`,
+        screenshot: observation.screenshot,
+        selectors: elements
+      };
+    }
+
+    // 3) Act: route to the appropriate tool based on the structured plan.
+    switch (parsed.action) {
+      case 'navigate':
+        return tools.navigate(parsed.url);
+      case 'click':
+        return tools.click(parsed.selector);
+      case 'type':
+        return tools.type(parsed.selector, parsed.text);
+      case 'noop':
+      default:
+        // Just return the observation; AI chose to do nothing.
+        return {
+          ...observation,
+          message: observation.message || 'Observed page only (AI chose no safe action)'
+        };
+    }
   }
 
   app.post('/api/execute', async (req, res) => {
@@ -179,51 +247,13 @@ export function createServer(port: number, chromePath?: string) {
         case 'ai': {
           if (!prompt) throw new Error('prompt required');
 
-          // First: deterministic navigation intent handling.
-          const inferredUrl = extractUrlFromPrompt(prompt);
-          if (inferredUrl) {
-            broadcast({
-              type: 'action',
-              timestamp: new Date().toISOString(),
-              message: `navigate (from ai prompt) ${inferredUrl}`
-            });
-            result = await tools.navigate(inferredUrl);
-            break;
-          }
+          broadcast({
+            type: 'action',
+            timestamp: new Date().toISOString(),
+            message: `ai_plan "${prompt.slice(0, 120)}"`
+          });
 
-          // Heuristic routing for common high-level commands so callers
-          // get real behaviour instead of an "AI not implemented" error.
-          const lower = prompt.toLowerCase();
-
-          // 1) Cookie banners: "accept the cookies", "reject cookies", etc.
-          if (/(accept|reject|deny).+cookie/.test(lower) || /cookie.+(accept|reject|deny)/.test(lower)) {
-            broadcast({
-              type: 'action',
-              timestamp: new Date().toISOString(),
-              message: 'handle_cookie_banner (from ai prompt)'
-            });
-            result = await tools.handleCookieBanner();
-            break;
-          }
-
-          // 2) Pure observation / selector extraction requests: fall back
-          // to observe so the UI gets an updated screenshot + selectors.
-          if (/observe|look at|show me|scan page/.test(lower)) {
-            broadcast({
-              type: 'action',
-              timestamp: new Date().toISOString(),
-              message: 'observe (from ai prompt)'
-            });
-            result = await tools.observe(selector);
-            break;
-          }
-
-          // 3) Default: do a no-op observe so the caller still receives
-          // a useful result, but mark clearly that no AI planning
-          // happened. This avoids hard errors in the UI.
-          await browser.init();
-          result = await tools.observe(selector);
-          result.message = result.message || 'Observed page (no AI planning yet)';
+          result = await handleAiAction(prompt, selector);
           break;
         }
         case 'generate_selenium':
