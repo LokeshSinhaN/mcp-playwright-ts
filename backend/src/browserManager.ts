@@ -343,12 +343,19 @@ export class BrowserManager {
    */
   async handleCookieBanner(): Promise<boolean> {
     const page = this.getPage();
-
-    const candidates = [
-      page.getByRole('button', { name: /accept( all)? cookies/i }),
-      page.getByRole('button', { name: /i agree/i }),
-      page.locator('button', { hasText: /accept cookies/i })
-    ];
+ 
+     const candidates = [
+       // Common "accept" patterns, including "Accept additional cookies" and
+       // other variations where "accept" appears before "cookies".
+       page.getByRole('button', { name: /accept.*cookies/i }),
+       page.locator('button', { hasText: /accept.*cookies/i }),
+       // Common "reject/deny" patterns, so the same helper can be reused if
+       // you later want a "reject cookies" flow.
+       page.getByRole('button', { name: /reject.*cookies/i }),
+       page.locator('button', { hasText: /reject.*cookies/i }),
+       // Generic consent text some sites use.
+       page.getByRole('button', { name: /i agree/i })
+     ];
 
     for (const locator of candidates) {
       try {

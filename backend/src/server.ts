@@ -90,8 +90,27 @@ export function createServer(port: number, chromePath?: string) {
     chromePath
   });
   const tools = new McpTools(browser);
-
-  const clients = new Set<WebSocket>();
+ 
+   const clients = new Set<WebSocket>();
+ 
+   // Deterministic helper: for clear cookie-banner intents (accept/allow/close
+   // cookies), try the dedicated cookie handler before invoking the LLM. This
+   // avoids unnecessary hallucinations when the task is simple.
+   async function maybeHandleCookieFromPrompt(prompt: string): Promise<ExecutionResult | null> {
+     const lower = prompt.toLowerCase();
+ 
+     if (!/cookie/.test(lower)) return null;
+     if (!/(accept|allow|agree|ok|close|dismiss|reject|deny)/.test(lower)) return null;
+ 
+     const result = await tools.handleCookieBanner();
+     // tools.handleCookieBanner always returns success=true; only treat it as
+     // a real action if a banner was actually dismissed.
+     if (result.message.toLowerCase().startsWith('cookie banner dismissed')) {
+       return result;
+     }
+ 
+     return null;
+   }
 
   // Simple in-memory history placeholder; you can wire this into a real
   // AI call later if needed.
@@ -122,21 +141,148 @@ export function createServer(port: number, chromePath?: string) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    // 1) Look: capture current page state.
+    // For obvious cookie-banner prompts, prefer the deterministic handler
+    // first so the LLM does not need to plan anything.
+    const cookieResult = await maybeHandleCookieFromPrompt(prompt);
+    if (cookieResult) {
+      return cookieResult;
+    }
+
+    // 1) LOOK: capture current page state and candidate elements.
     await browser.init();
     const observation = await tools.observe(selector);
     const elements = observation.selectors ?? [];
-    const domSummary = buildDomContext(elements);
-    const domForModel = domSummary.length > 8000 ? domSummary.slice(0, 8000) : domSummary;
+
+    type AiElement = {
+      id: string;
+      tagName: string;
+      role: string;
+      region: string;
+      text: string;
+      ariaLabel: string;
+      selector: string;
+      visible: boolean;
+    };
+
+    const baseCandidates: AiElement[] = elements
+      .map((el, idx) => {
+        const selectorValue = el.cssSelector ?? el.xpath ?? '';
+        return {
+          id: `el_${idx}`,
+          tagName: (el.tagName || '').toLowerCase(),
+          role: el.roleHint ?? 'other',
+          region: el.region ?? 'main',
+          text: el.text ?? '',
+          ariaLabel: el.ariaLabel ?? '',
+          selector: selectorValue,
+          visible: el.visible !== false
+        } satisfies AiElement;
+      })
+      .filter((e) => !!e.selector);
+
+    // Prefer visible elements only; let the model decide which ones matter.
+    let aiElements: AiElement[] = baseCandidates.filter((e) => e.visible);
+
+    // --- Prompt‑aware re‑ranking so we never drop the most relevant elements ---
+    const rawPrompt = prompt.toLowerCase();
+    const stopWords = new Set([
+      'the',
+      'a',
+      'an',
+      'on',
+      'in',
+      'at',
+      'to',
+      'for',
+      'of',
+      'and',
+      'or',
+      'please',
+      'click',
+      'press',
+      'button',
+      'link',
+      'field',
+      'box',
+      'banner',
+      'from',
+      'this',
+      'that'
+    ]);
+
+    const promptTokens = rawPrompt
+      .split(/[^a-z0-9]+/)
+      .map((w) => w.trim())
+      .filter((w) => w.length >= 3 && !stopWords.has(w));
+
+    const interactiveTagOrder = new Map<AiElement['tagName'], number>([
+      ['input', 0],
+      ['textarea', 0],
+      ['button', 1],
+      ['a', 2]
+    ]);
+
+    const scored = aiElements.map((el) => {
+      const haystack = `${el.text} ${el.ariaLabel}`.toLowerCase();
+      let score = 0;
+
+      for (const token of promptTokens) {
+        if (!token) continue;
+        if (haystack.includes(token)) {
+          // Strong boost for exact token matches from the prompt.
+          score += 3;
+        }
+      }
+
+      // Mild boost if element role matches obvious intent words.
+      if (/search|find/.test(rawPrompt) && el.role === 'input' && /search/i.test(haystack)) {
+        score += 2;
+      }
+
+      // Cookie/consent specific boost, but phrased generically so it also
+      // helps with any prompt mentioning those words.
+      if (/cookie|consent|privacy/.test(rawPrompt) && /cookie|consent|privacy/i.test(haystack)) {
+        score += 3;
+      }
+
+      // Prefer clearly labeled controls over nearly-empty ones.
+      const labelLength = (el.text || el.ariaLabel || '').trim().length;
+      if (labelLength >= 3) {
+        score += 1;
+      }
+
+      const tagBias = interactiveTagOrder.has(el.tagName) ? interactiveTagOrder.get(el.tagName)! : 3;
+
+      return { el, score, tagBias };
+    });
+
+    scored.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score; // higher score first
+      if (a.tagBias !== b.tagBias) return a.tagBias - b.tagBias; // prefer inputs/textareas, then buttons, then links
+
+      // Stable-ish fallback: shorter, more descriptive text first.
+      const aText = (a.el.text || a.el.ariaLabel || '').length;
+      const bText = (b.el.text || b.el.ariaLabel || '').length;
+      return aText - bText;
+    });
+
+    aiElements = scored.map((s) => s.el);
+
+    // Limit the number of elements we send to Gemini to keep the prompt small.
+    // We allow a slightly larger cap to reduce the chance of dropping
+    // important controls on dense pages like medical portals.
+    const limitedElements = aiElements.slice(0, 120);
+    const elementsJson = JSON.stringify(limitedElements, null, 2);
 
     type PlannedAction =
       | { action: 'navigate'; url: string }
-      | { action: 'click'; selector: string }
-      | { action: 'type'; selector: string; text: string }
+      | { action: 'click'; elementId: string }
+      | { action: 'type'; elementId: string; text: string }
       | { action: 'noop' };
 
     const heuristicUrl = extractUrlFromPrompt(prompt);
 
+    // 2) THINK: build a constrained planning prompt.
     const lines: string[] = [];
     lines.push('You are a web automation planner for a headless browser.');
     lines.push('');
@@ -146,23 +292,26 @@ export function createServer(port: number, chromePath?: string) {
     lines.push('Heuristic URL parsed from the request (may be empty if none found):');
     lines.push(heuristicUrl ?? '');
     lines.push('');
-    lines.push('Current page elements (compact summary):');
-    lines.push(domForModel);
+    lines.push('You may ONLY click or type into elements from the following JSON array named "elements":');
+    lines.push('elements = ' + elementsJson);
     lines.push('');
-    lines.push('Decide ONE best next action for the agent.');
+    lines.push('Rules:');
+    lines.push('- Do NOT invent new selectors, ids, or elements.');
+    lines.push('- If you choose to click or type, you MUST reference the element by its "id" field (e.g., "el_3").');
+    lines.push('- If the user says "click [input/box]" or refers to a text box/field, prefer INPUT or TEXTAREA elements over BUTTON elements with similar labels.');
+    lines.push('- If no safe or relevant action can be taken, choose action "noop".');
     lines.push('');
-    lines.push('Return ONLY a JSON object with this TypeScript type (no markdown, no extra text):');
-    lines.push('');
+    lines.push('Return ONLY a JSON value of this TypeScript union type (no markdown, no comments):');
     lines.push('type PlannedAction =');
     lines.push('  | { "action": "navigate"; "url": string }');
-    lines.push('  | { "action": "click"; "selector": string }');
-    lines.push('  | { "action": "type"; "selector": string; "text": string }');
+    lines.push('  | { "action": "click"; "elementId": string }');
+    lines.push('  | { "action": "type"; "elementId": string; "text": string }');
     lines.push('  | { "action": "noop" };');
 
     const planningPrompt = lines.join('\n');
 
-    const response = await model.generateContent(planningPrompt);
-    const rawText = response.response.text();
+    const response = await model.generateContent(planningPrompt as any);
+    const rawText = (response as any).response.text();
 
     let parsed: PlannedAction;
     try {
@@ -185,14 +334,34 @@ export function createServer(port: number, chromePath?: string) {
       };
     }
 
-    // 3) Act: route to the appropriate tool based on the structured plan.
+    // 3) ACT: route to the appropriate tool based on the structured plan.
     switch (parsed.action) {
       case 'navigate':
         return tools.navigate(parsed.url);
-      case 'click':
-        return tools.click(parsed.selector);
-      case 'type':
-        return tools.type(parsed.selector, parsed.text);
+      case 'click': {
+        const target = limitedElements.find((e) => e.id === parsed.elementId);
+        if (!target) {
+          return {
+            ...observation,
+            success: false,
+            message: `AI chose invalid elementId: ${parsed.elementId}`,
+            error: `Invalid elementId: ${parsed.elementId}`
+          };
+        }
+        return tools.click(target.selector);
+      }
+      case 'type': {
+        const target = limitedElements.find((e) => e.id === parsed.elementId);
+        if (!target) {
+          return {
+            ...observation,
+            success: false,
+            message: `AI chose invalid elementId: ${parsed.elementId}`,
+            error: `Invalid elementId: ${parsed.elementId}`
+          };
+        }
+        return tools.type(target.selector, parsed.text);
+      }
       case 'noop':
       default:
         // Just return the observation; AI chose to do nothing.
