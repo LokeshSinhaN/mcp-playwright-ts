@@ -6,7 +6,7 @@ export class SelectorExtractor {
 
   async extractAllInteractive(): Promise<ElementInfo[]> {
     const handles = await this.page.$$(
-      'button, a, input, textarea, select, [role=button], [role=link], [onclick]'
+      'button, a, input, textarea, select, [role=button], [role=link], [role="option"], [onclick], li[onclick], img[onclick], div[onclick]'
     );
 
     const results: ElementInfo[] = [];

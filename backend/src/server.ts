@@ -180,97 +180,13 @@ export function createServer(port: number, chromePath?: string) {
       })
       .filter((e) => !!e.selector);
 
-    // Prefer visible elements only; let the model decide which ones matter.
-    let aiElements: AiElement[] = baseCandidates.filter((e) => e.visible);
+    // Prefer visible elements only, but otherwise preserve the natural DOM order
+    // as returned by the extractor so the model can infer relationships from
+    // spatial layout (labels next to inputs, grouped controls, etc.).
+    const aiElements: AiElement[] = baseCandidates.filter((e) => e.visible);
 
-    // --- Prompt‑aware re‑ranking so we never drop the most relevant elements ---
-    const rawPrompt = prompt.toLowerCase();
-    const stopWords = new Set([
-      'the',
-      'a',
-      'an',
-      'on',
-      'in',
-      'at',
-      'to',
-      'for',
-      'of',
-      'and',
-      'or',
-      'please',
-      'click',
-      'press',
-      'button',
-      'link',
-      'field',
-      'box',
-      'banner',
-      'from',
-      'this',
-      'that'
-    ]);
-
-    const promptTokens = rawPrompt
-      .split(/[^a-z0-9]+/)
-      .map((w) => w.trim())
-      .filter((w) => w.length >= 3 && !stopWords.has(w));
-
-    const interactiveTagOrder = new Map<AiElement['tagName'], number>([
-      ['input', 0],
-      ['textarea', 0],
-      ['button', 1],
-      ['a', 2]
-    ]);
-
-    const scored = aiElements.map((el) => {
-      const haystack = `${el.text} ${el.ariaLabel}`.toLowerCase();
-      let score = 0;
-
-      for (const token of promptTokens) {
-        if (!token) continue;
-        if (haystack.includes(token)) {
-          // Strong boost for exact token matches from the prompt.
-          score += 3;
-        }
-      }
-
-      // Mild boost if element role matches obvious intent words.
-      if (/search|find/.test(rawPrompt) && el.role === 'input' && /search/i.test(haystack)) {
-        score += 2;
-      }
-
-      // Cookie/consent specific boost, but phrased generically so it also
-      // helps with any prompt mentioning those words.
-      if (/cookie|consent|privacy/.test(rawPrompt) && /cookie|consent|privacy/i.test(haystack)) {
-        score += 3;
-      }
-
-      // Prefer clearly labeled controls over nearly-empty ones.
-      const labelLength = (el.text || el.ariaLabel || '').trim().length;
-      if (labelLength >= 3) {
-        score += 1;
-      }
-
-      const tagBias = interactiveTagOrder.has(el.tagName) ? interactiveTagOrder.get(el.tagName)! : 3;
-
-      return { el, score, tagBias };
-    });
-
-    scored.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score; // higher score first
-      if (a.tagBias !== b.tagBias) return a.tagBias - b.tagBias; // prefer inputs/textareas, then buttons, then links
-
-      // Stable-ish fallback: shorter, more descriptive text first.
-      const aText = (a.el.text || a.el.ariaLabel || '').length;
-      const bText = (b.el.text || b.el.ariaLabel || '').length;
-      return aText - bText;
-    });
-
-    aiElements = scored.map((s) => s.el);
-
-    // Limit the number of elements we send to Gemini to keep the prompt small.
-    // We allow a slightly larger cap to reduce the chance of dropping
-    // important controls on dense pages like medical portals.
+    // Limit the number of elements we send to Gemini to keep the request small,
+    // but preserve order instead of re-ranking heuristically.
     const limitedElements = aiElements.slice(0, 120);
     const elementsJson = JSON.stringify(limitedElements, null, 2);
 
@@ -285,6 +201,8 @@ export function createServer(port: number, chromePath?: string) {
     // 2) THINK: build a constrained planning prompt.
     const lines: string[] = [];
     lines.push('You are a web automation planner for a headless browser.');
+    lines.push('You can see a screenshot of the current page (PNG image) and a JSON list of interactive elements.');
+    lines.push('Use the visual layout to disambiguate between elements with similar labels (e.g., navigation links vs primary buttons).');
     lines.push('');
     lines.push('User request:');
     lines.push(prompt);
@@ -298,7 +216,9 @@ export function createServer(port: number, chromePath?: string) {
     lines.push('Rules:');
     lines.push('- Do NOT invent new selectors, ids, or elements.');
     lines.push('- If you choose to click or type, you MUST reference the element by its "id" field (e.g., "el_3").');
-    lines.push('- If the user says "click [input/box]" or refers to a text box/field, prefer INPUT or TEXTAREA elements over BUTTON elements with similar labels.');
+    lines.push('- Use the screenshot to resolve ambiguities when multiple elements share similar labels (for example, a "Search" navigation link vs. a "Search" button next to an input).');
+    lines.push('- Treat dropdowns and select-like controls as a two-step interaction: (1) click the control to open the list, optionally wait for it to appear, then (2) click the specific option element (often with role="option" or rendered as a list item).');
+    lines.push('- When planning actions for dropdowns, plan clicks only on elements that are present in the provided elements JSON; do NOT assume hidden options are clickable until they appear.');
     lines.push('- If no safe or relevant action can be taken, choose action "noop".');
     lines.push('');
     lines.push('Return ONLY a JSON value of this TypeScript union type (no markdown, no comments):');
@@ -310,7 +230,25 @@ export function createServer(port: number, chromePath?: string) {
 
     const planningPrompt = lines.join('\n');
 
-    const response = await model.generateContent(planningPrompt as any);
+    // Prefer using the current screenshot as a visual grounding signal for the planner.
+    const screenshotDataUrl = observation.screenshot;
+    const imageBase64 =
+      screenshotDataUrl && screenshotDataUrl.startsWith('data:')
+        ? screenshotDataUrl.split(',')[1]
+        : screenshotDataUrl || undefined;
+
+    const response = imageBase64
+      ? await model.generateContent([
+          {
+            inlineData: {
+              data: imageBase64,
+              mimeType: 'image/png'
+            }
+          },
+          { text: planningPrompt }
+        ] as any)
+      : await model.generateContent(planningPrompt as any);
+
     const rawText = (response as any).response.text();
 
     let parsed: PlannedAction;
