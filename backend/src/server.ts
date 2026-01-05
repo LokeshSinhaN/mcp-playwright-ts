@@ -230,24 +230,29 @@ export function createServer(port: number, chromePath?: string) {
 
     const planningPrompt = lines.join('\n');
 
-    // Prefer using the current screenshot as a visual grounding signal for the planner.
+    // Build multimodal parts for Gemini: a text prompt and a PNG screenshot.
     const screenshotDataUrl = observation.screenshot;
     const imageBase64 =
-      screenshotDataUrl && screenshotDataUrl.startsWith('data:')
+      screenshotDataUrl && screenshotDataUrl.startsWith('data:image/png;base64,')
+        ? screenshotDataUrl.replace('data:image/png;base64,', '')
+        : screenshotDataUrl && screenshotDataUrl.startsWith('data:')
         ? screenshotDataUrl.split(',')[1]
         : screenshotDataUrl || undefined;
 
-    const response = imageBase64
-      ? await model.generateContent([
-          {
+    const textPart = { text: planningPrompt } as const;
+    const imagePart =
+      imageBase64 != null
+        ? ({
             inlineData: {
               data: imageBase64,
               mimeType: 'image/png'
             }
-          },
-          { text: planningPrompt }
-        ] as any)
-      : await model.generateContent(planningPrompt as any);
+          } as const)
+        : null;
+
+    const response = imagePart
+      ? await model.generateContent([textPart, imagePart] as any)
+      : await model.generateContent(textPart as any);
 
     const rawText = (response as any).response.text();
 

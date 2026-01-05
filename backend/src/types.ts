@@ -23,6 +23,10 @@ export interface ElementInfo {
   region?: 'header' | 'main' | 'footer';
   // Bounding box (CSS pixels, viewport-relative).
   boundingBox?: { x: number; y: number; width: number; height: number };
+  // Optional smart context string that captures nearby labels or section headers
+  // to disambiguate otherwise similar elements (e.g., identical buttons in
+  // different cards).
+  context?: string;
   attributes: Record<string, string | undefined>;
 }
 

@@ -41,9 +41,12 @@ export class SelectorExtractor {
       else if (tagName === 'a') roleHint = 'link';
       else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') roleHint = 'input';
 
-      const typeAttr = (el.getAttribute && el.getAttribute('type')) || '';
-      const placeholder = (el.getAttribute && el.getAttribute('placeholder')) || '';
-      const ariaLabel = (el.getAttribute && el.getAttribute('aria-label')) || '';
+      const getAttr = (name: string): string =>
+        typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
+
+      const typeAttr = getAttr('type');
+      const placeholder = getAttr('placeholder');
+      const ariaLabel = getAttr('aria-label');
       const isSearchField =
         tagName === 'input' &&
         (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
@@ -52,6 +55,69 @@ export class SelectorExtractor {
       let region: 'header' | 'main' | 'footer' = 'main';
       if (rect.top < viewportHeight * 0.25) region = 'header';
       else if (rect.top > viewportHeight * 0.75) region = 'footer';
+
+      // --- Smart Context computation ---
+      const getText = (node: any | null): string => {
+        if (!node) return '';
+        const txt = (node.textContent || '').trim();
+        return txt;
+      };
+
+      const isSectionHeader = (node: any | null): boolean => {
+        if (!node || node.nodeType !== 1) return false;
+        const t = (node.tagName || '').toLowerCase();
+        if (/^h[1-6]$/.test(t)) return true;
+
+        const role = getAttr.call(node, 'role');
+        if (role && role.toLowerCase() === 'heading') return true;
+
+        const id = (node.id || '').toLowerCase();
+        const className = (node.className || '').toLowerCase();
+        const combined = `${id} ${className}`;
+        const keywords = ['title', 'header', 'name', 'card-label', 'profile'];
+        return keywords.some((k) => combined.includes(k));
+      };
+
+      const findSectionHeaderContext = (start: any): string => {
+        let current: any = start;
+        let depth = 0;
+        while (current && depth < 7) {
+          let sib = current.previousElementSibling;
+          while (sib) {
+            if (isSectionHeader(sib)) {
+              const txt = getText(sib);
+              if (txt) return txt;
+            }
+            sib = sib.previousElementSibling;
+          }
+          current = current.parentElement;
+          depth++;
+        }
+        return '';
+      };
+
+      let context: string | undefined;
+
+      // Strategy 1: immediate visual context for inputs (labels next to fields).
+      if (roleHint === 'input') {
+        const directLabel = getText(el.previousElementSibling);
+        let gridLabel = '';
+        if (!directLabel && el.parentElement) {
+          gridLabel = getText(el.parentElement.previousElementSibling);
+        }
+        const combined = [directLabel, gridLabel].filter(Boolean).join(' | ');
+        if (combined) {
+          context = combined;
+        }
+      }
+
+      // Strategy 2: DOM-walk for section headers for all interactive elements.
+      if (!context && (roleHint === 'button' || roleHint === 'link' || roleHint === 'other' || roleHint === 'input')) {
+        const header = findSectionHeaderContext(el);
+        if (header) {
+          context = header;
+        }
+      }
 
       return {
         tagName,
@@ -64,6 +130,7 @@ export class SelectorExtractor {
         searchField: isSearchField,
         region,
         boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+        context,
         attrs: Array.from(el.attributes).map((a: any) => [a.name, a.value] as const)
       };
     });
@@ -84,6 +151,7 @@ export class SelectorExtractor {
       searchField: base.searchField,
       region: base.region,
       boundingBox: base.boundingBox,
+      context: base.context,
       attributes: Object.fromEntries(base.attrs)
     };
   }
