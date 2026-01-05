@@ -68,11 +68,22 @@ export class SelectorExtractor {
         const t = (node.tagName || '').toLowerCase();
         if (/^h[1-6]$/.test(t)) return true;
 
-        const role = getAttr.call(node, 'role');
-        if (role && role.toLowerCase() === 'heading') return true;
+        // Use safe attribute access to avoid SVGAnimatedString / non-string className issues.
+        const roleAttr =
+          typeof (node as any).getAttribute === 'function'
+            ? (node as any).getAttribute('role') || ''
+            : '';
+        if (roleAttr && roleAttr.toLowerCase() === 'heading') return true;
 
-        const id = (node.id || '').toLowerCase();
-        const className = (node.className || '').toLowerCase();
+        const rawId = (node as any).id ?? '';
+        const id = (typeof rawId === 'string' ? rawId : String(rawId)).toLowerCase();
+        const classStr =
+          typeof (node as any).getAttribute === 'function'
+            ? (node as any).getAttribute('class') || ''
+            : typeof (node as any).className === 'string'
+            ? (node as any).className
+            : '';
+        const className = classStr.toLowerCase();
         const combined = `${id} ${className}`;
         const keywords = ['title', 'header', 'name', 'card-label', 'profile'];
         return keywords.some((k) => combined.includes(k));
