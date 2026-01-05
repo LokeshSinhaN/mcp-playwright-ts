@@ -90,29 +90,63 @@ export class SelectorExtractor {
 
   private async generateCss(handle: ElementHandle): Promise<string> {
     return handle.evaluate((el: any) => {
-      if (el.id) return `#${el.id}`;
-      if (el.getAttribute('data-testid')) {
-        return `[data-testid="${el.getAttribute('data-testid')}"]`;
+      const doc = el.ownerDocument || (typeof document !== 'undefined' ? document : null);
+      const tag = (el.tagName || '').toLowerCase();
+      const getAttr = (name: string): string | null =>
+        typeof el.getAttribute === 'function' ? el.getAttribute(name) : null;
+      const escapeAttr = (value: string) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+      // 1) Prefer stable single-attribute selectors that are resilient to
+      // layout changes.
+      if (el.id) {
+        return `#${el.id}`;
       }
 
+      const dataTestId = getAttr('data-testid');
+      if (dataTestId) {
+        return `[data-testid="${escapeAttr(dataTestId)}"]`;
+      }
+
+      const nameAttr = getAttr('name');
+      if (nameAttr) {
+        return `${tag}[name="${escapeAttr(nameAttr)}"]`;
+      }
+
+      const ariaLabel = getAttr('aria-label');
+      if (ariaLabel) {
+        // Prefer role+aria-label for interactive controls when possible.
+        const role = getAttr('role');
+        if (role) {
+          return `[role="${escapeAttr(role)}"][aria-label="${escapeAttr(ariaLabel)}"]`;
+        }
+        return `${tag}[aria-label="${escapeAttr(ariaLabel)}"]`;
+      }
+
+      // 2) Fallback: structural selector chain with limited class usage and
+      // nth-child. This is inherently more brittle, so only use it when we
+      // couldn't derive any robust attribute-based selector.
       const parts: string[] = [];
       let curr: any = el;
-      const doc = el.ownerDocument || (typeof document !== 'undefined' ? document : null);
-      
+
       while (curr && curr !== (doc ? doc.body : null)) {
-        let part = curr.tagName.toLowerCase();
+        let part = (curr.tagName || '').toLowerCase();
+        if (!part) break;
+
         if (curr.id) {
           part += `#${curr.id}`;
           parts.unshift(part);
           break;
         }
 
-        const classes = (curr.className || '')
-          .split(/\s+/)
-          .filter(Boolean)
-          .slice(0, 2)
-          .map((c: string) => `.${c}`);
-        if (classes.length) part += classes.join('');
+        const className = curr.className || '';
+        if (typeof className === 'string') {
+          const classes = className
+            .split(/\s+/)
+            .filter(Boolean)
+            .slice(0, 2)
+            .map((c: string) => `.${c}`);
+          if (classes.length) part += classes.join('');
+        }
 
         const parent = curr.parentElement;
         if (parent) {

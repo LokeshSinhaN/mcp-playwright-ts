@@ -27,6 +27,13 @@ export class BrowserManager {
     return this.config.timeoutMs;
   }
 
+  // Default per-click timeout (in ms). Navigation and other operations can
+  // still use the broader session timeout, but individual clicks should not
+  // fail too aggressively on slower, hydrated UIs.
+  private get clickTimeout(): number {
+    return 10000; // 10 seconds
+  }
+
   async init(): Promise<void> {
     if (this.browser) return; // idempotent
 
@@ -262,10 +269,19 @@ export class BrowserManager {
 
   async click(selector: string): Promise<ElementInfo> {
     // 1. Find best locator (frames, fuzzy, etc.)
-    const locator = await this.smartLocate(selector, this.defaultTimeout);
+    const baseLocator = await this.smartLocate(selector, this.defaultTimeout);
+    const locator = baseLocator.first();
 
-    // 2. Wait for it to be ready
-    await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
+    // 2. "Soft" wait for visibility to handle hydration delays. We log but do
+    // not immediately fail if the wait times out; a later forced click may
+    // still succeed.
+    try {
+      await locator.waitFor({ state: 'visible', timeout: this.clickTimeout });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Soft wait for click target timed out for selector "${selector}": ${msg}`);
+    }
+
     await locator.scrollIntoViewIfNeeded();
 
     // 3. Extract robust info before clicking (in case click navigates away)
@@ -280,14 +296,23 @@ export class BrowserManager {
       // ignore extraction errors, proceed to click
     }
 
-    // 3. Click
-    await locator.click({ timeout: this.defaultTimeout });
+    // 4. Primary click attempt, with a final forced-click fallback to handle
+    // transient overlays such as cookie banners or modals.
+    try {
+      await locator.click({ timeout: this.clickTimeout });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Primary click failed for selector "${selector}": ${msg}. Retrying with force.`);
+      try {
+        await locator.click({ timeout: this.clickTimeout, force: true });
+      } catch (forceErr) {
+        const forceMsg = forceErr instanceof Error ? forceErr.message : String(forceErr);
+        throw new Error(`Unable to click element found by "${selector}": ${forceMsg || msg}`);
+      }
+    }
 
-    // Re-resolve if we failed to extract before? No, strict flow.
-    // If we couldn't extract, we return a dummy info or throw?
-    // We'll return the info if we got it, or a basic one.
     if (info) return info;
-    
+
     // Fallback if extraction failed (shouldn't happen often)
     return {
       tagName: 'unknown',

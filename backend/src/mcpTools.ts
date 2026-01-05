@@ -1,7 +1,7 @@
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
-import { ExecutionCommand, ExecutionResult } from './types';
+import { ExecutionCommand, ExecutionResult, ElementInfo } from './types';
 
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
@@ -33,27 +33,85 @@ export class McpTools {
 
     try {
       const info = await this.browser.click(selector);
-      
+
       // Use the robust CSS from the extraction if available, otherwise fallback
       const robustSelector = info.cssSelector || selector;
       this.sessionHistory.push({ action: 'click', target: robustSelector });
 
       const screenshot = await this.browser.screenshot();
-      return { 
-        success: true, 
-        message: `Clicked ${selector}`, 
+      return {
+        success: true,
+        message: `Clicked ${selector}`,
         screenshot,
-        selectors: [info] 
+        selectors: [info]
       };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const screenshot = await this.browser.screenshot().catch(() => undefined as any);
-      let selectors;
+    } catch (primaryErr) {
+      // --- Self-healing click: retry using a text-based locator when we know
+      // the button's label from previously observed selectors. This helps when
+      // a brittle CSS selector breaks on dynamic pages.
+      let healedInfo: ElementInfo | undefined;
+      let healSucceeded = false;
+
       try {
-        selectors = await extractor.extractAllInteractive();
+        const knownSelectors = this.browser.getSelectors();
+        const matched = knownSelectors.find(
+          (s) => s.cssSelector === selector || s.xpath === selector
+        );
+
+        const label = matched?.text || matched?.ariaLabel;
+        if (label) {
+          const escaped = label
+            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/\s+/g, '\\s+');
+          const regex = new RegExp(escaped, 'i');
+
+          const locator = page.getByText(regex);
+          const target = locator.first();
+
+          await target.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+          await target.scrollIntoViewIfNeeded();
+
+          const handle = await target.elementHandle();
+          if (handle) {
+            healedInfo = await extractor.extractFromHandle(handle);
+          }
+
+          await target.click({ timeout: 10000 }).catch(async () => {
+            // Final attempt with force in case of overlays.
+            await target.click({ timeout: 10000, force: true });
+          });
+
+          const info = healedInfo || matched;
+          if (info) {
+            const robustSelector = info.cssSelector || selector;
+            this.sessionHistory.push({ action: 'click', target: robustSelector });
+          }
+
+          const screenshot = await this.browser.screenshot();
+          healSucceeded = true;
+          return {
+            success: true,
+            message: `Clicked ${selector} via text match on label "${label}"`,
+            screenshot,
+            selectors: info ? [info] : undefined
+          };
+        }
       } catch {
-        selectors = undefined;
+        // If self-healing fails for any reason, we fall back to the standard
+        // error reporting path below.
       }
+
+      const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+      const screenshot = await this.browser.screenshot().catch(() => undefined as any);
+      let selectors: ElementInfo[] | undefined;
+      if (!healSucceeded) {
+        try {
+          selectors = await extractor.extractAllInteractive();
+        } catch {
+          selectors = undefined;
+        }
+      }
+
       return {
         success: false,
         message: msg,
