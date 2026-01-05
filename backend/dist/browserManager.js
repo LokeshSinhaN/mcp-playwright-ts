@@ -77,7 +77,7 @@ class BrowserManager {
         // Capture only the current viewport at a larger size instead of a full-page
         // tall image. This makes the preview appear closer to a maximized view
         // instead of a shrunk-down full-page thumbnail.
-        const buf = await page.screenshot({ fullPage: false });
+        const buf = await page.screenshot({ fullPage: true });
         const base64 = buf.toString('base64');
         const dataUrl = `data:image/png;base64,${base64}`;
         this.state.lastScreenshot = dataUrl;
