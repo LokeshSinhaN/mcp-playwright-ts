@@ -12,3 +12,50 @@ This frontend is the user interface of the app. It has pages where users can log
 - Tailwind CSS: For styling the pages
 
 ## Folder Structure
+
+```
+frontend/
+├── package.json
+├── README.md
+├── tsconfig.json
+├── vite.config.ts
+└── src/
+    ├── index.html
+    ├── main.js
+    ├── main.ts
+    ├── styles.css
+    └── services/
+        ├── api.js
+        ├── api.ts
+        ├── websocket.js
+        └── websocket.ts
+```
+
+## Installation
+
+1. Navigate to the frontend directory:
+   ```bash
+   cd frontend
+   ```
+
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+## Running the Frontend
+
+- For development:
+  ```bash
+  npm run dev
+  ```
+
+- For production build:
+  ```bash
+  npm run build
+  npm run preview
+  ```
+
+## Development
+
+- `npm run type-check`: Check TypeScript types

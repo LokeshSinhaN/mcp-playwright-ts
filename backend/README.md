@@ -12,3 +12,52 @@ This backend is the server part of the app. It provides APIs for the frontend to
 - JWT: Handles user authentication
 
 ## Folder Structure
+
+```
+backend/
+├── package.json
+├── README.md
+├── tsconfig.json
+└── src/
+    ├── browserManager.ts
+    ├── index.ts
+    ├── mcpTools.ts
+    ├── selectorExtractor.ts
+    ├── seleniumGenerator.ts
+    ├── server.ts
+    └── types.ts
+```
+
+## Installation
+
+1. Navigate to the backend directory:
+   ```bash
+   cd backend
+   ```
+
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+## Running the Backend
+
+- For development:
+  ```bash
+  npm run dev
+  ```
+
+- For production:
+  ```bash
+  npm run build
+  npm start
+  ```
+
+## API Endpoints
+
+- Add details about API endpoints here if available.
+
+## Development
+
+- `npm run type-check`: Check TypeScript types
+- `npm run clean`: Clean build directory
