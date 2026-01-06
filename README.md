@@ -15,27 +15,6 @@
 - [Contributing](#contributing)
 - [License](#license)
 
-## Table of Contents
-- [Project Overview](#project-overview)
-- [Technology Stack](#technology-stack)
-- [Project Structure](#project-structure)
-- [Installation and Setup](#installation-and-setup)
-- [Running the Application](#running-the-application)
-- [Features and Functionality](#features-and-functionality)
-- [Development Workflow](#development-workflow)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
-- [Project Overview](#project-overview)
-- [Technology Stack](#technology-stack)
-- [Project Structure](#project-structure)
-- [Installation and Setup](#installation-and-setup)
-- [Running the Application](#running-the-application)
-- [Features and Functionality](#features-and-functionality)
-- [Development Workflow](#development-workflow)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## Project Overview
 This project implements a **Model Context Protocol (MCP) server** that enables AI models to interact with and automate web browsers using Playwright. It consists of a backend MCP server that handles AI-driven web automation tasks and a frontend web interface for users to control and monitor the automation in real-time.
