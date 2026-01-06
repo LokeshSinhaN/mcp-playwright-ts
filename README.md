@@ -16,37 +16,48 @@
 - [License](#license)
 
 ## Project Overview
-This application is a full-stack TypeScript project that helps users automate web tasks using Playwright. It has a backend server that handles data and logic, and a frontend interface where users can interact with it. Anyone who wants to test or automate websites can use this app, like developers or testers.
+This project implements a **Model Context Protocol (MCP) server** that enables AI models to interact with and automate web browsers using Playwright. It consists of a backend MCP server that handles AI-driven web automation tasks and a frontend web interface for users to control and monitor the automation in real-time.
+
+The system allows AI assistants to:
+- Navigate websites
+- Click buttons and links
+- Fill forms and input fields
+- Extract information from web pages
+- Take screenshots
+- Handle cookie banners automatically
+
+Users can give natural language instructions through the web interface, and the AI (powered by Google's Gemini) interprets these commands to perform the appropriate browser actions. All activity is streamed in real-time via WebSocket connections.
 
 ### Key Features
-- ✅ Automate browser actions with Playwright
-- ✅ Simple web interface to control tasks
-- ✅ Backend API for managing data
-- ✅ TypeScript for better code quality
+- ✅ **AI-Powered Web Automation**: Uses Gemini AI to understand natural language commands
+- ✅ **Real-Time Web Interface**: Live chat interface with screenshot updates
+- ✅ **MCP Protocol Support**: Standard protocol for AI tool integration
+- ✅ **Headless Browser Control**: Automated Playwright browser sessions
+- ✅ **TypeScript Implementation**: Full type safety and modern development practices
 
 ## Technology Stack
 ### Frontend Technologies
-- React: For building the user interface
-- TypeScript: For adding types to JavaScript
-- Playwright: For testing and automating web pages
-- Vite: For fast development builds
-- Axios: For making API calls
+- **Vanilla TypeScript**: For building the interactive web interface
+- **WebSocket API**: For real-time communication with the backend
+- **HTML5/CSS3**: For the user interface layout and styling
+- **Vite**: For fast development builds and hot reloading
 
 ### Backend Technologies
-- Express: For creating the server and APIs
-- TypeScript: For typed JavaScript
-- Dotenv: For managing secret settings
-- Cors: For allowing cross-origin requests
-- Mongoose: For connecting to MongoDB database
+- **Express.js**: For creating the HTTP server and REST API endpoints
+- **WebSocket Server**: For real-time streaming of browser automation events
+- **Playwright**: For headless browser automation and web scraping
+- **Google Gemini AI**: For natural language understanding and action planning
+- **TypeScript**: For type-safe server-side development
+- **CORS**: For cross-origin request handling
 
 ### Development Tools
-- Node.js: Runtime for running JavaScript
-- npm: Package manager for installing tools
-- Git: For version control
+- **Node.js**: Runtime environment for both frontend and backend
+- **npm**: Package management and script running
+- **Git**: Version control system
 
-### Database and Authentication
-- MongoDB: Database to store data
-- JWT: For user login and security
+### AI and Automation
+- **Model Context Protocol (MCP)**: Standard for AI tool integration
+- **Headless Chrome/Chromium**: Browser engine for automation
 
 ## Project Structure
 
@@ -99,7 +110,15 @@ mcp-playwright-ts/
    npm install
    ```
 
-3. Create a `.env` file in the backend directory with necessary environment variables (e.g., database URL, JWT secret).
+3. Create a `.env` file in the backend directory with required environment variables:
+   ```env
+   GEMINI_API_KEY=your_google_gemini_api_key_here
+   GEMINI_MODEL=gemini-2.5-flash
+   PORT=5000
+   CHROMEDRIVER_PATH=/path/to/chromium  # Optional, for custom Chrome path
+   ```
+
+4. Get a Google Gemini API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
 
 ### Frontend Setup
 1. Navigate to the frontend directory:
@@ -146,25 +165,41 @@ mcp-playwright-ts/
 
 ## Features and Functionality
 
-- **Browser Automation**: Use Playwright to automate web tasks.
-- **Web Interface**: User-friendly interface for managing tasks.
-- **API Backend**: RESTful API for data management.
-- **TypeScript Support**: Full TypeScript implementation for better code quality.
+- **Natural Language Web Control**: Give commands like "go to google.com and search for TypeScript" and watch the AI execute them
+- **Real-Time Visual Feedback**: See live screenshots as the browser navigates and interacts with pages
+- **Intelligent Element Detection**: AI automatically identifies clickable elements, forms, and interactive components
+- **Chat-Based Interface**: Conversational UI for issuing commands and receiving status updates
+- **WebSocket Streaming**: Instant updates of browser actions, screenshots, and AI decisions
+- **Cookie Banner Handling**: Automatic detection and dismissal of cookie consent banners
+- **Selector Extraction**: Advanced algorithms to find reliable CSS selectors and XPath expressions
+- **Selenium Code Generation**: Export browser actions as Selenium WebDriver code
+- **Headless Operation**: Runs invisibly in the background, perfect for automation scripts
 
 ## Development Workflow
 
-1. Clone the repository.
-2. Set up the backend and frontend as described in Installation.
-3. Make changes to the code.
-4. Run tests and type checks.
-5. Commit and push changes.
+1. **Setup**: Clone the repository and follow the installation steps above
+2. **Backend Development**: 
+   - Modify server logic in `backend/src/`
+   - Add new MCP tools in `mcpTools.ts`
+   - Test AI integration with different prompts
+3. **Frontend Development**:
+   - Update the UI in `frontend/src/`
+   - Enhance real-time features and user experience
+4. **Testing**: 
+   - Run both servers and test end-to-end automation
+   - Try various natural language commands
+   - Verify WebSocket streaming works correctly
+5. **Build & Deploy**: Use the production build commands for deployment
 
 ## Troubleshooting
 
-- Ensure Node.js version is 18+.
-- Check that all dependencies are installed.
-- Verify environment variables are set correctly.
-- For frontend issues, check browser console for errors.
+- **"GEMINI_API_KEY is not configured"**: Make sure you have set the GEMINI_API_KEY in your backend .env file
+- **WebSocket connection fails**: Ensure the backend server is running on the expected port
+- **Browser automation not working**: Check that Chrome/Chromium is installed and accessible
+- **Screenshots not updating**: Verify WebSocket connection is stable
+- **AI not understanding commands**: Try more specific instructions, like "click the blue button" instead of "click that button"
+- **Node.js version issues**: Ensure you're using Node.js 18 or higher
+- **Port conflicts**: Change the PORT in .env if 5000 is already in use
 
 ## Contributing
 

@@ -1,15 +1,21 @@
 # Frontend for mcp-playwright-ts
 
 ## What This Frontend Does
-This frontend is the user interface of the app. It has pages where users can log in, create tasks, and see results. Users click buttons and fill forms to interact with the app.
+This frontend provides a user-friendly web interface for interacting with the MCP Playwright server. It features a chat-based UI where users can type natural language commands to control web browser automation. The interface displays real-time screenshots of the browser session and shows live logs of AI actions and decisions.
+
+Users can:
+- Send commands like "navigate to google.com" or "click the search button"
+- View live browser screenshots as actions are performed
+- See AI reasoning and action logs in real-time
+- Monitor WebSocket connection status
+- Take manual screenshots on demand
 
 ## Technologies Used
-- React: Library for building UI components
-- TypeScript: For typed JavaScript
-- Playwright: For testing the UI
-- Vite: Tool for fast development
-- Axios: For calling backend APIs
-- Tailwind CSS: For styling the pages
+- **Vanilla TypeScript**: No framework overhead for simple, fast interface
+- **WebSocket API**: Real-time connection to the backend server
+- **HTML5 Canvas/CSS3**: For displaying screenshots and styling
+- **Vite**: Modern build tool for development and production
+- **Fetch API**: For HTTP requests to the backend
 
 ## Folder Structure
 
