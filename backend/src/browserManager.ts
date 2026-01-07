@@ -268,6 +268,8 @@ export class BrowserManager {
   }
 
   async click(selector: string): Promise<ElementInfo> {
+    const page = this.getPage();
+
     // 1. Find best locator (frames, fuzzy, etc.)
     const baseLocator = await this.smartLocate(selector, this.defaultTimeout);
     const locator = baseLocator.first();
@@ -283,6 +285,23 @@ export class BrowserManager {
     }
 
     await locator.scrollIntoViewIfNeeded();
+
+    // Briefly highlight the chosen element for visual debugging and to make it
+    // obvious which node the AI decided to interact with.
+    try {
+      await locator.evaluate((el: any) => {
+        try {
+          (el as HTMLElement).style.outline = '3px solid red';
+          (el as HTMLElement).style.backgroundColor =
+            (el as HTMLElement).style.backgroundColor || 'rgba(255, 0, 0, 0.08)';
+        } catch {
+          // ignore styling errors from non-HTMLElement targets (e.g. SVG)
+        }
+      });
+      await page.waitForTimeout(250);
+    } catch {
+      // Highlighting is best-effort only; do not fail the click on these errors.
+    }
 
     // 3. Extract robust info before clicking (in case click navigates away)
     let info: ElementInfo | undefined;

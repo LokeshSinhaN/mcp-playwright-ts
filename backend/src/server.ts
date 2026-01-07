@@ -76,6 +76,41 @@ function buildDomContext(elements: ElementInfo[], maxItems = 80): string {
   return lines.join('\n');
 }
 
+// Helper: Clean LLM responses that contain Markdown or conversational text and extract JSON.
+function parseAiResponse(text: string): any {
+  // Fast path: try direct parse first.
+  try {
+    return JSON.parse(text);
+  } catch {
+    // fall through to more robust strategies below
+  }
+
+  // 1) Look for a fenced ```json code block.
+  const markdownMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
+  if (markdownMatch && markdownMatch[1]) {
+    const inner = markdownMatch[1].trim();
+    return JSON.parse(inner);
+  }
+
+  // 2) Look for any fenced ``` code block.
+  const genericBlockMatch = text.match(/```\s*([\s\S]*?)\s*```/);
+  if (genericBlockMatch && genericBlockMatch[1]) {
+    const inner = genericBlockMatch[1].trim();
+    return JSON.parse(inner);
+  }
+
+  // 3) Fallback: Find the first '{' and last '}' to strip surrounding chatter.
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    const jsonCandidate = text.substring(first, last + 1).trim();
+    return JSON.parse(jsonCandidate);
+  }
+
+  // If we reach here, we have no plausible JSON object.
+  throw new Error(`Invalid JSON format. Raw output (truncated): ${text.substring(0, 100)}...`);
+}
+
 export function createServer(port: number, chromePath?: string) {
   const app = express();
   const server = http.createServer(app);
@@ -154,28 +189,67 @@ export function createServer(port: number, chromePath?: string) {
     const elements = observation.selectors ?? [];
 
     type AiElement = {
-      id: string;
+      /** Stable identifier used by the LLM to reference this element. */
+      elementId: string;
+      /** Raw DOM id attribute, if present. */
+      domId: string;
       tagName: string;
       role: string;
       region: string;
       text: string;
       ariaLabel: string;
+      placeholder: string;
+      title: string;
+      dataTestId: string;
+      href: string;
+      context: string;
+      /** Primary selector for interaction (CSS/XPath). */
       selector: string;
       visible: boolean;
+      /** Optional bounding box in viewport coordinates. */
+      x?: number;
+      y?: number;
+      width?: number;
+      height?: number;
+      /** Human-readable location summary for the LLM (e.g. "x:120,y:340"). */
+      location: string;
     };
 
     const baseCandidates: AiElement[] = elements
       .map((el, idx) => {
-        const selectorValue = el.cssSelector ?? el.xpath ?? '';
+        const selectorValue = el.selector ?? el.cssSelector ?? el.xpath ?? '';
+        const rect = el.boundingBox ?? el.rect;
+        const x = rect?.x;
+        const y = rect?.y;
+        const width = rect?.width;
+        const height = rect?.height;
+        const hasCoords =
+          typeof x === 'number' && typeof y === 'number' && typeof width === 'number' && typeof height === 'number';
+
         return {
-          id: `el_${idx}`,
+          elementId: `el_${idx}`,
+          domId: el.id ?? '',
           tagName: (el.tagName || '').toLowerCase(),
           role: el.roleHint ?? 'other',
           region: el.region ?? 'main',
           text: el.text ?? '',
           ariaLabel: el.ariaLabel ?? '',
+          placeholder: el.placeholder ?? '',
+          title: el.title ?? '',
+          dataTestId: el.dataTestId ?? '',
+          href: el.href ?? '',
+          context: el.context ?? '',
           selector: selectorValue,
-          visible: el.visible !== false
+          visible: el.visible !== false && el.isVisible !== false,
+          x: hasCoords ? Math.round(x as number) : undefined,
+          y: hasCoords ? Math.round(y as number) : undefined,
+          width: hasCoords ? Math.round(width as number) : undefined,
+          height: hasCoords ? Math.round(height as number) : undefined,
+          location: hasCoords
+            ? `x:${Math.round(x as number)},y:${Math.round(y as number)},w:${Math.round(
+                width as number
+              )},h:${Math.round(height as number)}`
+            : 'unknown'
         } satisfies AiElement;
       })
       .filter((e) => !!e.selector);
@@ -186,23 +260,32 @@ export function createServer(port: number, chromePath?: string) {
     const aiElements: AiElement[] = baseCandidates.filter((e) => e.visible);
 
     // Limit the number of elements we send to Gemini to keep the request small,
-    // but preserve order instead of re-ranking heuristically.
-    const limitedElements = aiElements.slice(0, 120);
+    // but preserve order instead of re-ranking heuristically. Increase the cap
+    // on complex sites so important elements below the fold are still visible.
+    const limitedElements = aiElements.slice(0, 300);
     const elementsJson = JSON.stringify(limitedElements, null, 2);
 
-    type PlannedAction =
-      | { action: 'navigate'; url: string }
-      | { action: 'click'; elementId: string }
-      | { action: 'type'; elementId: string; text: string }
-      | { action: 'noop' };
+    type ReasonedAction =
+      | { thought: string; action: 'navigate'; url: string }
+      | { thought: string; action: 'click'; elementId?: string; semanticTarget?: string }
+      | { thought: string; action: 'type'; elementId?: string; semanticTarget?: string; text: string }
+      | { thought: string; action: 'noop' };
 
     const heuristicUrl = extractUrlFromPrompt(prompt);
 
     // 2) THINK: build a constrained planning prompt.
     const lines: string[] = [];
-    lines.push('You are a web automation planner for a headless browser.');
-    lines.push('You can see a screenshot of the current page (PNG image) and a JSON list of interactive elements.');
-    lines.push('Use the visual layout to disambiguate between elements with similar labels (e.g., navigation links vs primary buttons).');
+    lines.push('SYSTEM ROLE: You are a Selenium Code Generation Specialist.');
+    lines.push(
+      'Your primary goal is to choose the **exact DOM element** that best satisfies the user request so that reliable Selenium code can be generated later.'
+    );
+    lines.push(
+      'You see a JSON list of interactive elements (`elements`) and an optional screenshot of the current page.'
+    );
+    lines.push(
+      'You MUST select elements by analyzing exact text and attributes from the JSON list. Use the screenshot ONLY to verify visibility/position when multiple JSON candidates look similar.'
+    );
+    lines.push('Never guess selectors or invent elements that are not present in the JSON list.');
     lines.push('');
     lines.push('User request:');
     lines.push(prompt);
@@ -213,20 +296,50 @@ export function createServer(port: number, chromePath?: string) {
     lines.push('You may ONLY click or type into elements from the following JSON array named "elements":');
     lines.push('elements = ' + elementsJson);
     lines.push('');
-    lines.push('Rules:');
-    lines.push('- Do NOT invent new selectors, ids, or elements.');
-    lines.push('- If you choose to click or type, you MUST reference the element by its "id" field (e.g., "el_3").');
-    lines.push('- Use the screenshot to resolve ambiguities when multiple elements share similar labels (for example, a "Search" navigation link vs. a "Search" button next to an input).');
-    lines.push('- Treat dropdowns and select-like controls as a two-step interaction: (1) click the control to open the list, optionally wait for it to appear, then (2) click the specific option element (often with role="option" or rendered as a list item).');
-    lines.push('- When planning actions for dropdowns, plan clicks only on elements that are present in the provided elements JSON; do NOT assume hidden options are clickable until they appear.');
+    lines.push('### INSTRUCTIONS ###');
+    lines.push('- The viewport coordinate system starts at the top-left corner (x=0,y=0).');
+    lines.push('- The "location" field encodes the element bounding box as x,y,w,h.');
+    lines.push('- Larger y values mean the element is lower on the page; larger x values mean it is further to the right.');
+    lines.push('- When the user says "under" some text, prefer elements with a greater y (below) but similar x-range.');
+    lines.push('- When the user says "above", prefer elements with a smaller y (above).');
+    lines.push('');
+    lines.push('Reasoning requirements:');
+    lines.push('- Always think step-by-step about which element best matches the request.');
+    lines.push(
+      '- Prefer elements whose DOM attributes (id, dataTestId, text, ariaLabel, placeholder, title, href, context) closely match the user request.'
+    );
+    lines.push(
+      '- When you can confidently map the request to a specific element in `elements`, output its `elementId` field.'
+    );
+    lines.push(
+      '- ONLY when there is **no** suitable element in the JSON list, omit `elementId` and instead set `semanticTarget` to a short natural-language description (e.g., "Login button").'
+    );
     lines.push('- If no safe or relevant action can be taken, choose action "noop".');
     lines.push('');
-    lines.push('Return ONLY a JSON value of this TypeScript union type (no markdown, no comments):');
-    lines.push('type PlannedAction =');
-    lines.push('  | { "action": "navigate"; "url": string }');
-    lines.push('  | { "action": "click"; "elementId": string }');
-    lines.push('  | { "action": "type"; "elementId": string; "text": string }');
-    lines.push('  | { "action": "noop" };');
+    lines.push('### RESPONSE FORMAT ###');
+    lines.push(
+      'You MUST return ONLY a raw JSON object. Do not wrap it in markdown (```json). Do not add explanations outside the JSON.'
+    );
+    lines.push('Example:');
+    lines.push(
+      '{ "thought": "I see the login button in the main section", "action": "click", "elementId": "el_12" }'
+    );
+    lines.push('');
+    lines.push('Return ONLY a JSON object of this TypeScript union type (no markdown, no comments):');
+    lines.push('type ReasonedAction =');
+    lines.push('  | { "thought": string; "action": "navigate"; "url": string }');
+    lines.push(
+      '  | { "thought": string; "action": "click"; "elementId"?: string; "semanticTarget"?: string }'
+    );
+    lines.push(
+      '  | { "thought": string; "action": "type"; "elementId"?: string; "semanticTarget"?: string; "text": string }'
+    );
+    lines.push('  | { "thought": string; "action": "noop" };');
+    lines.push('');
+    lines.push('Field rules:');
+    lines.push('- `thought` must contain your step-by-step reasoning in plain English.');
+    lines.push('- For `click` and `type`, prefer setting `elementId` that exactly matches one of elements[].elementId.');
+    lines.push('- Only use `semanticTarget` when no suitable elementId exists; this string will be used for fuzzy matching.');
 
     const planningPrompt = lines.join('\n');
 
@@ -255,19 +368,14 @@ export function createServer(port: number, chromePath?: string) {
       : await model.generateContent(textPart as any);
 
     const rawText = (response as any).response.text();
+    console.log('Gemini raw response:', rawText);
 
-    let parsed: PlannedAction;
+    let parsed: ReasonedAction;
     try {
-      // Ensure we only parse the JSON object even if the model adds stray text.
-      const firstBrace = rawText.indexOf('{');
-      const lastBrace = rawText.lastIndexOf('}');
-      const jsonSlice =
-        firstBrace >= 0 && lastBrace > firstBrace
-          ? rawText.slice(firstBrace, lastBrace + 1)
-          : rawText;
-      parsed = JSON.parse(jsonSlice) as PlannedAction;
+      parsed = parseAiResponse(rawText) as ReasonedAction;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      console.error('Failed to parse AI plan:', msg);
       return {
         success: false,
         message: `Failed to parse AI plan: ${msg}`,
@@ -277,40 +385,90 @@ export function createServer(port: number, chromePath?: string) {
       };
     }
 
+    // OBSERVABILITY: broadcast the model's reasoning before executing any action.
+    if ((parsed as any).thought) {
+      broadcast({
+        type: 'log',
+        timestamp: new Date().toISOString(),
+        message: `ai_thought: ${String(parsed.thought).slice(0, 400)}`,
+        data: {
+          role: 'reason-then-act',
+          thought: parsed.thought,
+          action: parsed.action,
+          plan: parsed
+        }
+      });
+    }
+
     // 3) ACT: route to the appropriate tool based on the structured plan.
     switch (parsed.action) {
-      case 'navigate':
-        return tools.navigate(parsed.url);
-      case 'click': {
-        const target = limitedElements.find((e) => e.id === parsed.elementId);
-        if (!target) {
+      case 'navigate': {
+        const targetUrl = parsed.url || heuristicUrl || '';
+        if (!targetUrl) {
           return {
             ...observation,
             success: false,
-            message: `AI chose invalid elementId: ${parsed.elementId}`,
-            error: `Invalid elementId: ${parsed.elementId}`
+            message: 'AI requested navigation but did not provide a URL',
+            error: 'Missing URL in ReasonedAction'
           };
         }
-        return tools.click(target.selector);
+        return tools.navigate(targetUrl);
+      }
+      case 'click': {
+        const byId = parsed.elementId
+          ? limitedElements.find((e) => e.elementId === parsed.elementId)
+          : undefined;
+
+        // STRICT ID PRIORITY: when a matching elementId exists, always use its selector.
+        if (byId && byId.selector) {
+          return tools.click(byId.selector);
+        }
+
+        // Fallback: semantic target for fuzzy matching inside McpTools.
+        if (parsed.semanticTarget) {
+          return tools.click(parsed.semanticTarget);
+        }
+
+        return {
+          ...observation,
+          success: false,
+          message:
+            'AI returned a click action without a valid elementId or semanticTarget; no action was taken.',
+          error: 'Invalid ReasonedAction for click'
+        };
       }
       case 'type': {
-        const target = limitedElements.find((e) => e.id === parsed.elementId);
-        if (!target) {
-          return {
-            ...observation,
-            success: false,
-            message: `AI chose invalid elementId: ${parsed.elementId}`,
-            error: `Invalid elementId: ${parsed.elementId}`
-          };
+        const byId = parsed.elementId
+          ? limitedElements.find((e) => e.elementId === parsed.elementId)
+          : undefined;
+
+        // STRICT ID PRIORITY: when a matching elementId exists, always use its selector.
+        if (byId && byId.selector) {
+          return tools.type(byId.selector, parsed.text);
         }
-        return tools.type(target.selector, parsed.text);
+
+        // Fallback: semantic target for fuzzy matching inside McpTools.
+        if (parsed.semanticTarget) {
+          return tools.type(parsed.semanticTarget, parsed.text);
+        }
+
+        return {
+          ...observation,
+          success: false,
+          message:
+            'AI returned a type action without a valid elementId or semanticTarget; no action was taken.',
+          error: 'Invalid ReasonedAction for type'
+        };
       }
       case 'noop':
       default:
         // Just return the observation; AI chose to do nothing.
         return {
           ...observation,
-          message: observation.message || 'Observed page only (AI chose no safe action)'
+          message:
+            observation.message || (parsed.action === 'noop'
+              ? 'Observed page only (AI chose no safe action)'
+              : 'Observed page only (AI action was unrecognized)')
         };
     }
   }
