@@ -364,37 +364,79 @@ export class BrowserManager {
   /**
    * Best-effort handler for common cookie/consent banners.
    * It silently does nothing if no banner is found.
-   * Returns true if a banner was detected and dismissed.
+   * Returns the ElementInfo for the clicked consent button, or null.
    */
-  async handleCookieBanner(): Promise<boolean> {
+  async handleCookieBanner(): Promise<ElementInfo | null> {
     const page = this.getPage();
- 
-     const candidates = [
-       // Common "accept" patterns, including "Accept additional cookies" and
-       // other variations where "accept" appears before "cookies".
-       page.getByRole('button', { name: /accept.*cookies/i }),
-       page.locator('button', { hasText: /accept.*cookies/i }),
-       // Common "reject/deny" patterns, so the same helper can be reused if
-       // you later want a "reject cookies" flow.
-       page.getByRole('button', { name: /reject.*cookies/i }),
-       page.locator('button', { hasText: /reject.*cookies/i }),
-       // Generic consent text some sites use.
-       page.getByRole('button', { name: /i agree/i })
-     ];
+    const extractor = new SelectorExtractor(page);
 
-    for (const locator of candidates) {
+    const candidates: Locator[] = [
+      // Common "accept" patterns, including "Accept additional cookies" and
+      // other variations where "accept" appears before "cookies".
+      page.getByRole('button', { name: /accept.*cookies?/i }),
+      page.locator('button', { hasText: /accept.*cookies?/i }),
+      page.getByRole('button', { name: /accept all/i }),
+      page.locator('button', { hasText: /accept all/i }),
+      page.getByRole('button', { name: /allow all/i }),
+      page.locator('button', { hasText: /allow all/i }),
+      page.getByRole('button', { name: /agree/i }),
+      page.locator('button', { hasText: /agree/i }),
+      page.getByRole('button', { name: /got it/i }),
+      page.locator('button', { hasText: /got it/i }),
+      // Common "reject/deny" patterns, so the same helper can be reused if
+      // you later want a "reject cookies" flow.
+      page.getByRole('button', { name: /reject.*cookies?/i }),
+      page.locator('button', { hasText: /reject.*cookies?/i }),
+      page.getByRole('button', { name: /deny.*cookies?/i }),
+      page.locator('button', { hasText: /deny.*cookies?/i }),
+      // Generic consent text some sites use.
+      page.getByRole('button', { name: /i agree/i }),
+      page.locator('button', { hasText: /i agree/i }),
+      page.getByRole('button', { name: /dismiss/i }),
+      page.locator('button', { hasText: /dismiss/i })
+    ];
+
+    for (const base of candidates) {
+      const locator = base.first();
       try {
-        if (await locator.isVisible({ timeout: 2000 })) {
-          await locator.scrollIntoViewIfNeeded();
-          await locator.click({ timeout: 5000 });
-          return true;
+        if (!(await locator.isVisible({ timeout: 2000 }))) continue;
+
+        await locator.scrollIntoViewIfNeeded();
+
+        // Try to extract selector info before we click, to survive navigation.
+        let info: ElementInfo | null = null;
+        try {
+          const handle = await locator.elementHandle();
+          if (handle) {
+            info = await extractor.extractFromHandle(handle);
+          }
+        } catch {
+          info = null;
         }
+
+        try {
+          await locator.click({ timeout: 5000 });
+        } catch {
+          // Final attempt with force in case of overlays.
+          await locator.click({ timeout: 5000, force: true });
+        }
+
+        if (info) {
+          // Store for later self-healing and history use.
+          const key = `cookie_${Date.now()}`;
+          this.storeSelector(key, info);
+          return info;
+        }
+
+        // If we reached here, we clicked but failed to extract metadata;
+        // still treat it as handled but without selector details.
+        return null;
       } catch {
-        // Ignore individual locator timeouts; move to next candidate.
+        // Ignore individual locator errors; move to next candidate.
       }
     }
 
-    return false;
+    return null;
   }
 
   isOpen(): boolean {
