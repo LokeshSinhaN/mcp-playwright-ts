@@ -6,12 +6,50 @@ export class SelectorExtractor {
 
   async extractAllInteractive(): Promise<ElementInfo[]> {
     const handles = await this.page.$$(
-      'button, a, input, textarea, select, [role=button], [role=link], [role="option"], [onclick], li[onclick], img[onclick], div[onclick]'
+      [
+        'button',
+        'a',
+        'input',
+        'textarea',
+        'select',
+        '[role=button]',
+        '[role=link]',
+        '[role="option"]',
+        '[role="search"]',
+        '[onclick]',
+        'li[onclick]',
+        'img[onclick]',
+        'div[onclick]',
+        // Button-like and icon/search affordances commonly used with event delegation.
+        '[class*="btn" i]',
+        '[class*="button" i]',
+        '[class*="icon" i]',
+        '[class*="search" i]',
+        // SVG icons that explicitly indicate pointer interactions.
+        'svg[cursor="pointer"]'
+      ].join(', ')
     );
 
     const results: ElementInfo[] = [];
+    const seen = new Set<string>();
+
     for (const h of handles) {
       const info = await this.extractFromHandle(h);
+      if (!info) continue;
+
+      const bbox = info.boundingBox || info.rect || { x: 0, y: 0, width: 0, height: 0 };
+      const key = [
+        info.tagName,
+        info.id ?? '',
+        info.className ?? '',
+        info.text ?? '',
+        info.ariaLabel ?? '',
+        info.href ?? '',
+        `${bbox.x},${bbox.y}`
+      ].join('|');
+
+      if (seen.has(key)) continue;
+      seen.add(key);
       results.push(info);
     }
 
@@ -47,6 +85,9 @@ export class SelectorExtractor {
       const typeAttr = getAttr('type');
       const placeholder = getAttr('placeholder');
       const ariaLabel = getAttr('aria-label');
+      const titleAttr = getAttr('title');
+      const dataTestId = getAttr('data-testid');
+      const href = getAttr('href');
       const isSearchField =
         tagName === 'input' &&
         (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
@@ -130,12 +171,31 @@ export class SelectorExtractor {
         }
       }
 
+      // Smart text extraction: prefer accessible helper text such as .sr-only or
+      // .visually-hidden children when present (often used for icon buttons).
+      let srOnlyText = '';
+      if (typeof el.querySelectorAll === 'function') {
+        const hiddenNodes = el.querySelectorAll('.sr-only, .visually-hidden');
+        srOnlyText = Array.from(hiddenNodes)
+          .map((n: any) => (n.textContent || '').trim())
+          .filter(Boolean)
+          .join(' ')
+          .trim();
+      }
+
+      const rawText = (el.textContent || '').trim();
+      const mainText = (srOnlyText || rawText) || undefined;
+
       return {
         tagName,
         id: el.id || undefined,
         className: el.className || undefined,
-        text: el.textContent?.trim() || undefined,
+        text: mainText,
         ariaLabel,
+        placeholder: placeholder || undefined,
+        title: titleAttr || undefined,
+        dataTestId: dataTestId || undefined,
+        href,
         visible,
         roleHint,
         searchField: isSearchField,
@@ -155,13 +215,20 @@ export class SelectorExtractor {
       className: base.className,
       text: base.text,
       ariaLabel: base.ariaLabel,
+      placeholder: base.placeholder,
+      title: base.title,
+      dataTestId: base.dataTestId,
+      href: base.href,
       cssSelector,
       xpath,
+      selector: cssSelector,
       visible: base.visible,
+      isVisible: base.visible,
       roleHint: base.roleHint,
       searchField: base.searchField,
       region: base.region,
       boundingBox: base.boundingBox,
+      rect: base.boundingBox,
       context: base.context,
       attributes: Object.fromEntries(base.attrs)
     };
@@ -262,5 +329,91 @@ export class SelectorExtractor {
 
       return '/' + segments.join('/');
     });
+  }
+
+  /**
+   * Universal candidate finder with weighted scoring over all interactive
+   * elements on the page.
+   */
+  async findCandidates(query: string): Promise<ElementInfo[]> {
+    const all = await this.extractAllInteractive();
+    const lowerQuery = query.toLowerCase().trim();
+    if (!lowerQuery) return [];
+
+    const scored = all
+      .map((info) => ({ info, score: this.scoreCandidate(info, lowerQuery) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    return scored.map((s) => s.info);
+  }
+
+  /**
+   * Backwards-compatible helper that now delegates to findCandidates().
+   */
+  async findRelatedElements(query: string): Promise<ElementInfo[]> {
+    return this.findCandidates(query);
+  }
+
+  /**
+   * Weighted scoring according to the spec:
+   *  - 100 pts: exact text/aria-label match (full phrase or individual term)
+   *  - 50  pts: partial text/aria-label match
+   *  - 25  pts: semantic boost when the query mentions "icon" or "search" and
+   *             the element id/class names include those terms.
+   * Additional small boosts prefer visible elements in the header region and
+   * known search fields to keep results intuitive.
+   */
+  private scoreCandidate(info: ElementInfo, lowerQuery: string): number {
+    let score = 0;
+
+    const text = (info.text || '').toLowerCase();
+    const label = (info.ariaLabel || '').toLowerCase();
+    const id = (info.id || '').toLowerCase();
+    const className = (info.className || '').toLowerCase();
+
+    const terms = lowerQuery.split(/\s+/).filter(Boolean);
+
+    // 100 pts: exact match on full query or any individual term.
+    const hasExact =
+      text === lowerQuery ||
+      label === lowerQuery ||
+      terms.some((t) => t.length > 1 && (text === t || label === t));
+    if (hasExact) {
+      score += 100;
+    }
+
+    // 50 pts: any partial match on text or aria-label.
+    const hasPartial =
+      text.includes(lowerQuery) ||
+      label.includes(lowerQuery) ||
+      terms.some((t) => t.length > 1 && (text.includes(t) || label.includes(t)));
+    if (hasPartial) {
+      score += 50;
+    }
+
+    // 25 pts: semantic boost for icon/search terminology in id/class.
+    const queryHasIcon = lowerQuery.includes('icon');
+    const queryHasSearch = lowerQuery.includes('search');
+
+    if (queryHasIcon && (id.includes('icon') || className.includes('icon'))) {
+      score += 25;
+    }
+    if (queryHasSearch && (id.includes('search') || className.includes('search'))) {
+      score += 25;
+    }
+
+    // Small tie-breakers: visible + header region + known search fields.
+    if (info.isVisible !== false) {
+      score += 5;
+    }
+    if (info.region === 'header') {
+      score += 5;
+    }
+    if (info.searchField && queryHasSearch) {
+      score += 10;
+    }
+
+    return score;
   }
 }

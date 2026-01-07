@@ -23,101 +23,127 @@ export class McpTools {
   }
 
   /**
-   * Click an element, always returning a structured result.
-   * On failure we include the latest screenshot and a snapshot of
-   * interactive elements so the LLM can retry or ask clarifying questions.
+   * INTELLIGENT CLICK
+   *
+   * Handles:
+   *  1) Ambiguity (multiple exact matches)
+   *  2) Near-misses (fuzzy search on text/attributes)
+   *  3) Success via BrowserManager.click for actual interaction
    */
-  async click(selector: string): Promise<ExecutionResult> {
+  async click(target: string): Promise<ExecutionResult> {
     const page = this.browser.getPage();
     const extractor = new SelectorExtractor(page);
+    let candidates: ElementInfo[] = [];
 
     try {
-      const info = await this.browser.click(selector);
+      // Step 1: Check strict selector count. If target is not a valid CSS/named
+      // selector, we fall back to semantic candidate matching.
+      let count = 0;
+      let isSelectorValid = true;
+      try {
+        const locator = page.locator(target);
+        // Minimal filter to ensure we get a count; also excludes detached nodes.
+        count = await locator.filter({ hasText: /.*/ }).count();
+      } catch {
+        isSelectorValid = false;
+      }
 
-      // Use the robust CSS from the extraction if available, otherwise fallback
-      const robustSelector = info.cssSelector || selector;
+      // Step 2: Handle Ambiguity (Multiple Exact Matches) when the caller passed
+      // a concrete selector.
+      if (isSelectorValid && count > 1) {
+        const locator = page.locator(target);
+        const locators = await locator.all();
+
+        for (const loc of locators) {
+          if (await loc.isVisible()) {
+            const handle = await loc.elementHandle();
+            if (handle) {
+              candidates.push(await extractor.extractFromHandle(handle));
+            }
+          }
+        }
+
+        if (candidates.length > 1) {
+          return {
+            success: false,
+            message: `Ambiguous request: '${target}' matches ${candidates.length} visible elements. Please clarify.`,
+            isAmbiguous: true,
+            requiresInteraction: true,
+            candidates,
+            screenshot: await this.browser.screenshot()
+          };
+        }
+        // If only 1 visible remains, we proceed to click logic below with the
+        // original selector.
+      }
+
+      let selectorToClick = target;
+      let selectedCandidate: ElementInfo | undefined;
+
+      // Step 3: Handle Near-Misses (Zero matches or Invalid Selector) by using
+      // the new semantic candidate finder.
+      if (!isSelectorValid || count === 0) {
+        candidates = await extractor.findCandidates(target);
+
+        // Fallback: explicit icon search when user mentions "icon" but no
+        // interactive candidates were found.
+        if (candidates.length === 0 && /icon/i.test(target)) {
+          const iconHandles = await page.$$('[class*="icon" i]');
+          for (const h of iconHandles) {
+            const info = await extractor.extractFromHandle(h);
+            candidates.push(info);
+          }
+          // Re-rank icon-only candidates using the same scoring rules.
+          const lower = target.toLowerCase();
+          candidates = candidates
+            .map((info) => ({ info, score: (extractor as any).scoreCandidate?.(info, lower) ?? 0 }))
+            .filter(({ score }) => score > 0)
+            .sort((a, b) => b.score - a.score)
+            .map((s) => s.info);
+        }
+
+        if (candidates.length > 0) {
+          // Choose the top-ranked candidate for direct interaction, but still
+          // expose the list to the caller for observability/debugging.
+          selectedCandidate = candidates[0];
+          const preferredSelector =
+            selectedCandidate.selector || selectedCandidate.cssSelector || selectedCandidate.xpath;
+          if (preferredSelector) {
+            selectorToClick = preferredSelector;
+          }
+        }
+        // If no semantic candidates were found we intentionally fall back to the
+        // browser's smartLocate() logic using the original target string.
+      }
+
+      // Step 4: Execute Click (Unique Match / Intelligent Locator)
+      const info = await this.browser.click(selectorToClick);
+      const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
       this.sessionHistory.push({ action: 'click', target: robustSelector });
 
       const screenshot = await this.browser.screenshot();
+      const baseMessage = `Clicked ${info.roleHint || 'element'} "${info.text || target}"`;
+      const visibilityHint =
+        selectedCandidate && selectedCandidate.isVisible === false
+          ? ' (note: element was initially hidden or collapsed)'
+          : '';
+
       return {
         success: true,
-        message: `Clicked ${selector}`,
+        message: baseMessage + visibilityHint,
+        selectors: [info],
         screenshot,
-        selectors: [info]
+        candidates: candidates.length ? candidates : undefined
       };
-    } catch (primaryErr) {
-      // --- Self-healing click: retry using a text-based locator when we know
-      // the button's label from previously observed selectors. This helps when
-      // a brittle CSS selector breaks on dynamic pages.
-      let healedInfo: ElementInfo | undefined;
-      let healSucceeded = false;
-
-      try {
-        const knownSelectors = this.browser.getSelectors();
-        const matched = knownSelectors.find(
-          (s) => s.cssSelector === selector || s.xpath === selector
-        );
-
-        const label = matched?.text || matched?.ariaLabel;
-        if (label) {
-          const escaped = label
-            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-            .replace(/\s+/g, '\\s+');
-          const regex = new RegExp(escaped, 'i');
-
-          const locator = page.getByText(regex);
-          const target = locator.first();
-
-          await target.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
-          await target.scrollIntoViewIfNeeded();
-
-          const handle = await target.elementHandle();
-          if (handle) {
-            healedInfo = await extractor.extractFromHandle(handle);
-          }
-
-          await target.click({ timeout: 10000 }).catch(async () => {
-            // Final attempt with force in case of overlays.
-            await target.click({ timeout: 10000, force: true });
-          });
-
-          const info = healedInfo || matched;
-          if (info) {
-            const robustSelector = info.cssSelector || selector;
-            this.sessionHistory.push({ action: 'click', target: robustSelector });
-          }
-
-          const screenshot = await this.browser.screenshot();
-          healSucceeded = true;
-          return {
-            success: true,
-            message: `Clicked ${selector} via text match on label "${label}"`,
-            screenshot,
-            selectors: info ? [info] : undefined
-          };
-        }
-      } catch {
-        // If self-healing fails for any reason, we fall back to the standard
-        // error reporting path below.
-      }
-
-      const msg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+    } catch (err) {
+      // Final safety net – we intentionally do not guess here.
+      const msg = err instanceof Error ? err.message : String(err);
       const screenshot = await this.browser.screenshot().catch(() => undefined as any);
-      let selectors: ElementInfo[] | undefined;
-      if (!healSucceeded) {
-        try {
-          selectors = await extractor.extractAllInteractive();
-        } catch {
-          selectors = undefined;
-        }
-      }
-
       return {
         success: false,
-        message: msg,
+        message: `Error clicking: ${msg}`,
         error: msg,
-        screenshot,
-        selectors
+        screenshot
       };
     }
   }
