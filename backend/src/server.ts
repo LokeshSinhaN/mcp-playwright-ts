@@ -2,7 +2,7 @@ import express from 'express';
 import http from 'http';
 import cors from 'cors';
 import WebSocket, { WebSocketServer } from 'ws';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
 import { BrowserManager } from './browserManager';
 import { McpTools } from './mcpTools';
 import { ExecutionResult, WebSocketMessage, ExecutionCommand, ElementInfo } from './types';
@@ -76,11 +76,49 @@ function buildDomContext(elements: ElementInfo[], maxItems = 80): string {
   return lines.join('\n');
 }
 
+// Helper: attempt to parse a JSON-like string, applying small repairs when needed.
+function tryParseJson(candidate: string): any {
+  const trimmed = candidate.trim();
+
+  // 1) Direct parse.
+  try {
+    return JSON.parse(trimmed);
+  } catch (err) {
+    // 2) Remove trailing commas before } or ] (very common LLM mistake).
+    let repaired = trimmed.replace(/,\s*([}\]])/g, '$1');
+    if (repaired !== trimmed) {
+      try {
+        return JSON.parse(repaired);
+      } catch {
+        // continue to next repair step
+      }
+    }
+
+    // 3) Convert simple single-quoted strings to double-quoted JSON strings.
+    //    This is conservative: we only touch segments that look like valid
+    //    string literals without embedded quotes.
+    repaired = repaired.replace(/'([^'"\\]*?)'/g, (_m, inner) => {
+      const escaped = String(inner).replace(/"/g, '\\"');
+      return `"${escaped}"`;
+    });
+    if (repaired !== trimmed) {
+      try {
+        return JSON.parse(repaired);
+      } catch {
+        // fall through to final failure below
+      }
+    }
+
+    // If we still fail, rethrow the original error; caller will decide how to handle it.
+    throw err;
+  }
+}
+
 // Helper: Clean LLM responses that contain Markdown or conversational text and extract JSON.
 function parseAiResponse(text: string): any {
-  // Fast path: try direct parse first.
+  // Fast path: try direct/repairing parse first.
   try {
-    return JSON.parse(text);
+    return tryParseJson(text);
   } catch {
     // fall through to more robust strategies below
   }
@@ -89,14 +127,14 @@ function parseAiResponse(text: string): any {
   const markdownMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
   if (markdownMatch && markdownMatch[1]) {
     const inner = markdownMatch[1].trim();
-    return JSON.parse(inner);
+    return tryParseJson(inner);
   }
 
   // 2) Look for any fenced ``` code block.
   const genericBlockMatch = text.match(/```\s*([\s\S]*?)\s*```/);
   if (genericBlockMatch && genericBlockMatch[1]) {
     const inner = genericBlockMatch[1].trim();
-    return JSON.parse(inner);
+    return tryParseJson(inner);
   }
 
   // 3) Fallback: Find the first '{' and last '}' to strip surrounding chatter.
@@ -104,7 +142,7 @@ function parseAiResponse(text: string): any {
   const last = text.lastIndexOf('}');
   if (first >= 0 && last > first) {
     const jsonCandidate = text.substring(first, last + 1).trim();
-    return JSON.parse(jsonCandidate);
+    return tryParseJson(jsonCandidate);
   }
 
   // If we reach here, we have no plausible JSON object.
@@ -116,6 +154,15 @@ export function createServer(port: number, chromePath?: string) {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
 
+  // Initialize a shared Gemini model instance once and inject it into tools.
+  const apiKey = process.env.GEMINI_API_KEY;
+  const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  let model: GenerativeModel | null = null;
+  if (apiKey) {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    model = genAI.getGenerativeModel({ model: modelName });
+  }
+
   const browser = new BrowserManager({
     headless: true,
     timeoutMs: 30000,
@@ -124,7 +171,7 @@ export function createServer(port: number, chromePath?: string) {
     viewport: { width: 1600, height: 900 },
     chromePath
   });
-  const tools = new McpTools(browser);
+  const tools = new McpTools(browser, model ?? undefined);
  
    const clients = new Set<WebSocket>();
  
@@ -162,19 +209,13 @@ export function createServer(port: number, chromePath?: string) {
   }
 
   async function handleAiAction(prompt: string, selector?: string): Promise<ExecutionResult> {
-    const apiKey = process.env.GEMINI_API_KEY;
-    const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-
-    if (!apiKey) {
+    if (!model) {
       return {
         success: false,
         message: 'GEMINI_API_KEY is not configured on the server',
         error: 'Missing GEMINI_API_KEY environment variable'
       };
     }
-
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: modelName });
 
     // For obvious cookie-banner prompts, prefer the deterministic handler
     // first so the LLM does not need to plan anything.
@@ -374,13 +415,18 @@ export function createServer(port: number, chromePath?: string) {
     try {
       parsed = parseAiResponse(rawText) as ReasonedAction;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('Failed to parse AI plan:', msg);
+      // Log detailed info for debugging, but degrade gracefully for the client.
+      console.error('Failed to parse AI plan from Gemini:', err);
+      console.error('Raw AI response (truncated):', rawText.slice(0, 400));
+
+      // Fall back to a safe no-op style response instead of hard-failing the
+      // /execute API. This keeps the session usable even if the model occasionally
+      // returns slightly malformed JSON.
       return {
-        success: false,
-        message: `Failed to parse AI plan: ${msg}`,
-        error: `Failed to parse AI plan: ${msg}`,
-        screenshot: observation.screenshot,
+        ...observation,
+        success: true,
+        message: 'Observed page only (AI response was not valid structured JSON, no action taken)',
+        // Preserve selectors/screenshot so the frontend still has full context.
         selectors: elements
       };
     }

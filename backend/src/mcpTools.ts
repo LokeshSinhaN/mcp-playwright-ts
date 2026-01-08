@@ -1,3 +1,4 @@
+import { GenerativeModel } from '@google/generative-ai';
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
@@ -6,7 +7,7 @@ import { ExecutionCommand, ExecutionResult, ElementInfo } from './types';
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
 
-  constructor(private readonly browser: BrowserManager) {}
+  constructor(private readonly browser: BrowserManager, private readonly model?: GenerativeModel) {}
 
   async navigate(url: string): Promise<ExecutionResult> {
     await this.browser.init();
@@ -22,15 +23,221 @@ export class McpTools {
     return { success: true, message: `Navigated to ${url}`, screenshot };
   }
 
-  /**
-   * INTELLIGENT CLICK
-   *
-   * Handles:
-   *  1) Ambiguity (multiple exact matches)
-   *  2) Near-misses (fuzzy search on text/attributes)
-   *  3) Success via BrowserManager.click for actual interaction
+/**
+   * Use the injected LLM to select the best element to click based on the
+   * user's natural-language request. Tiered flow:
+   *   1) LLM selection over sanitized elements.
+   *   2) Heuristic fallback when the LLM is unavailable, fails, or is
+   *      ambiguous.
    */
   async click(target: string): Promise<ExecutionResult> {
+    // Tier 1: LLM-driven selection when a model is configured.
+    if (this.model) {
+      try {
+        await this.browser.init();
+        const page = this.browser.getPage();
+        const extractor = new SelectorExtractor(page);
+
+        const all = await extractor.extractAllInteractive();
+        const visible = all.filter((el) => el.visible !== false && el.isVisible !== false);
+        const pool = visible.length > 0 ? visible : all;
+
+        if (pool.length === 0) {
+          const screenshot = await this.browser.screenshot().catch(() => undefined as any);
+          return {
+            success: false,
+            message: 'No interactive elements were found on the page to satisfy the click request.',
+            error: 'No interactive elements',
+            screenshot
+          };
+        }
+
+        const chosenIndex = await this.identifyTargetWithLLM(target, pool);
+
+        if (typeof chosenIndex === 'number' && chosenIndex >= 0 && chosenIndex < pool.length) {
+          const chosen = pool[chosenIndex];
+          const selectorToClick = chosen.selector || chosen.cssSelector || chosen.xpath;
+          if (!selectorToClick) {
+            console.warn('LLM selected element without usable selector, falling back to heuristics.');
+            return this.clickWithHeuristics(target);
+          }
+
+          const info = await this.browser.click(selectorToClick);
+          const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
+          this.sessionHistory.push({ action: 'click', target: robustSelector });
+
+          const screenshot = await this.browser.screenshot();
+          const baseMessage = `Clicked ${info.roleHint || 'element'} "${info.text || target}"`;
+
+          return {
+            success: true,
+            message: baseMessage,
+            selectors: [info],
+            screenshot,
+            candidates: pool
+          };
+        }
+
+        // LLM returned null or an invalid index -> ambiguity: fall back to heuristics.
+        console.warn('LLM selector returned null/ambiguous result, falling back to heuristics.');
+        return this.clickWithHeuristics(target);
+      } catch (err) {
+        console.warn('LLM selector failed, falling back to heuristic:', err);
+        return this.clickWithHeuristics(target);
+      }
+    }
+
+    // Tier 2: No model configured – always use heuristic path.
+    return this.clickWithHeuristics(target);
+  }
+
+  /**
+   * Sanitize ElementInfo list down to a minimal, JSON-safe structure for LLM
+   * consumption. This avoids passing complex prototypes or huge attribute
+   * maps into the SDK.
+   */
+  private sanitizeElementsForLLM(elements: ElementInfo[]): {
+    id: string;
+    text: string;
+    ariaLabel: string;
+    dataTestId: string;
+    region: string;
+    roleHint: string;
+  }[] {
+    return elements.map((el, idx) => ({
+      id: `el_${idx}`,
+      text: el.text ?? '',
+      ariaLabel: el.ariaLabel ?? '',
+      dataTestId: el.dataTestId ?? '',
+      region: el.region ?? 'main',
+      roleHint: el.roleHint ?? 'other'
+    }));
+  }
+
+  /**
+   * Decide which interactive element best matches the user's request using an
+   * LLM. Returns the index into the provided elements array, or null when the
+   * model reports ambiguity or an error occurs.
+   */
+  private async identifyTargetWithLLM(
+    userPrompt: string,
+    elements: ElementInfo[]
+  ): Promise<number | null> {
+    if (!this.model) return null;
+
+    const summaries = this.sanitizeElementsForLLM(elements);
+
+    // --- Semantic strictness pre-filter ---
+    const lowerPrompt = userPrompt.toLowerCase();
+    const tokens = lowerPrompt.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+
+    const filteredSummaries = summaries.filter((s) => {
+      const label = `${s.text} ${s.ariaLabel} ${s.dataTestId}`.toLowerCase();
+      if (!label.trim()) return false;
+      if (tokens.length === 0) return true;
+      return tokens.some((tok) => label.includes(tok));
+    });
+
+    if (filteredSummaries.length === 0) {
+      console.warn('No LLM candidates share semantic tokens with the user prompt; skipping LLM selection.');
+      return null;
+    }
+
+    const prompt = [
+      `SYSTEM: You are a precise automation engine. The user wants to: "${userPrompt}".`,
+      '',
+      'Here are the interactive elements on the screen as a JSON array:',
+      JSON.stringify(filteredSummaries),
+      '',
+      'Choose the single best element to interact with.',
+      '',
+      'Rules:',
+      '- You MUST only select elements that strongly match the user intent based on text, aria-label, or data-testid.',
+      '- If multiple elements match equally well, prefer ones whose "region" is "main" or "header".',
+      '- If none of the elements match the text or meaning strongly, return JSON null. Do NOT guess or select unrelated buttons.',
+      '- If you cannot confidently decide (the request is ambiguous), return JSON null. Do NOT guess.',
+      '- Return ONLY the "id" of the best element as a JSON string, e.g. ""el_3"".'
+    ].join('\\n');
+
+    try {
+      const result = await this.model.generateContent({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }]
+          }
+        ]
+      } as any);
+
+      const raw = (result as any).response?.text?.() ?? '';
+      const chosenId = this.parseLlmChosenId(raw);
+      if (!chosenId) return null;
+
+      const match = chosenId.match(/^el_(\d+)$/);
+      if (!match) return null;
+
+      const idx = Number.parseInt(match[1], 10);
+      return Number.isFinite(idx) ? idx : null;
+    } catch (err) {
+      console.warn('LLM Selector failed, falling back to heuristic:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Robustly extract the chosen element id (e.g. "el_3") from an LLM response
+   * that may be a raw string, JSON string, or small JSON object.
+   */
+  private parseLlmChosenId(raw: string): string | null {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+
+    if (trimmed === 'null' || trimmed === '"null"') return null;
+
+    // 1) Try direct JSON parse first.
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') {
+        return parsed;
+      }
+      if (parsed && typeof parsed === 'object') {
+        const obj = parsed as any;
+        if (typeof obj.id === 'string') return obj.id;
+        if (typeof obj.elementId === 'string') return obj.elementId;
+      }
+    } catch {
+      // ignore and fall back to regex-based extraction
+    }
+
+    // 2) Look for a token that looks like el_# either quoted or bare.
+    const match = trimmed.match(/"(el_\d+)"/) || trimmed.match(/\b(el_\d+)\b/);
+    return match ? match[1] : null;
+  }
+
+  /**
+   * Check if an element has any meaningful textual overlap with the user's
+   * prompt, using text, aria-label, or data-testid. This is the core of the
+   * semantic firewall that prevents obviously unrelated buttons (e.g.,
+   * "Payment Posting") from being considered for prompts like "Start Hiring".
+   */
+  private elementMatchesPrompt(prompt: string, el: ElementInfo): boolean {
+    const lowerPrompt = prompt.toLowerCase();
+    const tokens = lowerPrompt.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+    if (tokens.length === 0) return true;
+
+    const label = `${el.text ?? ''} ${el.ariaLabel ?? ''} ${el.dataTestId ?? ''}`.toLowerCase();
+    if (!label.trim()) return false;
+
+    return tokens.some((tok) => label.includes(tok));
+  }
+
+  /**
+   * Heuristic click implementation using the original fuzzy-matching and
+   * ambiguity handling logic. This is used as Tier 2 when the LLM selector is
+   * unavailable or fails.
+   */
+  private async clickWithHeuristics(target: string): Promise<ExecutionResult> {
+    await this.browser.init();
     const page = this.browser.getPage();
     const extractor = new SelectorExtractor(page);
     let candidates: ElementInfo[] = [];
@@ -81,9 +288,12 @@ export class McpTools {
       let selectedCandidate: ElementInfo | undefined;
 
       // Step 3: Handle Near-Misses (Zero matches or Invalid Selector) by using
-      // the new semantic candidate finder.
+      // the semantic candidate finder and scoring.
       if (!isSelectorValid || count === 0) {
         candidates = await extractor.findCandidates(target);
+
+        // Strict semantic pre-filter: drop any candidates with zero keyword overlap.
+        candidates = candidates.filter((el) => this.elementMatchesPrompt(target, el));
 
         // Fallback: explicit icon search when user mentions "icon" but no
         // interactive candidates were found.
@@ -94,18 +304,51 @@ export class McpTools {
             candidates.push(info);
           }
           // Re-rank icon-only candidates using the same scoring rules.
-          const lower = target.toLowerCase();
           candidates = candidates
-            .map((info) => ({ info, score: (extractor as any).scoreCandidate?.(info, lower) ?? 0 }))
+            .filter((el) => this.elementMatchesPrompt(target, el))
+            .map((info) => ({ info, score: extractor.scoreForQuery(info, target) }))
             .filter(({ score }) => score > 0)
             .sort((a, b) => b.score - a.score)
             .map((s) => s.info);
         }
 
         if (candidates.length > 0) {
-          // Choose the top-ranked candidate for direct interaction, but still
-          // expose the list to the caller for observability/debugging.
-          selectedCandidate = candidates[0];
+          // Strict ambiguity handling over the top tier of scored candidates.
+          const scored = candidates
+            .map((info) => ({ info, score: extractor.scoreForQuery(info, target) }))
+            .filter(({ score }) => score > 0)
+            .sort((a, b) => b.score - a.score);
+
+          if (scored.length > 0) {
+            const bestScore = scored[0].score;
+            const AMBIGUITY_BAND = 10; // ~5–10 points around the best candidate.
+
+            const topTier = scored
+              .filter(({ score }) => bestScore - score <= AMBIGUITY_BAND)
+              .map(({ info }) => info);
+
+            if (topTier.length > 1) {
+              const screenshot = await this.browser.screenshot().catch(() => undefined as any);
+              // We do not need verbose descriptions here; the caller can inspect
+              // candidates directly.
+              return {
+                success: true,
+                message: `Ambiguous request: found ${topTier.length} strong matches for "${target}".`,
+                isAmbiguous: true,
+                requiresInteraction: true,
+                candidates: topTier,
+                screenshot
+              };
+            }
+
+            // Otherwise, use the top-scoring candidate.
+            selectedCandidate = scored[0].info;
+          } else {
+            // No positive scores (very weak matches) — take the first candidate
+            // as a best-effort guess.
+            selectedCandidate = candidates[0];
+          }
+
           const preferredSelector =
             selectedCandidate.selector || selectedCandidate.cssSelector || selectedCandidate.xpath;
           if (preferredSelector) {

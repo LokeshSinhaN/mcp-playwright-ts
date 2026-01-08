@@ -63,7 +63,14 @@ export class SelectorExtractor {
   }
 
   async extractFromHandle(handle: ElementHandle): Promise<ElementInfo> {
-    const base = await handle.evaluate((el: any) => {
+    // Before extracting metadata, ensure we are pointing at the most
+    // appropriate interactive ancestor for this element. This prevents us
+    // from trying to click on passive children such as <span> or text nodes
+    // when the actual event listener is attached on an enclosing <button>,
+    // <a>, or other semantic control.
+    const interactiveHandle = await this.resolveInteractiveHandle(handle);
+
+    const base = await interactiveHandle.evaluate((el: any) => {
       const win = el.ownerDocument && el.ownerDocument.defaultView;
       const rect = el.getBoundingClientRect();
       const style = win ? win.getComputedStyle(el) : null;
@@ -92,10 +99,34 @@ export class SelectorExtractor {
         tagName === 'input' &&
         (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
 
+      // --- Structural region detection ---
+      // Prefer semantic landmarks when available and fall back to viewport
+      // position only when necessary. This enables better disambiguation of
+      // duplicate controls (e.g., header vs footer buttons).
       const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
       let region: 'header' | 'main' | 'footer' = 'main';
-      if (rect.top < viewportHeight * 0.25) region = 'header';
-      else if (rect.top > viewportHeight * 0.75) region = 'footer';
+
+      const closestSafe = (selector: string): Element | null => {
+        try {
+          return typeof el.closest === 'function' ? el.closest(selector) : null;
+        } catch {
+          return null;
+        }
+      };
+
+      if (closestSafe('header') || closestSafe('nav')) {
+        region = 'header';
+      } else if (closestSafe('footer')) {
+        region = 'footer';
+      } else if (closestSafe('main')) {
+        region = 'main';
+      } else {
+        // Fallback: approximate using vertical position when landmarks are not
+        // present.
+        if (rect.top < viewportHeight * 0.25) region = 'header';
+        else if (rect.top > viewportHeight * 0.75) region = 'footer';
+        else region = 'main';
+      }
 
       // --- Smart Context computation ---
       const getText = (node: any | null): string => {
@@ -206,8 +237,8 @@ export class SelectorExtractor {
       };
     });
 
-    const cssSelector = await this.generateCss(handle);
-    const xpath = await this.generateXpath(handle);
+    const cssSelector = await this.generateCss(interactiveHandle);
+    const xpath = await this.generateXpath(interactiveHandle);
 
     return {
       tagName: base.tagName,
@@ -232,6 +263,80 @@ export class SelectorExtractor {
       context: base.context,
       attributes: Object.fromEntries(base.attrs)
     };
+  }
+
+  /**
+   * Given a handle that may point at a passive node (e.g., <span>, <div>,
+   * <p>, or a text node), walk up the DOM to find a semantic interactive
+   * ancestor such as <button>, <a>, <input>, <select>, or an element with an
+   * appropriate ARIA role. If none is found, fall back to the original
+   * element so we never lose the concrete target.
+   */
+  private async resolveInteractiveHandle(handle: ElementHandle): Promise<ElementHandle> {
+    const candidateHandle = await handle.evaluateHandle((node: any) => {
+      const isElementNode = (n: any): n is Element => !!n && n.nodeType === 1;
+
+      const isInteractive = (el: any | null): boolean => {
+        if (!isElementNode(el)) return false;
+        const tag = (el.tagName || '').toLowerCase();
+        const role =
+          typeof (el as any).getAttribute === 'function'
+            ? ((el as any).getAttribute('role') || '').toLowerCase()
+            : '';
+        const hasOnClick = typeof (el as any).onclick === 'function';
+        const interactiveTags = ['button', 'a', 'input', 'select', 'textarea'];
+        const interactiveRoles = ['button', 'combobox', 'listbox', 'menuitem', 'checkbox', 'link'];
+        return interactiveTags.includes(tag) || interactiveRoles.includes(role) || hasOnClick;
+      };
+
+      const isPassive = (el: any | null): boolean => {
+        if (!isElementNode(el)) return false;
+        const tag = (el.tagName || '').toLowerCase();
+        return tag === 'span' || tag === 'div' || tag === 'p' || tag === 'i';
+      };
+
+      // Normalize starting point: if we were given a text node or other
+      // non-element, start from its parent element.
+      let current: any = node;
+      if (!isElementNode(current)) {
+        current = (node && (node as any).parentElement) || node;
+      }
+
+      if (!isElementNode(current)) {
+        return node;
+      }
+
+      // If already interactive, keep as-is.
+      if (isInteractive(current)) {
+        return current;
+      }
+
+      // If this is a passive node (e.g., span/div/text/i), try closest() to
+      // jump directly to the nearest interactive ancestor (universal bubbling).
+      if (isPassive(current) && typeof (current as any).closest === 'function') {
+        const viaClosest = (current as any).closest(
+          'button, a, input, textarea, select, [role="button"], [role="link"], [onclick]'
+        );
+        if (viaClosest) {
+          return viaClosest;
+        }
+      }
+
+      // Fallback: manual parent walk with semantic checks for robustness.
+      let ancestor: any | null = (current as any).parentElement;
+      while (ancestor) {
+        if (isInteractive(ancestor)) {
+          return ancestor;
+        }
+        ancestor = (ancestor as any).parentElement;
+      }
+
+      // No interactive ancestor; stay on the original element.
+      return current;
+    });
+
+    const asElement = candidateHandle.asElement();
+    return asElement ?? handle;
   }
 
   private async generateCss(handle: ElementHandle): Promise<string> {
@@ -286,9 +391,13 @@ export class SelectorExtractor {
 
         const className = curr.className || '';
         if (typeof className === 'string') {
+          // Only keep "simple" class names that do not require CSS escaping.
+          // This avoids generating selectors that Playwright cannot parse,
+          // such as classes containing "/" or other special characters.
           const classes = className
             .split(/\s+/)
             .filter(Boolean)
+            .filter((c: string) => /^[a-zA-Z0-9_-]+$/.test(c))
             .slice(0, 2)
             .map((c: string) => `.${c}`);
           if (classes.length) part += classes.join('');
@@ -353,6 +462,16 @@ export class SelectorExtractor {
    */
   async findRelatedElements(query: string): Promise<ElementInfo[]> {
     return this.findCandidates(query);
+  }
+
+  /**
+   * Public wrapper so external callers (e.g., McpTools) can consistently score
+   * candidates using the same weighting rules that findCandidates() relies on.
+   */
+  scoreForQuery(info: ElementInfo, query: string): number {
+    const lowerQuery = query.toLowerCase().trim();
+    if (!lowerQuery) return 0;
+    return this.scoreCandidate(info, lowerQuery);
   }
 
   /**

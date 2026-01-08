@@ -315,18 +315,49 @@ export class BrowserManager {
       // ignore extraction errors, proceed to click
     }
 
-    // 4. Primary click attempt, with a final forced-click fallback to handle
-    // transient overlays such as cookie banners or modals.
+    // 4. Primary click attempt, with a forced-click and JS-dispatch fallback
+    // chain to handle transient overlays or tricky event wiring.
     try {
-      await locator.click({ timeout: this.clickTimeout });
+      // Tier 1: normal Playwright click with a short timeout.
+      await locator.click({ timeout: 2000 });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`Primary click failed for selector "${selector}": ${msg}. Retrying with force.`);
       try {
-        await locator.click({ timeout: this.clickTimeout, force: true });
+        // Tier 2: force click, still with a short timeout.
+        await locator.click({ timeout: 2000, force: true });
       } catch (forceErr) {
         const forceMsg = forceErr instanceof Error ? forceErr.message : String(forceErr);
-        throw new Error(`Unable to click element found by "${selector}": ${forceMsg || msg}`);
+        console.warn(
+          `Force click also failed for selector "${selector}": ${forceMsg}. Attempting JS click fallback.`,
+        );
+        try {
+          const handle = await locator.elementHandle();
+          if (!handle) {
+            throw new Error('No element handle available for JS click fallback');
+          }
+
+          await handle.evaluate((el: any) => {
+            try {
+              // Tier 3: fire the click directly in the browser engine.
+              if (typeof (el as any).click === 'function') {
+                (el as any).click();
+              }
+
+              if (typeof (el as any).dispatchEvent === 'function') {
+                const evt = new Event('click', { bubbles: true });
+                (el as any).dispatchEvent(evt);
+              }
+            } catch {
+              // Swallow DOM-level errors; outer try/catch will handle.
+            }
+          });
+        } catch (jsErr) {
+          const jsMsg = jsErr instanceof Error ? jsErr.message : String(jsErr);
+          throw new Error(
+            `Unable to click element found by "${selector}": ${jsMsg || forceMsg || msg}`,
+          );
+        }
       }
     }
 
