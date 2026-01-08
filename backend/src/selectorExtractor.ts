@@ -350,7 +350,14 @@ export class SelectorExtractor {
       // 1) Prefer stable single-attribute selectors that are resilient to
       // layout changes.
       if (el.id) {
-        return `#${el.id}`;
+        const rawId = String(el.id);
+        // If the id is a simple CSS identifier, we can safely use #id.
+        if (/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(rawId)) {
+          return `#${rawId}`;
+        }
+        // Otherwise fall back to an attribute selector to avoid parser errors
+        // like "Unexpected token ':' while parsing css selector '#:foo'".
+        return `[id="${escapeAttr(rawId)}"]`;
       }
 
       const dataTestId = getAttr('data-testid');
