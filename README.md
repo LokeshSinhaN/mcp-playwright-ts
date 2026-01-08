@@ -3,17 +3,6 @@
 [![Version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/LokeshSinhaN/mcp-playwright-ts)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## Table of Contents
-- [Project Overview](#project-overview)
-- [Technology Stack](#technology-stack)
-- [Project Structure](#project-structure)
-- [Installation and Setup](#installation-and-setup)
-- [Running the Application](#running-the-application)
-- [Features and Functionality](#features-and-functionality)
-- [Development Workflow](#development-workflow)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License](#license)
 
 
 ## Project Overview
