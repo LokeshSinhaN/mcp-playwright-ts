@@ -361,6 +361,61 @@ export class BrowserManager {
       }
     }
 
+    // Give the UI a brief moment to react (e.g., dropdowns/menus opening)
+    // before callers capture a screenshot or issue the next command. Use a
+    // longer settle time for dropdown/combobox-like controls where menus often
+    // animate or mount asynchronously.
+    let isDropdownLike = false;
+    try {
+      isDropdownLike = !!info && (() => {
+        const tag = (info.tagName || '').toLowerCase();
+        const role = (info.attributes && (info.attributes['role'] || info.attributes['aria-role'])) || '';
+        const cls = (info.className || '').toLowerCase();
+        const text = (info.text || '').toLowerCase();
+
+        if (tag === 'select') return true;
+        if (/combobox|listbox|menu/.test(role)) return true;
+        if (/dropdown|drop-down/.test(cls)) return true;
+        if (/select/.test(text) && /role|option/.test(text)) return true;
+        return false;
+      })();
+
+      const settleMs = isDropdownLike ? 800 : 300;
+      await page.waitForTimeout(settleMs);
+    } catch {
+      // Non-fatal; continue even if the wait was interrupted.
+    }
+
+    // For dropdown-like controls, "nudge" the control with a keyboard event and
+    // then wait for a likely menu/listbox element to appear. This helps with UIs
+    // that open their menus on key presses or mount them asynchronously after
+    // the pointer interaction.
+    if (isDropdownLike) {
+      try {
+        await locator.press('ArrowDown');
+      } catch {
+        // Safe to ignore if the element is not focusable.
+      }
+      try {
+        await page.waitForSelector(
+          [
+            '[role="listbox"]',
+            '[role="menu"]',
+            '[role="dialog"]',
+            '.dropdown-menu',
+            '.menu-items',
+            '.select-menu',
+            '.ant-select-dropdown',
+            '.MuiList-root'
+          ].join(', '),
+          { state: 'visible', timeout: 1200 }
+        );
+      } catch {
+        // Best-effort only; many native <select> menus are rendered by the OS
+        // and will never be visible to the page/screenshot.
+      }
+    }
+
     if (info) return info;
 
     // Fallback if extraction failed (shouldn't happen often)

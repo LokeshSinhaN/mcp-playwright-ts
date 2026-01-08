@@ -52,7 +52,73 @@ export class McpTools {
           };
         }
 
-        const chosenIndex = await this.identifyTargetWithLLM(target, pool);
+        // Prefer any explicitly quoted label (e.g., "Select a role...") as the
+        // primary semantic key, so filler instructions like "next to X button"
+        // don't dilute matching.
+        const coreTarget = this.extractCoreLabel(target);
+
+        // --- Tier 1a: deterministic semantic preselection (no LLM) ---
+        // If we can find a single, clearly best-matching element using the
+        // same scoring logic as the heuristic path, we click it directly and
+        // completely bypass the LLM. This ensures prompts like
+        //   "Click on \"Select a role...\" drop down button next to Start Hiring button"
+        // behave identically to shorter variants that only mention the label.
+        let directChosen: ElementInfo | undefined;
+        let semanticCandidates: ElementInfo[] | undefined;
+        try {
+          semanticCandidates = await extractor.findCandidates(coreTarget || target);
+          semanticCandidates = semanticCandidates.filter((el) =>
+            this.elementMatchesPrompt(coreTarget || target, el),
+          );
+
+          if (semanticCandidates.length > 0) {
+            const scored = semanticCandidates
+              .map((info) => ({ info, score: extractor.scoreForQuery(info, coreTarget || target) }))
+              .filter(({ score }) => score > 0)
+              .sort((a, b) => b.score - a.score);
+
+            if (scored.length > 0) {
+              const bestScore = scored[0].score;
+              const AMBIGUITY_BAND = 10;
+              const topTier = scored
+                .filter(({ score }) => bestScore - score <= AMBIGUITY_BAND)
+                .map(({ info }) => info);
+
+              if (topTier.length === 1) {
+                directChosen = topTier[0];
+              }
+            }
+          }
+        } catch {
+          // If semantic preselection fails for any reason, we simply fall
+          // back to the LLM path below.
+          directChosen = undefined;
+        }
+
+        if (directChosen) {
+          const selectorToClick =
+            directChosen.selector || directChosen.cssSelector || directChosen.xpath;
+          if (selectorToClick) {
+            const info = await this.browser.click(selectorToClick);
+            const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
+            this.sessionHistory.push({ action: 'click', target: robustSelector });
+
+            const screenshot = await this.browser.screenshot();
+            const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || target}\"`;
+
+            return {
+              success: true,
+              message: baseMessage,
+              selectors: [info],
+              screenshot,
+              candidates: semanticCandidates ?? pool,
+            };
+          }
+        }
+
+        // --- Tier 1b: LLM-based selection when deterministic matching was
+        // ambiguous or inconclusive.
+        const chosenIndex = await this.identifyTargetWithLLM(target, coreTarget, pool);
 
         if (typeof chosenIndex === 'number' && chosenIndex >= 0 && chosenIndex < pool.length) {
           const chosen = pool[chosenIndex];
@@ -67,7 +133,7 @@ export class McpTools {
           this.sessionHistory.push({ action: 'click', target: robustSelector });
 
           const screenshot = await this.browser.screenshot();
-          const baseMessage = `Clicked ${info.roleHint || 'element'} "${info.text || target}"`;
+          const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || target}\"`;
 
           return {
             success: true,
@@ -115,12 +181,45 @@ export class McpTools {
   }
 
   /**
+   * Extract the core label from a natural-language click request. When the
+   * prompt contains a quoted label (e.g., "Click on \"Select a role...\" drop
+   * down button next to Start Hiring"), we treat the quoted portion as the
+   * primary matching key.
+   */
+  private extractCoreLabel(prompt: string): string {
+    const raw = (prompt || '').trim();
+    if (!raw) return '';
+
+    const quoted = raw.match(/["'“”‘’]([^"'“”‘’]{2,})["'“”‘’]/);
+    if (quoted && quoted[1].trim().length >= 3) {
+      return quoted[1].trim();
+    }
+
+    let core = raw;
+    const lower = core.toLowerCase();
+    const verbPrefixes = ['click on', 'click', 'press', 'tap', 'open', 'select', 'choose'];
+    for (const v of verbPrefixes) {
+      if (lower.startsWith(v + ' ')) {
+        core = core.slice(v.length).trim();
+        break;
+      }
+    }
+
+    // Remove common control-type suffixes that don't help identify which
+    // specific element is meant.
+    core = core.replace(/\b(button|link|tab|field|input|dropdown|drop down|icon|menu)\b/gi, '').trim();
+
+    return core || raw;
+  }
+
+  /**
    * Decide which interactive element best matches the user's request using an
    * LLM. Returns the index into the provided elements array, or null when the
    * model reports ambiguity or an error occurs.
    */
   private async identifyTargetWithLLM(
     userPrompt: string,
+    coreQuery: string,
     elements: ElementInfo[]
   ): Promise<number | null> {
     if (!this.model) return null;
@@ -128,7 +227,8 @@ export class McpTools {
     const summaries = this.sanitizeElementsForLLM(elements);
 
     // --- Semantic strictness pre-filter ---
-    const lowerPrompt = userPrompt.toLowerCase();
+    const selectionQuery = coreQuery && coreQuery.trim().length ? coreQuery : userPrompt;
+    const lowerPrompt = selectionQuery.toLowerCase();
     const tokens = lowerPrompt.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
 
     const filteredSummaries = summaries.filter((s) => {
@@ -143,9 +243,14 @@ export class McpTools {
       return null;
     }
 
+    const focusLine =
+      coreQuery && coreQuery.trim().length && coreQuery.trim() !== userPrompt.trim()
+        ? `Primary label to match: "${coreQuery.trim()}".\n`
+        : '';
+
     const prompt = [
       `SYSTEM: You are a precise automation engine. The user wants to: "${userPrompt}".`,
-      '',
+      focusLine,
       'Here are the interactive elements on the screen as a JSON array:',
       JSON.stringify(filteredSummaries),
       '',
@@ -214,14 +319,15 @@ export class McpTools {
     return match ? match[1] : null;
   }
 
-  /**
+/**
    * Check if an element has any meaningful textual overlap with the user's
    * prompt, using text, aria-label, or data-testid. This is the core of the
    * semantic firewall that prevents obviously unrelated buttons (e.g.,
    * "Payment Posting") from being considered for prompts like "Start Hiring".
    */
   private elementMatchesPrompt(prompt: string, el: ElementInfo): boolean {
-    const lowerPrompt = prompt.toLowerCase();
+    const core = this.extractCoreLabel(prompt);
+    const lowerPrompt = core.toLowerCase();
     const tokens = lowerPrompt.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
     if (tokens.length === 0) return true;
 
@@ -241,6 +347,11 @@ export class McpTools {
     const page = this.browser.getPage();
     const extractor = new SelectorExtractor(page);
     let candidates: ElementInfo[] = [];
+
+    // Normalize the natural-language target so that quoted labels (e.g.,
+    // "Select a role...") drive semantic matching instead of surrounding
+    // instructions like "next to Start Hiring button".
+    const coreTarget = this.extractCoreLabel(target);
 
     try {
       // Step 1: Check strict selector count. If target is not a valid CSS/named
@@ -290,14 +401,14 @@ export class McpTools {
       // Step 3: Handle Near-Misses (Zero matches or Invalid Selector) by using
       // the semantic candidate finder and scoring.
       if (!isSelectorValid || count === 0) {
-        candidates = await extractor.findCandidates(target);
+        candidates = await extractor.findCandidates(coreTarget || target);
 
         // Strict semantic pre-filter: drop any candidates with zero keyword overlap.
-        candidates = candidates.filter((el) => this.elementMatchesPrompt(target, el));
+        candidates = candidates.filter((el) => this.elementMatchesPrompt(coreTarget || target, el));
 
         // Fallback: explicit icon search when user mentions "icon" but no
         // interactive candidates were found.
-        if (candidates.length === 0 && /icon/i.test(target)) {
+        if (candidates.length === 0 && /icon/i.test(coreTarget || target)) {
           const iconHandles = await page.$$('[class*="icon" i]');
           for (const h of iconHandles) {
             const info = await extractor.extractFromHandle(h);
@@ -305,8 +416,8 @@ export class McpTools {
           }
           // Re-rank icon-only candidates using the same scoring rules.
           candidates = candidates
-            .filter((el) => this.elementMatchesPrompt(target, el))
-            .map((info) => ({ info, score: extractor.scoreForQuery(info, target) }))
+            .filter((el) => this.elementMatchesPrompt(coreTarget || target, el))
+            .map((info) => ({ info, score: extractor.scoreForQuery(info, coreTarget || target) }))
             .filter(({ score }) => score > 0)
             .sort((a, b) => b.score - a.score)
             .map((s) => s.info);
@@ -315,7 +426,7 @@ export class McpTools {
         if (candidates.length > 0) {
           // Strict ambiguity handling over the top tier of scored candidates.
           const scored = candidates
-            .map((info) => ({ info, score: extractor.scoreForQuery(info, target) }))
+            .map((info) => ({ info, score: extractor.scoreForQuery(info, coreTarget || target) }))
             .filter(({ score }) => score > 0)
             .sort((a, b) => b.score - a.score);
 
