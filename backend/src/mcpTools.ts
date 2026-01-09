@@ -3,6 +3,7 @@ import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
 import { ExecutionCommand, ExecutionResult, ElementInfo } from './types';
+import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent } from './dropdownUtils';
 
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
@@ -31,6 +32,57 @@ export class McpTools {
    *      ambiguous.
    */
   async click(target: string): Promise<ExecutionResult> {
+    // First, detect natural-language dropdown selection intents such as:
+    //   "Click on the Contact us drop down button and select Facebook option" or
+    //   "select the 'Payment Posting' from the drop down menu".
+    // When detected, we handle the interaction using a robust, keyboard-aware
+    // helper instead of trying to treat the request as a single "click" on a
+    // specific option element.
+    const dropdownIntent: DropdownIntent | null = parseDropdownInstruction(target);
+    if (dropdownIntent) {
+      try {
+        await this.browser.init();
+        const page = this.browser.getPage();
+
+        let message: string;
+
+        if (dropdownIntent.kind === 'open-and-select') {
+          await selectFromDropdown(page, dropdownIntent.dropdownLabel, dropdownIntent.optionLabel);
+
+          // Record this as two high-level steps for downstream Selenium
+          // generation: open dropdown (click) + select via keyboard.
+          this.sessionHistory.push(
+            { action: 'click', target: dropdownIntent.dropdownLabel },
+            { action: 'type', target: dropdownIntent.dropdownLabel, value: dropdownIntent.optionLabel },
+          );
+
+          message = `Selected option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`;
+        } else {
+          // Dropdown already open; just select the option.
+          await selectOptionInOpenDropdown(page, dropdownIntent.optionLabel);
+
+          this.sessionHistory.push({
+            action: 'type',
+            target: 'dropdown-option',
+            value: dropdownIntent.optionLabel,
+          });
+
+          message = `Selected option "${dropdownIntent.optionLabel}" from the currently open dropdown`;
+        }
+
+        const screenshot = await this.browser.screenshot();
+        return {
+          success: true,
+          message,
+          screenshot,
+        };
+      } catch (err) {
+        // If anything fails (e.g., parsing was over-eager for this prompt),
+        // log and fall back to the standard click heuristics below.
+        console.warn('Dropdown selection helper failed, falling back to standard click():', err);
+      }
+    }
+
     // Tier 1: LLM-driven selection when a model is configured.
     if (this.model) {
       try {

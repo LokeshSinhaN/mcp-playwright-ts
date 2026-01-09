@@ -343,6 +343,16 @@ export class SelectorExtractor {
     return handle.evaluate((el: any) => {
       const doc = el.ownerDocument || (typeof document !== 'undefined' ? document : null);
       const tag = (el.tagName || '').toLowerCase();
+      
+      // FIX: Robust CSS escaping helper
+      const escapeCss = (str: string) => {
+        if (typeof (globalThis as any).CSS !== 'undefined' && (globalThis as any).CSS.escape) {
+          return (globalThis as any).CSS.escape(str);
+        }
+        // Polyfill for environments without CSS.escape
+        return str.replace(/([:.[\]#])/g, '\\$1');
+      };
+
       const getAttr = (name: string): string | null =>
         typeof el.getAttribute === 'function' ? el.getAttribute(name) : null;
       const escapeAttr = (value: string) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -351,18 +361,13 @@ export class SelectorExtractor {
       // layout changes.
       if (el.id) {
         const rawId = String(el.id);
-        // If the id is a simple CSS identifier, we can safely use #id.
-        if (/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(rawId)) {
-          return `#${rawId}`;
-        }
-        // Otherwise fall back to an attribute selector to avoid parser errors
-        // like "Unexpected token ':' while parsing css selector '#:foo'".
-        return `[id="${escapeAttr(rawId)}"]`;
+        // FIX: Always escape ID to handle Radix/MUI colons (e.g. #radix-:r1:)
+        return `#${escapeCss(rawId)}`;
       }
 
       const dataTestId = getAttr('data-testid');
       if (dataTestId) {
-        return `[data-testid="${escapeAttr(dataTestId)}"]`;
+        return `[data-testid="${escapeCss(dataTestId)}"]`;
       }
 
       const nameAttr = getAttr('name');
@@ -391,7 +396,9 @@ export class SelectorExtractor {
         if (!part) break;
 
         if (curr.id) {
-          part += `#${curr.id}`;
+          // Use the same robust escaping as for the primary id case so that
+          // ancestor ids like "radix-:r1:" do not produce invalid selectors.
+          part += `#${escapeCss(String(curr.id))}`;
           parts.unshift(part);
           break;
         }
