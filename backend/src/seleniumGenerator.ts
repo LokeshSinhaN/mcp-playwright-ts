@@ -20,72 +20,92 @@ export class SeleniumGenerator {
   }
 
   /**
-   * Generate Python Selenium code using the injected LLM for rich, commented,
-   * production-style scripts. Falls back to the template-based generator when
-   * no model is configured or the model call fails.
+   * Generate Python Selenium code using the injected LLM, using a strictly
+   * formatted step manifest so the model cannot "guess" selector strategies.
+   * Falls back to the template-based generator when no model is configured or
+   * the model call fails.
    */
   async generateWithLLM(commands: ExecutionCommand[]): Promise<string> {
     if (!this.model) {
       return this.generate(commands);
     }
 
-    const stepManifestLines: string[] = [];
-    commands.forEach((cmd, index) => {
-      const stepNo = index + 1;
-      const description = (cmd.description || cmd.target || '').replace(/"/g, '\\"');
-      const sel = cmd.selectors || {};
-      const id = sel.id ?? '';
-      const css = sel.css ?? (cmd.target || '');
-      const xpath = sel.xpath ?? '';
-      const text = sel.text ?? '';
+    // 1. Build a strict manifest of steps with explicit selector details.
+    const stepsContext = commands
+      .map((cmd, index) => {
+        const stepNum = index + 1;
+        const description = cmd.description || 'Perform action';
+        const value = cmd.value ?? 'None';
 
-      const parts: string[] = [];
-      parts.push(`Step ${stepNo}: Action="${cmd.action}"`);
-      if (description) parts.push(`Description="${description}"`);
-      if (id) parts.push(`Id="${id}"`);
-      if (css) parts.push(`CssSelector="${css}"`);
-      if (xpath) parts.push(`Xpath="${xpath}"`);
-      if (text) parts.push(`Text="${text.replace(/"/g, '\\"')}"`);
-      if (cmd.value && (cmd.action === 'type')) {
-        parts.push(`Value="${String(cmd.value).slice(0, 80).replace(/"/g, '\\"')}"`);
-      }
+        let selectorInfo = 'No selectors (Navigation, Wait, or Examine step)';
+        if (cmd.selectors) {
+          const css = cmd.selectors.css || 'N/A';
+          const xpath = cmd.selectors.xpath || 'N/A';
+          const id = cmd.selectors.id || 'N/A';
+          const text = cmd.selectors.text || '';
 
-      stepManifestLines.push(parts.join(', '));
-    });
+          selectorInfo = [
+            `- Available CSS: ${css}`,
+            `- Available XPath: ${xpath}`,
+            `- Available ID: ${id}`,
+            `- Target Text: "${text}"`,
+          ].join('\n');
+        }
 
-    const stepManifest = stepManifestLines.join('\n');
+        return [
+          `### STEP ${stepNum}:`,
+          `Action: ${cmd.action}`,
+          `Description: ${description}`,
+          `Input Value: ${value}`,
+          'SELECTORS (STRICT USE ONLY):',
+          selectorInfo,
+          '---------------------------------------------------',
+        ].join('\n');
+      })
+      .join('\n');
 
     const testName = this.opts.testName ?? 'test_automation';
     const driverPath = this.opts.chromeDriverPath ?? 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe';
 
+    // 2. Anti-hallucination prompt.
     const prompt = [
-      'You are an expert QA Automation Engineer.',
+      'You are a Senior QA Automation Engineer. I need a robust Python Selenium script based on the execution log below.',
       '',
-      'Task: Convert the following execution steps into a robust, production-ready Python Selenium script.',
+      '### CRITICAL RULES (Follow these exactly):',
+      '1. SELECTOR SAFETY:',
+      '   - If the "Available CSS" value starts with "//" or "/", treat it as an XPath and use By.XPATH, not By.CSS_SELECTOR.',
+      '   - If you use the XPath string, you MUST use By.XPATH.',
+      '   - If you use the CSS string, you MUST use By.CSS_SELECTOR.',
+      '   - NEVER put an XPath string inside By.CSS_SELECTOR.',
+      '   - Do NOT invent new selectors; only use the ones listed in the SELECTORS block for each step.',
       '',
-      'STRICT CONSTRAINTS (follow all):',
-      '- You MUST treat the provided selectors as the single source of truth.',
-      '- For each step, use the provided Id, CssSelector, and Xpath exactly as written. Do not invent, modify, or guess any selectors.',
-      '- If an Id is provided in a step, prefer using By.ID with that exact Id.',
-      '- Otherwise, when a CssSelector is provided, use By.CSS_SELECTOR with that exact selector.',
-      '- Only when neither Id nor CssSelector is available, use By.XPATH with the provided Xpath.',
-      '- Do NOT rewrite CSS selectors or XPaths (no trimming, reformatting, or simplification).',
-      '- Do NOT introduce selectors that are not explicitly present in the step manifest.',
+      '2. VISIBILITY / DEMO FRIENDLINESS:',
+      '   - The user wants to SEE the bot working.',
+      '   - Add time.sleep(2) after every action (navigate, click, type, scroll, examine).',
+      '   - At the very end of the script, add: input("Press Enter to close the browser...") so the browser window stays open.',
       '',
-'Code quality requirements:',
-      `- Implement a function named ${testName}() that drives the browser.`,
-      '- Use WebDriverWait for all interactions (clicks and typing). Do NOT rely on bare time.sleep for readiness.',
-      '- Include concise comments above or beside each major interaction, derived from the Description field of the corresponding step.',
-      '- Use a reusable helper function inject_cookies(driver, raw_cookies_json) stub so cookies can be injected by the caller.',
-      '- Use a Chrome WebDriver with the given driver path, via Service (from selenium.webdriver.chrome.service import Service) and driver = webdriver.Chrome(service=Service(r"PATH"), options=options). Do NOT use the deprecated executable_path argument.',
+      '3. ROBUSTNESS:',
+      '   - Always use WebDriverWait(driver, 10) before interacting with elements.',
+      '   - Use proper By strategy for each selector as per the SELECTOR SAFETY rules.',
       '',
-      'Driver path to use literally in the script:',
-      driverPath,
+      '4. DRIVER SETUP (MANDATORY PATTERN):',
+      '   - Use this exact pattern for the driver setup (with the given driver path):',
+      '       from selenium.webdriver.chrome.service import Service',
+      `       service = Service(r'${driverPath}')`,
+      '       options = webdriver.ChromeOptions()',
+      "       driver = webdriver.Chrome(service=service, options=options)",
       '',
-      'STEP MANIFEST:',
-      stepManifest,
+      '5. COOKIES HELPER:',
+      '   - Include an inject_cookies(driver, raw_cookies_json) helper that loops over json.loads(raw_cookies_json) and calls driver.add_cookie.',
       '',
-      'Now generate ONLY the final Python code (no Markdown, no explanations).',
+      '### EXECUTION LOG (SOURCE OF TRUTH):',
+      stepsContext,
+      '',
+      '### OUTPUT FORMAT:',
+      `- Implement a function named ${testName}() that performs the steps in order.`,
+      '- Return ONLY valid Python code (no Markdown, no backticks).',
+      '- Include all necessary imports (webdriver, By, WebDriverWait, expected_conditions as EC, Service, json, time).',
+      '- Follow all CRITICAL RULES strictly.',
     ].join('\n');
 
     try {
@@ -98,12 +118,10 @@ export class SeleniumGenerator {
         ],
       } as any);
 
-      const text = (result as any).response?.text?.() ?? '';
-      const cleaned = text
-        // Strip Markdown fences if the model ignored the "no Markdown" rule.
-        .replace(/```[a-zA-Z]*[\s\S]*?```/g, (block: string) =>
-          block.replace(/```[a-zA-Z]*\n?/, '').replace(/```$/, ''),
-        )
+      const raw = (result as any).response?.text?.() ?? '';
+      const cleaned = raw
+        .replace(/```python/g, '')
+        .replace(/```/g, '')
         .trim();
 
       return cleaned || this.generatePython(commands);
