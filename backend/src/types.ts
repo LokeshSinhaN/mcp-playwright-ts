@@ -43,9 +43,21 @@ export interface ElementInfo {
 
 export interface ExecutionCommand {
   action: 'navigate' | 'click' | 'type' | 'scroll' | 'wait' | 'examine';
-  target?: string;      // selector or URL
+  target?: string;      // selector or URL (legacy primary target)
   value?: string;       // text to type
   waitTime?: number;    // seconds or ms depending on generator
+  // Rich selector data captured from successful interactions so downstream
+  // generators (e.g., Selenium) never need to hallucinate locators.
+  selectors?: {
+    css?: string;
+    xpath?: string;
+    id?: string;
+    text?: string;
+  };
+  // High-level natural-language description of the step, ideally the original
+  // user prompt or intent (e.g., "Click the 'Login' button"). Used to generate
+  // human-friendly comments in the Selenium script.
+  description?: string;
 }
 
 export interface ExecutionResult {

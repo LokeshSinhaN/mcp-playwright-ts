@@ -1,3 +1,4 @@
+import { GenerativeModel } from '@google/generative-ai';
 import { ExecutionCommand } from './types';
 
 export class SeleniumGenerator {
@@ -6,7 +7,8 @@ export class SeleniumGenerator {
       language?: 'python';
       testName?: string;
       chromeDriverPath?: string;
-    } = {}
+    } = {},
+    private readonly model?: GenerativeModel,
   ) {}
 
   generate(commands: ExecutionCommand[]): string {
@@ -15,6 +17,100 @@ export class SeleniumGenerator {
       throw new Error('Only python generation implemented here');
     }
     return this.generatePython(commands);
+  }
+
+  /**
+   * Generate Python Selenium code using the injected LLM for rich, commented,
+   * production-style scripts. Falls back to the template-based generator when
+   * no model is configured or the model call fails.
+   */
+  async generateWithLLM(commands: ExecutionCommand[]): Promise<string> {
+    if (!this.model) {
+      return this.generate(commands);
+    }
+
+    const stepManifestLines: string[] = [];
+    commands.forEach((cmd, index) => {
+      const stepNo = index + 1;
+      const description = (cmd.description || cmd.target || '').replace(/"/g, '\\"');
+      const sel = cmd.selectors || {};
+      const id = sel.id ?? '';
+      const css = sel.css ?? (cmd.target || '');
+      const xpath = sel.xpath ?? '';
+      const text = sel.text ?? '';
+
+      const parts: string[] = [];
+      parts.push(`Step ${stepNo}: Action="${cmd.action}"`);
+      if (description) parts.push(`Description="${description}"`);
+      if (id) parts.push(`Id="${id}"`);
+      if (css) parts.push(`CssSelector="${css}"`);
+      if (xpath) parts.push(`Xpath="${xpath}"`);
+      if (text) parts.push(`Text="${text.replace(/"/g, '\\"')}"`);
+      if (cmd.value && (cmd.action === 'type')) {
+        parts.push(`Value="${String(cmd.value).slice(0, 80).replace(/"/g, '\\"')}"`);
+      }
+
+      stepManifestLines.push(parts.join(', '));
+    });
+
+    const stepManifest = stepManifestLines.join('\n');
+
+    const testName = this.opts.testName ?? 'test_automation';
+    const driverPath = this.opts.chromeDriverPath ?? 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe';
+
+    const prompt = [
+      'You are an expert QA Automation Engineer.',
+      '',
+      'Task: Convert the following execution steps into a robust, production-ready Python Selenium script.',
+      '',
+      'STRICT CONSTRAINTS (follow all):',
+      '- You MUST treat the provided selectors as the single source of truth.',
+      '- For each step, use the provided Id, CssSelector, and Xpath exactly as written. Do not invent, modify, or guess any selectors.',
+      '- If an Id is provided in a step, prefer using By.ID with that exact Id.',
+      '- Otherwise, when a CssSelector is provided, use By.CSS_SELECTOR with that exact selector.',
+      '- Only when neither Id nor CssSelector is available, use By.XPATH with the provided Xpath.',
+      '- Do NOT rewrite CSS selectors or XPaths (no trimming, reformatting, or simplification).',
+      '- Do NOT introduce selectors that are not explicitly present in the step manifest.',
+      '',
+      'Code quality requirements:',
+      `- Implement a function named ${testName}() that drives the browser.`,
+      '- Use WebDriverWait for all interactions (clicks and typing). Do NOT rely on bare time.sleep for readiness.',
+      '- Include concise comments above or beside each major interaction, derived from the Description field of the corresponding step.',
+      '- Use a reusable helper function inject_cookies(driver, raw_cookies_json) stub so cookies can be injected by the caller.',
+      '- Use a Chrome WebDriver with the given driver path.',
+      '',
+      'Driver path to use literally in the script:',
+      driverPath,
+      '',
+      'STEP MANIFEST:',
+      stepManifest,
+      '',
+      'Now generate ONLY the final Python code (no Markdown, no explanations).',
+    ].join('\n');
+
+    try {
+      const result = await this.model.generateContent({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }],
+          },
+        ],
+      } as any);
+
+      const text = (result as any).response?.text?.() ?? '';
+      const cleaned = text
+        // Strip Markdown fences if the model ignored the "no Markdown" rule.
+        .replace(/```[a-zA-Z]*[\s\S]*?```/g, (block: string) =>
+          block.replace(/```[a-zA-Z]*\n?/, '').replace(/```$/, ''),
+        )
+        .trim();
+
+      return cleaned || this.generatePython(commands);
+    } catch (err) {
+      console.warn('SeleniumGenerator.generateWithLLM failed, falling back to template generator:', err);
+      return this.generatePython(commands);
+    }
   }
 
   private generatePython(commands: ExecutionCommand[]): string {

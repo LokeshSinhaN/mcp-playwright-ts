@@ -386,14 +386,15 @@ body {
   border-radius: 0.8rem;
   background: #020617;
   border: 1px solid rgba(15, 23, 42, 1);
-  /* Allow scrolling if the screenshot is taller than the preview area,
-     while keeping the image crisp and not overly zoomed. */
+  /* Allow scrolling if the screenshot or script is taller than the preview area,
+     while keeping the content crisp and readable. */
   overflow-y: auto;
   min-height: 0;
   flex: 1;
   display: flex;
-  align-items: flex-start;
-  justify-content: center;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
 }
 
 .browser-placeholder {
@@ -421,6 +422,19 @@ body {
   height: auto;
   display: block;
   object-fit: contain;
+}
+
+.code-preview {
+  margin: 0;
+  padding: 0.75rem 0.85rem;
+  border-top: 1px solid rgba(15, 23, 42, 1);
+  background: #020617;
+  color: var(--text);
+  font-family: SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre;
+  overflow-x: auto;
 }
 
 @media (max-width: 960px) {

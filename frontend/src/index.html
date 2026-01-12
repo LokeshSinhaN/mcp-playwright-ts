@@ -70,8 +70,9 @@
                 />
               </div>
               <div class="browser-actions">
-                <button id="take-screenshot-btn" class="toolbar-btn">📸</button>
-                <button id="close-session-btn" class="toolbar-btn toolbar-btn-danger">
+                <button id="take-screenshot-btn" class="toolbar-btn" title="Take screenshot">📸</button>
+                <button id="generate-script-btn" class="toolbar-btn" title="Generate Selenium script">📜</button>
+                <button id="close-session-btn" class="toolbar-btn toolbar-btn-danger" title="Reset session">
                   ✕
                 </button>
               </div>
@@ -89,6 +90,12 @@
                 alt="Browser screenshot"
                 hidden
               />
+              <pre
+                id="selenium-code-output"
+                class="code-preview"
+                aria-label="Generated Selenium Python script"
+                hidden
+              ></pre>
             </div>
           </div>
         </section>

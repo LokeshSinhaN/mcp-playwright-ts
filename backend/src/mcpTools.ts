@@ -14,7 +14,12 @@ export class McpTools {
     await this.browser.init();
     await this.browser.goto(url);
 
-    this.sessionHistory.push({ action: 'navigate', target: url });
+    // Record a high-level navigation step; description is the raw URL or prompt.
+    this.sessionHistory.push({
+      action: 'navigate',
+      target: url,
+      description: url,
+    });
 
     // Best-effort cookie/consent banner handling so subsequent
     // clicks (e.g. LOGIN, ACCEPT) are less likely to time out.
@@ -52,8 +57,17 @@ export class McpTools {
           // Record this as two high-level steps for downstream Selenium
           // generation: open dropdown (click) + select via keyboard.
           this.sessionHistory.push(
-            { action: 'click', target: dropdownIntent.dropdownLabel },
-            { action: 'type', target: dropdownIntent.dropdownLabel, value: dropdownIntent.optionLabel },
+            {
+              action: 'click',
+              target: dropdownIntent.dropdownLabel,
+              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`,
+            },
+            {
+              action: 'type',
+              target: dropdownIntent.dropdownLabel,
+              value: dropdownIntent.optionLabel,
+              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`,
+            },
           );
 
           message = `Selected option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`;
@@ -65,6 +79,7 @@ export class McpTools {
             action: 'type',
             target: 'dropdown-option',
             value: dropdownIntent.optionLabel,
+            description: `Select option "${dropdownIntent.optionLabel}" from currently open dropdown`,
           });
 
           message = `Selected option "${dropdownIntent.optionLabel}" from the currently open dropdown`;
@@ -153,7 +168,17 @@ export class McpTools {
           if (selectorToClick) {
             const info = await this.browser.click(selectorToClick);
             const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
-            this.sessionHistory.push({ action: 'click', target: robustSelector });
+            this.sessionHistory.push({
+              action: 'click',
+              target: robustSelector,
+              selectors: {
+                css: info.cssSelector ?? info.selector,
+                xpath: info.xpath,
+                id: info.id,
+                text: info.text,
+              },
+              description: target,
+            });
 
             // Give the UI time to animate (e.g., open dropdowns) before capturing
             // a screenshot that the LLM will use for its next decision.
@@ -185,7 +210,17 @@ export class McpTools {
 
           const info = await this.browser.click(selectorToClick);
           const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
-          this.sessionHistory.push({ action: 'click', target: robustSelector });
+          this.sessionHistory.push({
+            action: 'click',
+            target: robustSelector,
+            selectors: {
+              css: info.cssSelector ?? info.selector,
+              xpath: info.xpath,
+              id: info.id,
+              text: info.text,
+            },
+            description: target,
+          });
 
           // Allow dropdowns/menus to fully render before we capture the
           // post-click screenshot.
@@ -228,7 +263,17 @@ export class McpTools {
     try {
       const info = await this.browser.click(selector);
       const robustSelector = info.selector || info.cssSelector || info.xpath || selector;
-      this.sessionHistory.push({ action: 'click', target: robustSelector });
+      this.sessionHistory.push({
+        action: 'click',
+        target: robustSelector,
+        selectors: {
+          css: info.cssSelector ?? info.selector,
+          xpath: info.xpath,
+          id: info.id,
+          text: info.text,
+        },
+        description: labelForHistory || selector,
+      });
 
       const screenshot = await this.browser.screenshot();
       const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || labelForHistory || selector}\"`;
@@ -585,7 +630,17 @@ export class McpTools {
       // Step 4: Execute Click (Unique Match / Intelligent Locator)
       const info = await this.browser.click(selectorToClick);
       const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
-      this.sessionHistory.push({ action: 'click', target: robustSelector });
+      this.sessionHistory.push({
+        action: 'click',
+        target: robustSelector,
+        selectors: {
+          css: info.cssSelector ?? info.selector,
+          xpath: info.xpath,
+          id: info.id,
+          text: info.text,
+        },
+        description: target,
+      });
 
       // Pause briefly so any dropdowns/menus opened by the click have time to
       // render before we grab the screenshot for the client.
@@ -629,7 +684,18 @@ export class McpTools {
       const info = await this.browser.type(selector, text);
       
       const robustSelector = info.cssSelector || selector;
-      this.sessionHistory.push({ action: 'type', target: robustSelector, value: text });
+      this.sessionHistory.push({
+        action: 'type',
+        target: robustSelector,
+        value: text,
+        selectors: {
+          css: info.cssSelector ?? info.selector,
+          xpath: info.xpath,
+          id: info.id,
+          text: info.text,
+        },
+        description: selector,
+      });
 
       const screenshot = await this.browser.screenshot();
       return { 
@@ -713,22 +779,31 @@ export class McpTools {
   }
 
   async generateSelenium(commands?: ExecutionCommand[]): Promise<ExecutionResult> {
-    const gen = new SeleniumGenerator({
-      language: 'python',
-      testName: 'test_flow',
-      chromeDriverPath: 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe'
-    });
+    const gen = new SeleniumGenerator(
+      {
+        language: 'python',
+        testName: 'test_flow',
+        chromeDriverPath: 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe',
+      },
+      this.model,
+    );
 
     const cmdsToUse = (commands && commands.length > 0) ? commands : this.sessionHistory;
     
     // If we're using history, we might want to filter out non-essential steps if needed,
     // but usually exact replay is desired.
 
-    const code = gen.generate(cmdsToUse);
+    let code: string;
+    if (this.model) {
+      code = await gen.generateWithLLM(cmdsToUse);
+    } else {
+      code = gen.generate(cmdsToUse);
+    }
+
     return {
       success: true,
       message: `Generated selenium code from ${cmdsToUse.length} steps`,
-      seleniumCode: code
+      seleniumCode: code,
     };
   }
 }

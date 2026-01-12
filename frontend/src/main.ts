@@ -8,7 +8,9 @@ const promptInput = document.getElementById('prompt-input') as HTMLTextAreaEleme
 const screenshotImg = document.getElementById('browser-screenshot') as HTMLImageElement;
 const placeholder = document.getElementById('browser-placeholder') as HTMLDivElement;
 const takeScreenshotBtn = document.getElementById('take-screenshot-btn') as HTMLButtonElement;
+const generateScriptBtn = document.getElementById('generate-script-btn') as HTMLButtonElement | null;
 const closeSessionBtn = document.getElementById('close-session-btn') as HTMLButtonElement;
+const seleniumCodeOutput = document.getElementById('selenium-code-output') as HTMLPreElement | null;
 const wsStatusDot = document.getElementById('ws-status-dot');
 const wsStatusText = document.getElementById('ws-status-text');
 
@@ -62,6 +64,11 @@ chatForm.addEventListener('submit', async (e) => {
       screenshotImg.hidden = false;
       placeholder.hidden = true;
     }
+    // Any navigation or AI action switches the preview back to screenshot mode.
+    if (seleniumCodeOutput) {
+      seleniumCodeOutput.hidden = true;
+      seleniumCodeOutput.textContent = '';
+    }
   } catch (err: any) {
     appendLog({ type: 'error', message: err.message ?? String(err) });
   }
@@ -79,6 +86,26 @@ takeScreenshotBtn.addEventListener('click', async () => {
     appendLog({ type: 'error', message: err.message ?? String(err) });
   }
 });
+
+if (generateScriptBtn && seleniumCodeOutput) {
+  generateScriptBtn.addEventListener('click', async () => {
+    try {
+      const res = await api.execute('generate_selenium');
+      if (res.seleniumCode) {
+        seleniumCodeOutput.textContent = res.seleniumCode;
+        seleniumCodeOutput.hidden = false;
+        // When showing the script, we can keep the last screenshot as context but
+        // ensure the placeholder stays hidden.
+        placeholder.hidden = true;
+      } else {
+        seleniumCodeOutput.textContent = '# No Selenium script could be generated (no recorded steps).';
+        seleniumCodeOutput.hidden = false;
+      }
+    } catch (err: any) {
+      appendLog({ type: 'error', message: err.message ?? String(err) });
+    }
+  });
+}
 
 closeSessionBtn.addEventListener('click', () => {
   // you can add /api/close if needed
