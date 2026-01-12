@@ -424,10 +424,36 @@ body {
   object-fit: contain;
 }
 
+.code-preview-container {
+  border-top: 1px solid rgba(15, 23, 42, 1);
+  background: #020617;
+  display: flex;
+  flex-direction: column;
+}
+
+.code-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.45rem 0.7rem 0.35rem;
+  gap: 0.5rem;
+}
+
+.code-preview-title {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.code-copy-btn {
+  width: auto;
+  height: 22px;
+  padding: 0 0.55rem;
+  font-size: 0.7rem;
+}
+
 .code-preview {
   margin: 0;
-  padding: 0.75rem 0.85rem;
-  border-top: 1px solid rgba(15, 23, 42, 1);
+  padding: 0.75rem 0.85rem 0.9rem;
   background: #020617;
   color: var(--text);
   font-family: SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;

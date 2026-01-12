@@ -10,7 +10,9 @@ const placeholder = document.getElementById('browser-placeholder') as HTMLDivEle
 const takeScreenshotBtn = document.getElementById('take-screenshot-btn') as HTMLButtonElement;
 const generateScriptBtn = document.getElementById('generate-script-btn') as HTMLButtonElement | null;
 const closeSessionBtn = document.getElementById('close-session-btn') as HTMLButtonElement;
+const seleniumCodeContainer = document.getElementById('selenium-code-container') as HTMLDivElement | null;
 const seleniumCodeOutput = document.getElementById('selenium-code-output') as HTMLPreElement | null;
+const copySeleniumCodeBtn = document.getElementById('copy-selenium-code-btn') as HTMLButtonElement | null;
 const wsStatusDot = document.getElementById('ws-status-dot');
 const wsStatusText = document.getElementById('ws-status-text');
 
@@ -65,8 +67,8 @@ chatForm.addEventListener('submit', async (e) => {
       placeholder.hidden = true;
     }
     // Any navigation or AI action switches the preview back to screenshot mode.
-    if (seleniumCodeOutput) {
-      seleniumCodeOutput.hidden = true;
+    if (seleniumCodeContainer && seleniumCodeOutput) {
+      seleniumCodeContainer.hidden = true;
       seleniumCodeOutput.textContent = '';
     }
   } catch (err: any) {
@@ -82,27 +84,41 @@ takeScreenshotBtn.addEventListener('click', async () => {
       screenshotImg.hidden = false;
       placeholder.hidden = true;
     }
+    if (seleniumCodeContainer && seleniumCodeOutput) {
+      seleniumCodeContainer.hidden = true;
+      seleniumCodeOutput.textContent = '';
+    }
   } catch (err: any) {
     appendLog({ type: 'error', message: err.message ?? String(err) });
   }
 });
 
-if (generateScriptBtn && seleniumCodeOutput) {
+if (generateScriptBtn && seleniumCodeContainer && seleniumCodeOutput) {
   generateScriptBtn.addEventListener('click', async () => {
     try {
       const res = await api.execute('generate_selenium');
       if (res.seleniumCode) {
         seleniumCodeOutput.textContent = res.seleniumCode;
-        seleniumCodeOutput.hidden = false;
+        seleniumCodeContainer.hidden = false;
         // When showing the script, hide the screenshot so the code is immediately visible.
         screenshotImg.hidden = true;
         placeholder.hidden = true;
       } else {
         seleniumCodeOutput.textContent = '# No Selenium script could be generated (no recorded steps).';
-        seleniumCodeOutput.hidden = false;
+        seleniumCodeContainer.hidden = false;
       }
     } catch (err: any) {
       appendLog({ type: 'error', message: err.message ?? String(err) });
+    }
+  });
+}
+
+if (copySeleniumCodeBtn && seleniumCodeOutput) {
+  copySeleniumCodeBtn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(seleniumCodeOutput.textContent ?? '');
+    } catch (err) {
+      console.error('Failed to copy selenium code', err);
     }
   });
 }

@@ -90,12 +90,23 @@
                 alt="Browser screenshot"
                 hidden
               />
-              <pre
-                id="selenium-code-output"
-                class="code-preview"
+              <div
+                id="selenium-code-container"
+                class="code-preview-container"
                 aria-label="Generated Selenium Python script"
                 hidden
-              ></pre>
+              >
+                <div class="code-preview-header">
+                  <span class="code-preview-title">Generated Selenium Python script</span>
+                  <button id="copy-selenium-code-btn" class="toolbar-btn code-copy-btn" title="Copy script">
+                    ⧉
+                  </button>
+                </div>
+                <pre
+                  id="selenium-code-output"
+                  class="code-preview"
+                ></pre>
+              </div>
             </div>
           </div>
         </section>
