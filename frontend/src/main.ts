@@ -94,8 +94,8 @@ if (generateScriptBtn && seleniumCodeOutput) {
       if (res.seleniumCode) {
         seleniumCodeOutput.textContent = res.seleniumCode;
         seleniumCodeOutput.hidden = false;
-        // When showing the script, we can keep the last screenshot as context but
-        // ensure the placeholder stays hidden.
+        // When showing the script, hide the screenshot so the code is immediately visible.
+        screenshotImg.hidden = true;
         placeholder.hidden = true;
       } else {
         seleniumCodeOutput.textContent = '# No Selenium script could be generated (no recorded steps).';
