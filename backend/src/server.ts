@@ -6,6 +6,7 @@ import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
 import { BrowserManager } from './browserManager';
 import { McpTools } from './mcpTools';
 import { ExecutionResult, WebSocketMessage, ExecutionCommand, ElementInfo } from './types';
+import { parseDropdownInstruction } from './dropdownUtils';
 
 // Minimal conversation turn type if you later add real AI calls.
 interface ConversationTurn {
@@ -446,6 +447,11 @@ export function createServer(port: number, chromePath?: string) {
       });
     }
 
+    // Detect dropdown-style intents once, based on the original natural-language
+    // prompt so we can route them through the specialised dropdown helper
+    // instead of treating them as a generic "click" on the <select> element.
+    const dropdownIntentFromPrompt = parseDropdownInstruction(prompt);
+
     // 3) ACT: route to the appropriate tool based on the structured plan.
     switch (parsed.action) {
       case 'navigate': {
@@ -461,12 +467,52 @@ export function createServer(port: number, chromePath?: string) {
         return tools.navigate(targetUrl);
       }
       case 'click': {
+        // For dropdown-selection prompts like "Select the Indiana option from the
+        // drop down menu", the most reliable behaviour is to reuse the
+        // specialised dropdown helper wired into McpTools.click(). When a
+        // dropdown intent is detected from the original prompt, we deliberately
+        // ignore the model's chosen elementId and let the dropdown helper
+        // resolve the appropriate trigger and option using its own heuristics
+        // and LLM-assisted matching.
+        if (dropdownIntentFromPrompt) {
+          return tools.click(prompt);
+        }
+
         const byId = parsed.elementId
           ? limitedElements.find((e) => e.elementId === parsed.elementId)
           : undefined;
 
-        // STRICT ID PRIORITY: when a matching elementId exists, always use its selector.
+        // STRICT ID PRIORITY: when a matching elementId exists, we still require
+        // its visible label/ariaLabel to have meaningful overlap with the
+        // original natural-language prompt. This prevents the system from
+        // blindly clicking elements like "Test Autofill" when the user asked
+        // for "Credit Card".
         if (byId && byId.selector) {
+          const promptText = (prompt || '').toLowerCase();
+          const promptTokens = promptText
+            .split(/[^a-z0-9]+/)
+            .filter((t) => t.length >= 3)
+            .filter((t) => !['click', 'press', 'tap', 'open', 'go', 'goto', 'the', 'this', 'that', 'button', 'link', 'tab', 'menu', 'dropdown', 'drop', 'down', 'header', 'footer'].includes(t));
+
+          const labelBlob = `${byId.text ?? ''} ${byId.ariaLabel ?? ''} ${byId.dataTestId ?? ''}`
+            .toLowerCase()
+            .trim();
+
+          const hasOverlap =
+            promptTokens.length === 0 ||
+            (labelBlob && promptTokens.some((tok) => labelBlob.includes(tok)));
+
+          if (!hasOverlap) {
+            const screenshot = observation.screenshot ?? (await browser.screenshot().catch(() => undefined as any));
+            return {
+              ...observation,
+              success: false,
+              message: `No element with text matching the request "${prompt}" could be safely identified. AI suggested "${byId.text || byId.ariaLabel || byId.selector}", which does not share key words with the prompt, so no click was performed.`,
+              error: 'No strong overlap between prompt and chosen element',
+              screenshot,
+            };
+          }
+
           return tools.click(byId.selector);
         }
 

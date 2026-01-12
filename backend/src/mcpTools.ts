@@ -513,9 +513,18 @@ export class McpTools {
             // Otherwise, use the top-scoring candidate.
             selectedCandidate = scored[0].info;
           } else {
-            // No positive scores (very weak matches) — take the first candidate
-            // as a best-effort guess.
-            selectedCandidate = candidates[0];
+            // No positive scores (very weak matches) — instead of guessing, treat
+            // this as a "not found" situation so we never click an obviously
+            // unrelated element.
+            const screenshot = await this.browser.screenshot().catch(() => undefined as any);
+            return {
+              success: false,
+              message: `No elements on the page matched "${target}" strongly enough to click safely.`,
+              isAmbiguous: false,
+              requiresInteraction: true,
+              candidates,
+              screenshot
+            };
           }
 
           const preferredSelector =

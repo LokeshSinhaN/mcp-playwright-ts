@@ -53,15 +53,19 @@ async function resolveTrigger(page: Page, trigger: string): Promise<Locator> {
  * has already been opened if necessary.
  */
 async function selectOptionByStrategies(page: Page, optionText: string): Promise<void> {
-  // Strategy 0: Modern "Type & Enter" Optimization.
-  // If we just clicked a trigger and now an input/combobox is focused,
-  // simply type to filter/shift the list and press Enter.
+  // Normalise option text for regex/text locators.
+  const optionEscaped = optionText.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  const optionRe = new RegExp(optionEscaped, 'i');
+
+  // Strategy 0 (primary): if the current focused element behaves like a
+  // combobox or text input, prefer "type + Enter". This matches how modern
+  // searchable dropdowns are designed to be used.
   const isComboboxFocused = await page.evaluate(() => {
     const el = document.activeElement as HTMLElement | null;
     if (!el) return false;
     const tag = (el.tagName || '').toLowerCase();
-    const role = el.getAttribute('role') || '';
-    return tag === 'input' || role.toLowerCase() === 'combobox';
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    return tag === 'input' || role === 'combobox' || role === 'textbox';
   });
 
   if (isComboboxFocused) {
@@ -71,11 +75,8 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
     return;
   }
 
-  // Normalise option text for regex/text locators.
-  const optionEscaped = optionText.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
-  const optionRe = new RegExp(optionEscaped, 'i');
-
-  // Strategy A: semantic roles commonly used for menu options.
+  // Strategy A: semantic roles commonly used for menu options. Prefer direct
+  // clicking on an explicit option/menu item when type+Enter is not available.
   const roleLocators: Locator[] = [
     page.getByRole('option',   { name: optionRe }),
     page.getByRole('menuitem', { name: optionRe }),
@@ -128,10 +129,11 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
     // If menu containers are not found, continue to keyboard fallback.
   }
 
-  // Strategy C (universal fallback): type the option text and press Enter.
-  // This matches how most modern dropdowns/comboboxes behave: they move the
-  // highlight as you type and commit on Enter, even if the option nodes are not
-  // directly clickable or are virtualized.
+  // Strategy C (universal fallback): as a last resort for highly
+  // custom/virtualized dropdowns, type the option text and press Enter even
+  // when we could not positively identify a focused combobox. This still
+  // leverages the common "type to filter then Enter" behaviour while avoiding
+  // brittle, site-specific selectors.
   await page.keyboard.type(optionText, { delay: 50 });
   await page.keyboard.press('Enter');
 }
@@ -169,16 +171,48 @@ export async function selectFromDropdown(
     if (handle) {
       const tagName = await handle.evaluate((el: any) => (el.tagName || '').toLowerCase());
       if (tagName === 'select') {
-        await triggerLocator.selectOption({ label: optionText });
-        return;
+        // Prefer an exact visible-label match, but gracefully fall back to a
+        // case-insensitive/partial option match when the label text in the DOM
+        // differs slightly from the natural-language prompt (extra spaces,
+        // punctuation, etc.). This avoids brittle hard-coding while still
+        // strongly preferring precise matches.
+        try {
+          await triggerLocator.selectOption({ label: optionText });
+          return;
+        } catch {
+          const escaped = optionText
+            .trim()
+            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/\s+/g, '\\s+');
+          const re = new RegExp(escaped, 'i');
+          const fallbackOption = triggerLocator.locator('option').filter({ hasText: re }).first();
+          if (await fallbackOption.count()) {
+            await fallbackOption.click({ timeout: 1500 });
+            return;
+          }
+        }
       }
 
       // Some component libraries wrap <select> inside a styled container; check
       // for a descendant <select> when the trigger itself is not one.
       const innerSelect = triggerLocator.locator('select');
       if (await innerSelect.count()) {
-        await innerSelect.first().selectOption({ label: optionText });
-        return;
+        const firstSelect = innerSelect.first();
+        try {
+          await firstSelect.selectOption({ label: optionText });
+          return;
+        } catch {
+          const escaped = optionText
+            .trim()
+            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/\s+/g, '\\s+');
+          const re = new RegExp(escaped, 'i');
+          const fallbackOption = firstSelect.locator('option').filter({ hasText: re }).first();
+          if (await fallbackOption.count()) {
+            await fallbackOption.click({ timeout: 1500 });
+            return;
+          }
+        }
       }
     }
   } catch {
