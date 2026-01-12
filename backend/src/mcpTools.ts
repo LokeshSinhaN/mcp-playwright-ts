@@ -43,7 +43,7 @@ export class McpTools {
       try {
         await this.browser.init();
         const page = this.browser.getPage();
-
+        
         let message: string;
 
         if (dropdownIntent.kind === 'open-and-select') {
@@ -213,6 +213,51 @@ export class McpTools {
 
     // Tier 2: No model configured – always use heuristic path.
     return this.clickWithHeuristics(target);
+  }
+
+  /**
+   * Direct, selector-based click that trusts an upstream planner's chosen
+   * element. This skips additional fuzzy matching, but still records history
+   * for downstream Selenium generation and returns a rich ExecutionResult.
+   */
+  async clickExact(selector: string, labelForHistory?: string): Promise<ExecutionResult> {
+    await this.browser.init();
+    const page = this.browser.getPage();
+    const extractor = new SelectorExtractor(page);
+
+    try {
+      const info = await this.browser.click(selector);
+      const robustSelector = info.selector || info.cssSelector || info.xpath || selector;
+      this.sessionHistory.push({ action: 'click', target: robustSelector });
+
+      const screenshot = await this.browser.screenshot();
+      const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || labelForHistory || selector}\"`;
+
+      return {
+        success: true,
+        message: baseMessage,
+        selectors: [info],
+        screenshot,
+      };
+    } catch (err) {
+      // Final safety net – mirror type() behaviour and surface a structured
+      // failure with a fresh selector snapshot instead of throwing.
+      const msg = err instanceof Error ? err.message : String(err);
+      const screenshot = await this.browser.screenshot().catch(() => undefined as any);
+      let selectors;
+      try {
+        selectors = await extractor.extractAllInteractive();
+      } catch {
+        selectors = undefined;
+      }
+      return {
+        success: false,
+        message: msg,
+        error: msg,
+        screenshot,
+        selectors,
+      };
+    }
   }
 
   /**

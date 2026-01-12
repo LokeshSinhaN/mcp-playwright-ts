@@ -483,10 +483,11 @@ export function createServer(port: number, chromePath?: string) {
           : undefined;
 
         // STRICT ID PRIORITY: when a matching elementId exists, we still require
-        // its visible label/ariaLabel to have meaningful overlap with the
-        // original natural-language prompt. This prevents the system from
-        // blindly clicking elements like "Test Autofill" when the user asked
-        // for "Credit Card".
+        // its visible labels to have meaningful overlap with the original
+        // natural-language prompt. This prevents the system from blindly
+        // clicking elements like "Test Autofill" when the user asked for
+        // "Credit Card", while still allowing inputs that are only labelled via
+        // placeholder, title, or nearby context.
         if (byId && byId.selector) {
           const promptText = (prompt || '').toLowerCase();
           const promptTokens = promptText
@@ -494,7 +495,16 @@ export function createServer(port: number, chromePath?: string) {
             .filter((t) => t.length >= 3)
             .filter((t) => !['click', 'press', 'tap', 'open', 'go', 'goto', 'the', 'this', 'that', 'button', 'link', 'tab', 'menu', 'dropdown', 'drop', 'down', 'header', 'footer'].includes(t));
 
-          const labelBlob = `${byId.text ?? ''} ${byId.ariaLabel ?? ''} ${byId.dataTestId ?? ''}`
+          const labelBlob = [
+            byId.text,
+            byId.ariaLabel,
+            byId.dataTestId,
+            byId.placeholder,
+            byId.title,
+            byId.context,
+          ]
+            .filter(Boolean)
+            .join(' ')
             .toLowerCase()
             .trim();
 
@@ -513,7 +523,19 @@ export function createServer(port: number, chromePath?: string) {
             };
           }
 
-          return tools.click(byId.selector);
+          // At this point the planner has selected a concrete elementId and its
+          // labels semantically match the user's request. We can safely perform
+          // a direct selector-based click without re-running a second round of
+          // heuristic matching that might reintroduce ambiguity.
+          const historyLabel =
+            prompt ||
+            byId.text ||
+            byId.ariaLabel ||
+            byId.dataTestId ||
+            byId.context ||
+            byId.selector;
+
+          return tools.clickExact(byId.selector, historyLabel);
         }
 
         // Fallback: semantic target for fuzzy matching inside McpTools.
