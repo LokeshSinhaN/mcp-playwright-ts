@@ -89,14 +89,28 @@ export class BrowserManager {
 
   async screenshot(): Promise<string> {
     const page = this.getPage();
-    // Capture only the current viewport at a larger size instead of a full-page
-    // tall image. This makes the preview appear closer to a maximized view
-    // instead of a shrunk-down full-page thumbnail.
-    const buf = await page.screenshot({ fullPage: true });
-    const base64 = buf.toString('base64');
-    const dataUrl = `data:image/png;base64,${base64}`;
-    this.state.lastScreenshot = dataUrl;
-    return dataUrl;
+
+    try {
+      // Capture a full-page screenshot but bound the timeout so we don't block
+      // actions on sites whose fonts or other assets never finish loading.
+      const buf = await page.screenshot({ fullPage: true, timeout: 5000 });
+      const base64 = buf.toString('base64');
+      const dataUrl = `data:image/png;base64,${base64}`;
+      this.state.lastScreenshot = dataUrl;
+      return dataUrl;
+    } catch (err) {
+      // If screenshot capture times out (e.g., stuck on "waiting for fonts to
+      // load"), fall back to the last successful screenshot instead of failing
+      // the entire action. This keeps the automation flow alive even when the
+      // visual snapshot is slightly stale.
+      console.warn('BrowserManager.screenshot failed, using lastScreenshot if available:', err);
+      if (this.state.lastScreenshot) {
+        return this.state.lastScreenshot;
+      }
+      // As an absolute fallback, return an empty data URL so callers still
+      // receive a string and do not crash.
+      return 'data:image/png;base64,';
+    }
   }
 
   /**
@@ -377,10 +391,15 @@ export class BrowserManager {
         if (/combobox|listbox|menu/.test(role)) return true;
         if (/dropdown|drop-down/.test(cls)) return true;
         if (/select/.test(text) && /role|option/.test(text)) return true;
+        // Extra hint for location-style dropdowns like the Mayo Clinic "LOCATION"
+        // control, which is a div with location-related text.
+        if (tag === 'div' && /select|location/i.test(info.text || '')) return true;
         return false;
       })();
 
-      const settleMs = isDropdownLike ? 800 : 300;
+      // Use a slightly longer settle time for dropdown-like controls to avoid
+      // racing their open animations.
+      const settleMs = isDropdownLike ? 2000 : 500;
       await page.waitForTimeout(settleMs);
     } catch {
       // Non-fatal; continue even if the wait was interrupted.

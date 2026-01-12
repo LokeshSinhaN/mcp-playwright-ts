@@ -155,6 +155,9 @@ export class McpTools {
             const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
             this.sessionHistory.push({ action: 'click', target: robustSelector });
 
+            // Give the UI time to animate (e.g., open dropdowns) before capturing
+            // a screenshot that the LLM will use for its next decision.
+            await page.waitForTimeout(1000);
             const screenshot = await this.browser.screenshot();
             const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || target}\"`;
 
@@ -184,6 +187,9 @@ export class McpTools {
           const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
           this.sessionHistory.push({ action: 'click', target: robustSelector });
 
+          // Allow dropdowns/menus to fully render before we capture the
+          // post-click screenshot.
+          await page.waitForTimeout(1000);
           const screenshot = await this.browser.screenshot();
           const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || target}\"`;
 
@@ -527,6 +533,9 @@ export class McpTools {
       const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
       this.sessionHistory.push({ action: 'click', target: robustSelector });
 
+      // Pause briefly so any dropdowns/menus opened by the click have time to
+      // render before we grab the screenshot for the client.
+      await page.waitForTimeout(1000);
       const screenshot = await this.browser.screenshot();
       const baseMessage = `Clicked ${info.roleHint || 'element'} "${info.text || target}"`;
       const visibilityHint =
