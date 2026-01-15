@@ -6,6 +6,7 @@ export class BrowserManager {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private screenshotStreamer: NodeJS.Timeout | null = null;
   private readonly config: BrowserConfig;
   private readonly state: SessionState = {
     isOpen: false,
@@ -22,6 +23,38 @@ export class BrowserManager {
       chromePath: config.chromePath
     };
   }
+
+  startScreenshotStream(broadcast: (message: string) => void) {
+    if (this.screenshotStreamer) {
+      console.log('Screenshot streamer is already running.');
+      return;
+    }
+
+    console.log('Starting screenshot streamer.');
+    this.screenshotStreamer = setInterval(async () => {
+      try {
+        const screenshot = await this.screenshot();
+        broadcast(
+          JSON.stringify({
+            type: 'screenshot',
+            data: { screenshot, timestamp: Date.now() }
+          })
+        );
+      } catch (err) {
+        // This is a "best-effort" stream, so we log errors but do not stop
+        // the timer. It may recover on the next tick.
+        console.warn('Screenshot stream failed on one tick:', err);
+      }
+    }, 250); // Send a screenshot every 250ms for a 4 FPS stream
+  }
+
+  stopScreenshotStream() {
+    if (!this.screenshotStreamer) return;
+    console.log('Stopping screenshot streamer.');
+    clearInterval(this.screenshotStreamer);
+    this.screenshotStreamer = null;
+  }
+
 
   private get defaultTimeout(): number {
     return this.config.timeoutMs;
