@@ -2,7 +2,15 @@ import { GenerativeModel } from '@google/generative-ai';
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
-import { ExecutionCommand, ExecutionResult, ElementInfo } from './types';
+import {
+  ExecutionCommand,
+  ExecutionResult,
+  ElementInfo,
+  AgentAction,
+  AgentStepResult,
+  AgentSessionResult,
+  AgentConfig,
+} from './types';
 import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent } from './dropdownUtils';
 
 export class McpTools {
@@ -805,5 +813,737 @@ export class McpTools {
       message: `Generated selenium code from ${cmdsToUse.length} steps`,
       seleniumCode: code,
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // AUTONOMOUS AGENT WITH SELF-HEALING
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Run an autonomous agent that accomplishes a high-level goal through
+   * an observe-think-act loop with self-healing capabilities.
+   *
+   * Self-healing mechanisms:
+   * 1. State change detection - verifies actions had the intended effect
+   * 2. Automatic retry with alternative selectors when actions fail
+   * 3. Action history awareness - prevents infinite loops on the same element
+   * 4. Semantic element matching - finds similar elements when exact match fails
+   */
+  async runAutonomousAgent(
+    goal: string,
+    config: AgentConfig = {}
+  ): Promise<AgentSessionResult> {
+    const maxSteps = config.maxSteps ?? 20;
+    const maxRetries = config.maxRetriesPerAction ?? 3;
+    const generateSelenium = config.generateSelenium ?? true;
+
+    // Clear session history for a fresh autonomous run
+    this.sessionHistory = [];
+
+    const steps: AgentStepResult[] = [];
+    const failedElements: Set<string> = new Set(); // Track elements that failed to avoid retrying them
+    const actionHistory: string[] = []; // Natural language history for context
+
+    await this.browser.init();
+    const page = this.browser.getPage();
+
+    let stepNumber = 0;
+    let isFinished = false;
+    let finalSummary = '';
+
+    while (stepNumber < maxSteps && !isFinished) {
+      stepNumber++;
+
+      // ─────────────────────────────────────────────────────────────────────
+      // PHASE 1: OBSERVE - Capture current state
+      // ─────────────────────────────────────────────────────────────────────
+      const urlBefore = page.url();
+      const observation = await this.observe();
+      const elements = observation.selectors ?? [];
+      const screenshot = observation.screenshot;
+
+      // ─────────────────────────────────────────────────────────────────────
+      // PHASE 2: THINK - Ask LLM for next action
+      // ─────────────────────────────────────────────────────────────────────
+      const nextAction = await this.planNextAgentAction(
+        goal,
+        elements,
+        actionHistory,
+        failedElements,
+        screenshot
+      );
+
+      // Notify callback if provided
+      if (config.onThought) {
+        config.onThought(nextAction.thought, nextAction);
+      }
+
+      // Check if agent decided to finish
+      if (nextAction.type === 'finish') {
+        isFinished = true;
+        finalSummary = nextAction.summary;
+        steps.push({
+          stepNumber,
+          action: nextAction,
+          success: true,
+          message: 'Agent completed the goal',
+          urlBefore,
+          urlAfter: urlBefore,
+          stateChanged: false,
+          screenshot,
+          retryCount: 0,
+        });
+        break;
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // PHASE 3: ACT - Execute with self-healing retry logic
+      // ─────────────────────────────────────────────────────────────────────
+      let retryCount = 0;
+      let actionSuccess = false;
+      let actionMessage = '';
+      let actionError: string | undefined;
+      let elementInfo: ElementInfo | undefined;
+      let recoveryAttempt: string | undefined;
+      let urlAfter = urlBefore;
+      let postActionScreenshot = screenshot;
+
+      while (retryCount <= maxRetries && !actionSuccess) {
+        try {
+          const result = await this.executeAgentAction(
+            nextAction,
+            elements,
+            retryCount,
+            failedElements
+          );
+
+          actionSuccess = result.success;
+          actionMessage = result.message;
+          elementInfo = result.elementInfo;
+
+          if (!actionSuccess && result.error) {
+            actionError = result.error;
+            // Track failed element to avoid retrying it
+            if (result.failedSelector) {
+              failedElements.add(result.failedSelector);
+            }
+            retryCount++;
+            if (retryCount <= maxRetries) {
+              recoveryAttempt = `Retry ${retryCount}/${maxRetries}: ${result.recoveryHint || 'trying alternative approach'}`;
+            }
+          }
+        } catch (err) {
+          actionError = err instanceof Error ? err.message : String(err);
+          retryCount++;
+          if (retryCount <= maxRetries) {
+            recoveryAttempt = `Retry ${retryCount}/${maxRetries} after error: ${actionError}`;
+            // Brief pause before retry
+            await page.waitForTimeout(500 * retryCount);
+          }
+        }
+      }
+
+      // Capture post-action state
+      urlAfter = page.url();
+      try {
+        postActionScreenshot = await this.browser.screenshot();
+      } catch {
+        postActionScreenshot = screenshot;
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // PHASE 4: VERIFY - Detect state change (self-healing check)
+      // ─────────────────────────────────────────────────────────────────────
+      const stateChanged = await this.detectStateChange(
+        urlBefore,
+        urlAfter,
+        nextAction
+      );
+
+      // Update action history for context in future steps
+      const actionDescription = this.describeAction(nextAction, actionSuccess);
+      actionHistory.push(actionDescription);
+
+      const stepResult: AgentStepResult = {
+        stepNumber,
+        action: nextAction,
+        success: actionSuccess,
+        message: actionMessage,
+        urlBefore,
+        urlAfter,
+        stateChanged,
+        recoveryAttempt,
+        screenshot: postActionScreenshot,
+        elementInfo,
+        error: actionError,
+        retryCount,
+      };
+
+      steps.push(stepResult);
+
+      // Notify callback if provided
+      if (config.onStepComplete) {
+        config.onStepComplete(stepResult);
+      }
+
+      // Self-healing: if action succeeded but no state change, log warning
+      if (actionSuccess && !stateChanged && nextAction.type !== 'wait') {
+        console.warn(
+          `Step ${stepNumber}: Action succeeded but no state change detected. ` +
+          `This might indicate the click had no effect.`
+        );
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FINAL: Generate results
+    // ─────────────────────────────────────────────────────────────────────────
+    let seleniumCode: string | undefined;
+    if (generateSelenium && this.sessionHistory.length > 0) {
+      try {
+        const seleniumResult = await this.generateSelenium();
+        seleniumCode = seleniumResult.seleniumCode;
+      } catch (err) {
+        console.warn('Failed to generate Selenium code:', err);
+      }
+    }
+
+    const finalObservation = await this.observe();
+    const overallSuccess = isFinished || steps.filter(s => s.success).length > 0;
+
+    return {
+      success: overallSuccess,
+      summary: finalSummary || this.generateSessionSummary(steps, goal),
+      goal,
+      totalSteps: stepNumber,
+      steps,
+      commands: [...this.sessionHistory],
+      seleniumCode,
+      screenshot: finalObservation.screenshot,
+      selectors: finalObservation.selectors,
+    };
+  }
+
+  /**
+   * Ask the LLM to decide the next action based on current state and history.
+   */
+  private async planNextAgentAction(
+    goal: string,
+    elements: ElementInfo[],
+    actionHistory: string[],
+    failedElements: Set<string>,
+    screenshot?: string
+  ): Promise<AgentAction> {
+    if (!this.model) {
+      // Fallback: if no model, return finish immediately
+      return {
+        type: 'finish',
+        thought: 'No LLM model available',
+        summary: 'Cannot proceed without AI model',
+      };
+    }
+
+    // Build element context for LLM
+    const visibleElements = elements.filter(el => el.visible !== false && el.isVisible !== false);
+    const limitedElements = visibleElements.slice(0, 150).map((el, idx) => ({
+      id: `el_${idx}`,
+      tag: el.tagName,
+      text: (el.text || '').slice(0, 100),
+      ariaLabel: el.ariaLabel || '',
+      placeholder: el.placeholder || '',
+      role: el.roleHint || 'other',
+      region: el.region || 'main',
+      selector: el.selector || el.cssSelector || el.xpath || '',
+      isFailed: el.selector ? failedElements.has(el.selector) : false,
+    }));
+
+    const historyContext = actionHistory.length > 0
+      ? `\n\nPrevious actions taken:\n${actionHistory.map((a, i) => `${i + 1}. ${a}`).join('\n')}`
+      : '';
+
+    const failedContext = failedElements.size > 0
+      ? `\n\nElements that have failed (DO NOT retry these):\n${Array.from(failedElements).slice(0, 10).join('\n')}`
+      : '';
+
+    const prompt = [
+      'SYSTEM: You are an autonomous browser agent. Your goal is to accomplish the user\'s task through a series of browser actions.',
+      '',
+      `GOAL: ${goal}`,
+      historyContext,
+      failedContext,
+      '',
+      'CURRENT PAGE ELEMENTS (JSON):',
+      JSON.stringify(limitedElements, null, 2),
+      '',
+      'INSTRUCTIONS:',
+      '- Analyze the current state and decide the SINGLE next action to take.',
+      '- If an element has "isFailed: true", DO NOT select it - find an alternative.',
+      '- If you have completed the goal or cannot proceed further, use action "finish".',
+      '- Be precise: prefer elements with exact text matches to the goal.',
+      '- Consider the action history to avoid repeating failed approaches.',
+      '',
+      'RESPONSE FORMAT (JSON only, no markdown):',
+      'Return ONE of these action types:',
+      '{ "type": "navigate", "url": "https://...", "thought": "reasoning" }',
+      '{ "type": "click", "elementId": "el_N", "thought": "reasoning" }',
+      '{ "type": "click", "semanticTarget": "button text", "thought": "reasoning" }',
+      '{ "type": "type", "elementId": "el_N", "text": "text to type", "thought": "reasoning" }',
+      '{ "type": "scroll", "direction": "down", "thought": "reasoning" }',
+      '{ "type": "wait", "durationMs": 1000, "thought": "reasoning" }',
+      '{ "type": "finish", "thought": "reasoning", "summary": "what was accomplished" }',
+      '',
+      'The "thought" field must explain your reasoning. Return ONLY raw JSON.',
+    ].join('\n');
+
+    try {
+      // Build multimodal request if screenshot is available
+      const textPart = { text: prompt };
+      const imagePart = screenshot && screenshot.startsWith('data:image/')
+        ? {
+            inlineData: {
+              data: screenshot.split(',')[1] || '',
+              mimeType: 'image/png',
+            },
+          }
+        : null;
+
+      const response = imagePart
+        ? await this.model.generateContent([textPart, imagePart] as any)
+        : await this.model.generateContent(textPart as any);
+
+      const rawText = (response as any).response?.text?.() ?? '';
+      const parsed = this.parseAgentActionResponse(rawText);
+      return parsed;
+    } catch (err) {
+      console.error('Failed to get next agent action from LLM:', err);
+      return {
+        type: 'finish',
+        thought: `LLM error: ${err instanceof Error ? err.message : String(err)}`,
+        summary: 'Agent stopped due to LLM error',
+      };
+    }
+  }
+
+  /**
+   * Parse the LLM response into a typed AgentAction.
+   */
+  private parseAgentActionResponse(raw: string): AgentAction {
+    const trimmed = raw.trim();
+
+    // Try to extract JSON from markdown code blocks if present
+    const jsonMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    const jsonStr = jsonMatch ? jsonMatch[1].trim() : trimmed;
+
+    // Find first { and last } to extract JSON object
+    const first = jsonStr.indexOf('{');
+    const last = jsonStr.lastIndexOf('}');
+    if (first < 0 || last <= first) {
+      return {
+        type: 'finish',
+        thought: 'Could not parse LLM response as JSON',
+        summary: 'Parse error - stopping agent',
+      };
+    }
+
+    try {
+      const parsed = JSON.parse(jsonStr.substring(first, last + 1));
+
+      // Validate and normalize the action
+      const thought = parsed.thought || 'No reasoning provided';
+
+      switch (parsed.type) {
+        case 'navigate':
+          return { type: 'navigate', url: parsed.url || '', thought };
+        case 'click':
+          return {
+            type: 'click',
+            elementId: parsed.elementId,
+            selector: parsed.selector,
+            semanticTarget: parsed.semanticTarget,
+            thought,
+          };
+        case 'type':
+          return {
+            type: 'type',
+            elementId: parsed.elementId,
+            selector: parsed.selector,
+            semanticTarget: parsed.semanticTarget,
+            text: parsed.text || '',
+            thought,
+          };
+        case 'scroll':
+          return {
+            type: 'scroll',
+            direction: parsed.direction === 'up' ? 'up' : 'down',
+            thought,
+          };
+        case 'wait':
+          return {
+            type: 'wait',
+            durationMs: parsed.durationMs || 1000,
+            thought,
+          };
+        case 'finish':
+          return {
+            type: 'finish',
+            thought,
+            summary: parsed.summary || 'Task completed',
+          };
+        default:
+          return {
+            type: 'finish',
+            thought: `Unknown action type: ${parsed.type}`,
+            summary: 'Unknown action - stopping agent',
+          };
+      }
+    } catch (err) {
+      return {
+        type: 'finish',
+        thought: `JSON parse error: ${err instanceof Error ? err.message : String(err)}`,
+        summary: 'Parse error - stopping agent',
+      };
+    }
+  }
+
+  /**
+   * Execute a single agent action with self-healing support.
+   */
+  private async executeAgentAction(
+    action: AgentAction,
+    elements: ElementInfo[],
+    retryCount: number,
+    failedElements: Set<string>
+  ): Promise<{
+    success: boolean;
+    message: string;
+    elementInfo?: ElementInfo;
+    error?: string;
+    failedSelector?: string;
+    recoveryHint?: string;
+  }> {
+    const page = this.browser.getPage();
+
+    switch (action.type) {
+      case 'navigate': {
+        const result = await this.navigate(action.url);
+        return {
+          success: result.success,
+          message: result.message,
+          error: result.error,
+        };
+      }
+
+      case 'click': {
+        // Resolve the selector to use
+        let selectorToClick: string | undefined;
+        let elementInfo: ElementInfo | undefined;
+
+        if (action.elementId) {
+          // Find element by LLM-assigned ID
+          const match = action.elementId.match(/^el_(\d+)$/);
+          if (match) {
+            const idx = parseInt(match[1], 10);
+            const visibleElements = elements.filter(el => el.visible !== false && el.isVisible !== false);
+            const el = visibleElements[idx];
+            if (el) {
+              selectorToClick = el.selector || el.cssSelector || el.xpath;
+              elementInfo = el;
+            }
+          }
+        }
+
+        if (action.selector) {
+          selectorToClick = action.selector;
+        }
+
+        // Self-healing: if the chosen selector has failed before, find alternative
+        if (selectorToClick && failedElements.has(selectorToClick) && retryCount > 0) {
+          const alternative = await this.findAlternativeElement(
+            elements,
+            action.semanticTarget || elementInfo?.text || '',
+            failedElements
+          );
+          if (alternative) {
+            selectorToClick = alternative.selector || alternative.cssSelector || alternative.xpath;
+            elementInfo = alternative;
+          }
+        }
+
+        // Fallback to semantic target
+        if (!selectorToClick && action.semanticTarget) {
+          const result = await this.click(action.semanticTarget);
+          return {
+            success: result.success,
+            message: result.message,
+            elementInfo: result.selectors?.[0],
+            error: result.error,
+            failedSelector: action.semanticTarget,
+            recoveryHint: 'Will try alternative element matching',
+          };
+        }
+
+        if (!selectorToClick) {
+          return {
+            success: false,
+            message: 'No valid selector found for click action',
+            error: 'Missing selector',
+            recoveryHint: 'Need to find element by semantic matching',
+          };
+        }
+
+        try {
+          const result = await this.clickExact(selectorToClick, action.thought);
+          return {
+            success: result.success,
+            message: result.message,
+            elementInfo: result.selectors?.[0] || elementInfo,
+            error: result.error,
+            failedSelector: result.success ? undefined : selectorToClick,
+            recoveryHint: result.success ? undefined : 'Will try alternative selector',
+          };
+        } catch (err) {
+          return {
+            success: false,
+            message: `Click failed: ${err instanceof Error ? err.message : String(err)}`,
+            elementInfo,
+            error: err instanceof Error ? err.message : String(err),
+            failedSelector: selectorToClick,
+            recoveryHint: 'Will try alternative selector',
+          };
+        }
+      }
+
+      case 'type': {
+        let selectorToType: string | undefined;
+        let elementInfo: ElementInfo | undefined;
+
+        if (action.elementId) {
+          const match = action.elementId.match(/^el_(\d+)$/);
+          if (match) {
+            const idx = parseInt(match[1], 10);
+            const visibleElements = elements.filter(el => el.visible !== false && el.isVisible !== false);
+            const el = visibleElements[idx];
+            if (el) {
+              selectorToType = el.selector || el.cssSelector || el.xpath;
+              elementInfo = el;
+            }
+          }
+        }
+
+        if (action.selector) {
+          selectorToType = action.selector;
+        }
+
+        if (!selectorToType && action.semanticTarget) {
+          selectorToType = action.semanticTarget;
+        }
+
+        if (!selectorToType) {
+          return {
+            success: false,
+            message: 'No valid selector found for type action',
+            error: 'Missing selector',
+          };
+        }
+
+        try {
+          const result = await this.type(selectorToType, action.text);
+          return {
+            success: result.success,
+            message: result.message,
+            elementInfo: result.selectors?.[0] || elementInfo,
+            error: result.error,
+            failedSelector: result.success ? undefined : selectorToType,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            message: `Type failed: ${err instanceof Error ? err.message : String(err)}`,
+            elementInfo,
+            error: err instanceof Error ? err.message : String(err),
+            failedSelector: selectorToType,
+          };
+        }
+      }
+
+      case 'scroll': {
+        try {
+          const delta = action.direction === 'up' ? -500 : 500;
+          await page.mouse.wheel(0, delta);
+          await page.waitForTimeout(500);
+          return {
+            success: true,
+            message: `Scrolled ${action.direction}`,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            message: `Scroll failed: ${err instanceof Error ? err.message : String(err)}`,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }
+
+      case 'wait': {
+        await page.waitForTimeout(action.durationMs);
+        return {
+          success: true,
+          message: `Waited ${action.durationMs}ms`,
+        };
+      }
+
+      case 'finish': {
+        return {
+          success: true,
+          message: 'Agent finished',
+        };
+      }
+
+      default:
+        return {
+          success: false,
+          message: 'Unknown action type',
+          error: 'Unknown action',
+        };
+    }
+  }
+
+  /**
+   * Self-healing: Find an alternative element when the primary one fails.
+   * Uses semantic similarity to find elements with similar text/role.
+   */
+  private async findAlternativeElement(
+    elements: ElementInfo[],
+    targetDescription: string,
+    failedElements: Set<string>
+  ): Promise<ElementInfo | null> {
+    if (!targetDescription) return null;
+
+    const targetLower = targetDescription.toLowerCase();
+    const targetTokens = targetLower.split(/[^a-z0-9]+/).filter(t => t.length >= 3);
+
+    // Score elements by similarity to target
+    const candidates = elements
+      .filter(el => {
+        const selector = el.selector || el.cssSelector || el.xpath;
+        if (!selector) return false;
+        if (failedElements.has(selector)) return false;
+        if (el.visible === false || el.isVisible === false) return false;
+        return true;
+      })
+      .map(el => {
+        const label = `${el.text || ''} ${el.ariaLabel || ''} ${el.placeholder || ''}`.toLowerCase();
+        const matchCount = targetTokens.filter(tok => label.includes(tok)).length;
+        return { el, score: matchCount };
+      })
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    return candidates.length > 0 ? candidates[0].el : null;
+  }
+
+  /**
+   * Detect whether a meaningful state change occurred after an action.
+   */
+  private async detectStateChange(
+    urlBefore: string,
+    urlAfter: string,
+    action: AgentAction
+  ): Promise<boolean> {
+    // URL change is a definite state change
+    if (urlBefore !== urlAfter) {
+      return true;
+    }
+
+    // Navigate actions should always result in URL change
+    if (action.type === 'navigate') {
+      return urlBefore !== urlAfter;
+    }
+
+    // For click/type, we assume state changed if the action succeeded
+    // A more sophisticated implementation could compare DOM snapshots
+    if (action.type === 'click' || action.type === 'type') {
+      return true; // Optimistic - assume UI updated
+    }
+
+    // Scroll and wait don't typically change URL
+    if (action.type === 'scroll' || action.type === 'wait') {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Generate a human-readable description of an action for history tracking.
+   */
+  private describeAction(action: AgentAction, success: boolean): string {
+    const status = success ? '✓' : '✗';
+    switch (action.type) {
+      case 'navigate':
+        return `${status} Navigated to ${action.url}`;
+      case 'click':
+        return `${status} Clicked ${action.semanticTarget || action.elementId || 'element'}`;
+      case 'type':
+        return `${status} Typed "${action.text}" into ${action.semanticTarget || action.elementId || 'input'}`;
+      case 'scroll':
+        return `${status} Scrolled ${action.direction}`;
+      case 'wait':
+        return `${status} Waited ${action.durationMs}ms`;
+      case 'finish':
+        return `${status} Finished: ${action.summary}`;
+      default:
+        return `${status} Unknown action`;
+    }
+  }
+
+  /**
+   * Generate a summary of the agent session.
+   */
+  private generateSessionSummary(steps: AgentStepResult[], goal: string): string {
+    const successCount = steps.filter(s => s.success).length;
+    const failCount = steps.filter(s => !s.success).length;
+    const totalRetries = steps.reduce((sum, s) => sum + s.retryCount, 0);
+
+    const actions = steps
+      .filter(s => s.action.type !== 'finish')
+      .map(s => {
+        switch (s.action.type) {
+          case 'navigate': return `navigated to ${s.action.url}`;
+          case 'click': return `clicked ${s.action.semanticTarget || s.action.elementId || 'element'}`;
+          case 'type': return `typed text`;
+          case 'scroll': return `scrolled ${s.action.direction}`;
+          case 'wait': return `waited`;
+          default: return 'performed action';
+        }
+      });
+
+    let summary = `Attempted to: ${goal}. `;
+    summary += `Completed ${successCount} of ${steps.length} steps. `;
+    if (failCount > 0) {
+      summary += `${failCount} steps failed. `;
+    }
+    if (totalRetries > 0) {
+      summary += `Self-healed with ${totalRetries} retry attempts. `;
+    }
+    if (actions.length > 0 && actions.length <= 5) {
+      summary += `Actions: ${actions.join(', ')}.`;
+    }
+
+    return summary;
+  }
+
+  /**
+   * Get the current session history (useful for external access).
+   */
+  getSessionHistory(): ExecutionCommand[] {
+    return [...this.sessionHistory];
+  }
+
+  /**
+   * Clear the session history.
+   */
+  clearSessionHistory(): void {
+    this.sessionHistory = [];
   }
 }

@@ -91,3 +91,85 @@ export interface SessionState {
   lastScreenshot?: string;
   selectors: Map<string, ElementInfo>;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Autonomous Agent Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Represents a single action the autonomous agent can take.
+ */
+export type AgentAction =
+  | { type: 'navigate'; url: string; thought: string }
+  | { type: 'click'; elementId?: string; selector?: string; semanticTarget?: string; thought: string }
+  | { type: 'type'; elementId?: string; selector?: string; semanticTarget?: string; text: string; thought: string }
+  | { type: 'scroll'; direction: 'up' | 'down'; thought: string }
+  | { type: 'wait'; durationMs: number; thought: string }
+  | { type: 'finish'; thought: string; summary: string };
+
+/**
+ * Result of a single step in the autonomous agent loop.
+ */
+export interface AgentStepResult {
+  stepNumber: number;
+  action: AgentAction;
+  success: boolean;
+  message: string;
+  /** URL before the action was executed */
+  urlBefore: string;
+  /** URL after the action was executed */
+  urlAfter: string;
+  /** Whether a meaningful state change was detected (URL change, DOM change, etc.) */
+  stateChanged: boolean;
+  /** If the action failed, describes the recovery attempt (if any) */
+  recoveryAttempt?: string;
+  /** Screenshot after action (base64 data URL) */
+  screenshot?: string;
+  /** Element info if an element was interacted with */
+  elementInfo?: ElementInfo;
+  /** Error message if the step failed */
+  error?: string;
+  /** Number of retry attempts made for this step */
+  retryCount: number;
+}
+
+/**
+ * Final result of an autonomous agent session.
+ */
+export interface AgentSessionResult {
+  success: boolean;
+  /** High-level summary of what the agent accomplished */
+  summary: string;
+  /** The original goal/prompt */
+  goal: string;
+  /** Total number of steps taken */
+  totalSteps: number;
+  /** Detailed history of each step */
+  steps: AgentStepResult[];
+  /** The execution commands recorded (for Selenium generation) */
+  commands: ExecutionCommand[];
+  /** Generated Selenium code for replaying the session */
+  seleniumCode?: string;
+  /** Final screenshot */
+  screenshot?: string;
+  /** All interactive elements on the final page */
+  selectors?: ElementInfo[];
+  /** Error message if the session failed */
+  error?: string;
+}
+
+/**
+ * Configuration options for the autonomous agent.
+ */
+export interface AgentConfig {
+  /** Maximum number of steps before the agent stops (default: 20) */
+  maxSteps?: number;
+  /** Maximum retries per failed action (default: 3) */
+  maxRetriesPerAction?: number;
+  /** Whether to generate Selenium code at the end (default: true) */
+  generateSelenium?: boolean;
+  /** Callback for real-time step updates */
+  onStepComplete?: (step: AgentStepResult) => void;
+  /** Callback for agent thoughts/reasoning */
+  onThought?: (thought: string, action: AgentAction) => void;
+}

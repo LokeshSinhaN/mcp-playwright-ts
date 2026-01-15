@@ -5,7 +5,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
 import { BrowserManager } from './browserManager';
 import { McpTools } from './mcpTools';
-import { ExecutionResult, WebSocketMessage, ExecutionCommand, ElementInfo } from './types';
+import { ExecutionResult, WebSocketMessage, ExecutionCommand, ElementInfo, AgentSessionResult, AgentConfig } from './types';
 import { parseDropdownInstruction } from './dropdownUtils';
 
 // Minimal conversation turn type if you later add real AI calls.
@@ -48,6 +48,49 @@ function extractUrlFromPrompt(prompt: string): string | null {
   }
 
   return null;
+}
+
+/**
+ * Detect if a prompt contains multiple sequential actions that should trigger
+ * autonomous agent mode instead of single-step execution.
+ */
+function detectMultiStepPrompt(prompt: string): boolean {
+  const lower = prompt.toLowerCase();
+
+  // Strong indicators of multi-step tasks
+  const multiStepPatterns = [
+    // Sequential conjunctions
+    /\b(then|next|after|and then|followed by)\b/,
+    // Multiple action verbs in sequence
+    /(click|type|enter|select|choose|navigate|go to|search|fill).*\b(then|and|next|after)\b.*(click|type|enter|select|choose|navigate|search|fill)/,
+    // Repetitive actions
+    /\b(all|each|every|one by one|for each)\b/,
+    // Explicit counting
+    /\b(first|second|third|1st|2nd|3rd|multiple|several)\b.*\b(then|and|next)/,
+    // Complex workflows
+    /\buntil\b/,
+  ];
+
+  // Check for multiple action keywords (suggests sequence)
+  const actionVerbs = [
+    'click', 'type', 'enter', 'fill', 'select', 'choose',
+    'navigate', 'go to', 'visit', 'open', 'search', 'submit',
+    'scroll', 'wait', 'verify', 'check'
+  ];
+  
+  const actionCount = actionVerbs.filter(verb => {
+    const regex = new RegExp(`\\b${verb}\\b`, 'i');
+    return regex.test(lower);
+  }).length;
+
+  // If prompt has 3+ action verbs or matches multi-step patterns, use agent mode
+  if (actionCount >= 3) return true;
+  
+  for (const pattern of multiStepPatterns) {
+    if (pattern.test(lower)) return true;
+  }
+
+  return false;
 }
 
 // Helper: build a compact DOM context summary for future AI integrations.
@@ -588,13 +631,14 @@ export function createServer(port: number, chromePath?: string) {
   }
 
   app.post('/api/execute', async (req, res) => {
-    const { action, url, selector, text, commands, prompt } = req.body as {
+    const { action, url, selector, text, commands, prompt, agentConfig } = req.body as {
       action: string;
       url?: string;
       selector?: string;
       text?: string;
       commands?: ExecutionCommand[];
       prompt?: string;
+      agentConfig?: Partial<AgentConfig>;
     };
 
     let result: ExecutionResult;
@@ -631,13 +675,160 @@ export function createServer(port: number, chromePath?: string) {
         case 'ai': {
           if (!prompt) throw new Error('prompt required');
 
+          // SMART ROUTING: Detect if this is a multi-step task and route to agent mode
+          const isMultiStep = detectMultiStepPrompt(prompt);
+          
+          if (isMultiStep) {
+            // Auto-route to autonomous agent for complex tasks
+            broadcast({
+              type: 'action',
+              timestamp: new Date().toISOString(),
+              message: `ai_agent (auto-detected multi-step): "${prompt.slice(0, 100)}"`
+            });
+
+            const config: AgentConfig = {
+              maxSteps: agentConfig?.maxSteps ?? 20,
+              maxRetriesPerAction: agentConfig?.maxRetriesPerAction ?? 3,
+              generateSelenium: agentConfig?.generateSelenium ?? true,
+              onStepComplete: (step) => {
+                broadcast({
+                  type: 'log',
+                  timestamp: new Date().toISOString(),
+                  message: `Step ${step.stepNumber}: ${step.message}`,
+                  data: {
+                    stepNumber: step.stepNumber,
+                    action: step.action,
+                    success: step.success,
+                    stateChanged: step.stateChanged,
+                    retryCount: step.retryCount,
+                  }
+                });
+              },
+              onThought: (thought, action) => {
+                broadcast({
+                  type: 'log',
+                  timestamp: new Date().toISOString(),
+                  message: `ai_thought: ${thought.slice(0, 200)}`,
+                  data: {
+                    role: 'agent-reasoning',
+                    thought,
+                    actionType: action.type,
+                  }
+                });
+              }
+            };
+
+            const agentResult: AgentSessionResult = await tools.runAutonomousAgent(prompt, config);
+
+            broadcast({
+              type: agentResult.success ? 'success' : 'error',
+              timestamp: new Date().toISOString(),
+              message: `ai_agent completed: ${agentResult.summary.slice(0, 150)}`,
+              data: {
+                totalSteps: agentResult.totalSteps,
+                success: agentResult.success,
+              }
+            });
+
+            result = {
+              success: agentResult.success,
+              message: agentResult.summary,
+              screenshot: agentResult.screenshot,
+              selectors: agentResult.selectors,
+              seleniumCode: agentResult.seleniumCode,
+              data: {
+                goal: agentResult.goal,
+                totalSteps: agentResult.totalSteps,
+                steps: agentResult.steps,
+                commands: agentResult.commands,
+              }
+            };
+          } else {
+            // Single-step mode for simple tasks
+            broadcast({
+              type: 'action',
+              timestamp: new Date().toISOString(),
+              message: `ai_plan "${prompt.slice(0, 120)}"`
+            });
+
+            result = await handleAiAction(prompt, selector);
+          }
+          break;
+        }
+        case 'ai_agent': {
+          // Autonomous agent mode: takes a high-level goal and executes
+          // a multi-step plan with self-healing capabilities
+          if (!prompt) throw new Error('prompt required for ai_agent');
+
           broadcast({
             type: 'action',
             timestamp: new Date().toISOString(),
-            message: `ai_plan "${prompt.slice(0, 120)}"`
+            message: `ai_agent starting: "${prompt.slice(0, 100)}"`
           });
 
-          result = await handleAiAction(prompt, selector);
+          // Build agent config with real-time broadcasting
+          const config: AgentConfig = {
+            maxSteps: agentConfig?.maxSteps ?? 20,
+            maxRetriesPerAction: agentConfig?.maxRetriesPerAction ?? 3,
+            generateSelenium: agentConfig?.generateSelenium ?? true,
+            onStepComplete: (step) => {
+              // Broadcast each step as it completes
+              broadcast({
+                type: 'log',
+                timestamp: new Date().toISOString(),
+                message: `Step ${step.stepNumber}: ${step.message}`,
+                data: {
+                  stepNumber: step.stepNumber,
+                  action: step.action,
+                  success: step.success,
+                  stateChanged: step.stateChanged,
+                  retryCount: step.retryCount,
+                  recoveryAttempt: step.recoveryAttempt,
+                }
+              });
+            },
+            onThought: (thought, action) => {
+              // Broadcast agent reasoning
+              broadcast({
+                type: 'log',
+                timestamp: new Date().toISOString(),
+                message: `ai_thought: ${thought.slice(0, 200)}`,
+                data: {
+                  role: 'agent-reasoning',
+                  thought,
+                  actionType: action.type,
+                }
+              });
+            }
+          };
+
+          const agentResult: AgentSessionResult = await tools.runAutonomousAgent(prompt, config);
+
+          // Broadcast completion
+          broadcast({
+            type: agentResult.success ? 'success' : 'error',
+            timestamp: new Date().toISOString(),
+            message: `ai_agent completed: ${agentResult.summary.slice(0, 150)}`,
+            data: {
+              totalSteps: agentResult.totalSteps,
+              success: agentResult.success,
+            }
+          });
+
+          // Return the full agent result (includes steps, commands, selenium code)
+          result = {
+            success: agentResult.success,
+            message: agentResult.summary,
+            screenshot: agentResult.screenshot,
+            selectors: agentResult.selectors,
+            seleniumCode: agentResult.seleniumCode,
+            data: {
+              goal: agentResult.goal,
+              totalSteps: agentResult.totalSteps,
+              steps: agentResult.steps,
+              commands: agentResult.commands,
+            }
+          };
           break;
         }
         case 'generate_selenium':
