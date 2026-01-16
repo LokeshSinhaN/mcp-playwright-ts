@@ -124,19 +124,26 @@ export class BrowserManager {
     const page = this.getPage();
 
     try {
-      // Capture a full-page screenshot but bound the timeout so we don't block
-      // actions on sites whose fonts or other assets never finish loading.
-      const buf = await page.screenshot({ fullPage: true, timeout: 5000 });
+      // For live preview, capture the viewport only. It's much faster than
+      // a full-page screenshot, which can time out on complex sites while
+      // waiting for fonts or stitching large images.
+      const buf = await page.screenshot({
+        fullPage: false,
+        timeout: 2500,
+        animations: 'disabled'
+      });
       const base64 = buf.toString('base64');
       const dataUrl = `data:image/png;base64,${base64}`;
       this.state.lastScreenshot = dataUrl;
       return dataUrl;
     } catch (err) {
-      // If screenshot capture times out (e.g., stuck on "waiting for fonts to
-      // load"), fall back to the last successful screenshot instead of failing
-      // the entire action. This keeps the automation flow alive even when the
-      // visual snapshot is slightly stale.
-      console.warn('BrowserManager.screenshot failed, using lastScreenshot if available:', err);
+      // If screenshot capture times out, fall back to the last successful
+      // screenshot instead of failing. This keeps the automation flow alive
+      // even when the visual snapshot is slightly stale.
+      console.warn(
+        'BrowserManager.screenshot failed, using lastScreenshot if available:',
+        err
+      );
       if (this.state.lastScreenshot) {
         return this.state.lastScreenshot;
       }

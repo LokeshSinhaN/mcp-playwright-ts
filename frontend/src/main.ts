@@ -41,8 +41,16 @@ function appendLog(p: WsPayload | { type: string; message: string; timestamp?: s
 }
 
 wsClient.on((p) => {
-  if (p.type === 'log') setWsStatus('connected', 'Connected');
-  if (p.type === 'error') setWsStatus('error', 'Error');
+  if (p.type === 'log') {
+    setWsStatus('connected', 'Connected');
+  } else if (p.type === 'error') {
+    setWsStatus('error', 'Error');
+  } else if (p.type === 'screenshot' && p.data && (p.data as any).screenshot) {
+    screenshotImg.src = (p.data as any).screenshot;
+    screenshotImg.hidden = false;
+    placeholder.hidden = true;
+    return; // Don't log screenshot messages
+  }
   appendLog(p);
 });
 

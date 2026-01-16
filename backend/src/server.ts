@@ -805,20 +805,11 @@ export function createServer(port: number, chromePath?: string) {
           // --- START SCREENSHOT STREAM ---
           // Wrap the agent execution in a try/finally to ensure the stream is
           // always stopped, even if the agent fails.
-          browser.startScreenshotStream((payload: string) => {
-            // We can't use the main `broadcast` function directly because it
-            // stringifies the payload, and our streamer already does that.
-            for (const ws of clients) {
-              if (ws.readyState === WebSocket.OPEN) ws.send(payload);
-            }
-          });
-
           let agentResult: AgentSessionResult;
           try {
             agentResult = await tools.runAutonomousAgent(prompt, config);
           } finally {
             // --- STOP SCREENSHOT STREAM ---
-            browser.stopScreenshotStream();
           }
 
           // Broadcast completion
@@ -896,8 +887,19 @@ export function createServer(port: number, chromePath?: string) {
       } satisfies WebSocketMessage)
     );
 
+    if (clients.size === 1) {
+      browser.startScreenshotStream((payload: string) => {
+        for (const ws of clients) {
+          if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+        }
+      });
+    }
+
     ws.on('close', () => {
       clients.delete(ws);
+      if (clients.size === 0) {
+        browser.stopScreenshotStream();
+      }
     });
   });
 
