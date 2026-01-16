@@ -1,4 +1,88 @@
-import { Page, Locator } from 'playwright';
+import { Page, Locator, ElementHandle } from 'playwright';
+
+/**
+ * Result returned by dropdown selection functions containing the real selector
+ * of the option that was clicked (when available).
+ */
+export interface DropdownSelectionResult {
+  /** The CSS selector of the option element that was clicked (if captured) */
+  optionSelector?: string;
+  /** The XPath of the option element that was clicked (if captured) */
+  optionXpath?: string;
+  /** How the selection was performed: 'click', 'keyboard', 'native-select' */
+  method: 'click' | 'keyboard' | 'native-select';
+}
+
+/**
+ * Generate a robust CSS selector for an element handle.
+ * Mirrors the logic in SelectorExtractor but standalone for use in dropdownUtils.
+ */
+async function generateCssForHandle(handle: ElementHandle): Promise<string> {
+  return handle.evaluate((el: any) => {
+    const doc = el.ownerDocument || (typeof document !== 'undefined' ? document : null);
+    const tag = (el.tagName || '').toLowerCase();
+    
+    const escapeCss = (str: string) => {
+      if (typeof (globalThis as any).CSS !== 'undefined' && (globalThis as any).CSS.escape) {
+        return (globalThis as any).CSS.escape(str);
+      }
+      return str.replace(/([:.[\]#])/g, '\\$1');
+    };
+
+    const getAttr = (name: string): string | null =>
+      typeof el.getAttribute === 'function' ? el.getAttribute(name) : null;
+    const escapeAttr = (value: string) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+    // 1) Prefer stable single-attribute selectors
+    if (el.id) {
+      return `#${escapeCss(String(el.id))}`;
+    }
+
+    const dataTestId = getAttr('data-testid');
+    if (dataTestId) {
+      return `[data-testid="${escapeCss(dataTestId)}"]`;
+    }
+
+    const ariaLabel = getAttr('aria-label');
+    if (ariaLabel) {
+      const role = getAttr('role');
+      if (role) {
+        return `[role="${escapeAttr(role)}"][aria-label="${escapeAttr(ariaLabel)}"]`;
+      }
+      return `${tag}[aria-label="${escapeAttr(ariaLabel)}"]`;
+    }
+
+    // 2) Fallback: structural selector chain
+    const parts: string[] = [];
+    let curr: any = el;
+
+    while (curr && curr !== (doc ? doc.body : null)) {
+      let part = (curr.tagName || '').toLowerCase();
+      if (!part) break;
+
+      if (curr.id) {
+        parts.unshift(`#${escapeCss(String(curr.id))}`);
+        break;
+      }
+
+      const parent = curr.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(
+          (c: any) => (c.tagName || '').toLowerCase() === part
+        );
+        if (siblings.length > 1) {
+          const idx = siblings.indexOf(curr) + 1;
+          part += `:nth-child(${idx})`;
+        }
+      }
+
+      parts.unshift(part);
+      curr = parent;
+    }
+
+    return parts.join(' > ');
+  });
+}
 
 /**
  * Resolve a dropdown trigger either by treating the input as a selector or,
@@ -51,8 +135,11 @@ async function resolveTrigger(page: Page, trigger: string): Promise<Locator> {
  * Core option-selection logic shared by selectFromDropdown() and
  * selectOptionInOpenDropdown(). It assumes that any required dropdown/combobox
  * has already been opened if necessary.
+ * 
+ * Returns information about the option that was selected, including the real
+ * CSS selector when a click-based selection was used.
  */
-async function selectOptionByStrategies(page: Page, optionText: string): Promise<void> {
+async function selectOptionByStrategies(page: Page, optionText: string): Promise<DropdownSelectionResult> {
   // Normalise option text for regex/text locators.
   const optionEscaped = optionText.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
   const optionRe = new RegExp(optionEscaped, 'i');
@@ -72,7 +159,7 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
     await page.keyboard.type(optionText, { delay: 100 });
     await page.waitForTimeout(300);
     await page.keyboard.press('Enter');
-    return;
+    return { method: 'keyboard' };
   }
 
   // Strategy A: semantic roles commonly used for menu options. Prefer direct
@@ -88,8 +175,18 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
     const first = loc.first();
     try {
       if (await first.count()) {
+        // Capture the real selector BEFORE clicking
+        const handle = await first.elementHandle();
+        let optionSelector: string | undefined;
+        if (handle) {
+          try {
+            optionSelector = await generateCssForHandle(handle);
+          } catch {
+            // If selector generation fails, we still click but won't have the selector
+          }
+        }
         await first.click({ timeout: 1500 });
-        return;
+        return { method: 'click', optionSelector };
       }
     } catch {
       // try the next strategy
@@ -117,8 +214,18 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
       const option = container.locator('*').filter({ hasText: optionRe }).first();
       if (await option.count()) {
         try {
+          // Capture the real selector BEFORE clicking
+          const handle = await option.elementHandle();
+          let optionSelector: string | undefined;
+          if (handle) {
+            try {
+              optionSelector = await generateCssForHandle(handle);
+            } catch {
+              // If selector generation fails, we still click but won't have the selector
+            }
+          }
           await option.click({ timeout: 1500 });
-          return;
+          return { method: 'click', optionSelector };
         } catch {
           // if this specific option fails, continue to keyboard fallback
           break;
@@ -136,6 +243,7 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
   // brittle, site-specific selectors.
   await page.keyboard.type(optionText, { delay: 50 });
   await page.keyboard.press('Enter');
+  return { method: 'keyboard' };
 }
 
 /**
@@ -154,7 +262,7 @@ export async function selectFromDropdown(
   page: Page,
   trigger: string,
   optionText: string,
-): Promise<void> {
+): Promise<DropdownSelectionResult> {
   const triggerLocator = await resolveTrigger(page, trigger);
 
   // 1. Ensure the trigger is visible and clickable.
@@ -178,7 +286,9 @@ export async function selectFromDropdown(
         // strongly preferring precise matches.
         try {
           await triggerLocator.selectOption({ label: optionText });
-          return;
+          // For native <select>, we use the option[value] or option text as selector
+          const optionSelector = `${trigger} option:checked`;
+          return { method: 'native-select', optionSelector };
         } catch {
           const escaped = optionText
             .trim()
@@ -187,8 +297,15 @@ export async function selectFromDropdown(
           const re = new RegExp(escaped, 'i');
           const fallbackOption = triggerLocator.locator('option').filter({ hasText: re }).first();
           if (await fallbackOption.count()) {
+            const optHandle = await fallbackOption.elementHandle();
+            let optionSelector: string | undefined;
+            if (optHandle) {
+              try {
+                optionSelector = await generateCssForHandle(optHandle);
+              } catch { /* ignore */ }
+            }
             await fallbackOption.click({ timeout: 1500 });
-            return;
+            return { method: 'native-select', optionSelector };
           }
         }
       }
@@ -200,7 +317,7 @@ export async function selectFromDropdown(
         const firstSelect = innerSelect.first();
         try {
           await firstSelect.selectOption({ label: optionText });
-          return;
+          return { method: 'native-select', optionSelector: `${trigger} select option:checked` };
         } catch {
           const escaped = optionText
             .trim()
@@ -209,8 +326,15 @@ export async function selectFromDropdown(
           const re = new RegExp(escaped, 'i');
           const fallbackOption = firstSelect.locator('option').filter({ hasText: re }).first();
           if (await fallbackOption.count()) {
+            const optHandle = await fallbackOption.elementHandle();
+            let optionSelector: string | undefined;
+            if (optHandle) {
+              try {
+                optionSelector = await generateCssForHandle(optHandle);
+              } catch { /* ignore */ }
+            }
             await fallbackOption.click({ timeout: 1500 });
-            return;
+            return { method: 'native-select', optionSelector };
           }
         }
       }
@@ -232,11 +356,12 @@ export async function selectFromDropdown(
     // Some wrappers are not focusable; this is best-effort.
   }
 
-  await selectOptionByStrategies(page, optionText);
+  const result = await selectOptionByStrategies(page, optionText);
 
   // We intentionally do not attempt to assert success here, because many UIs do
   // not update visible text in a consistent way. Callers who need verification
   // should assert on the resulting DOM state separately.
+  return result;
 }
 
 /**
@@ -249,8 +374,8 @@ export async function selectFromDropdown(
 export async function selectOptionInOpenDropdown(
   page: Page,
   optionText: string,
-): Promise<void> {
-  await selectOptionByStrategies(page, optionText);
+): Promise<DropdownSelectionResult> {
+  return selectOptionByStrategies(page, optionText);
 }
 
 /**

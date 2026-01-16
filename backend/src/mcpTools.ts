@@ -11,7 +11,7 @@ import {
   AgentSessionResult,
   AgentConfig,
 } from './types';
-import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent } from './dropdownUtils';
+import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent, DropdownSelectionResult } from './dropdownUtils';
 
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
@@ -60,10 +60,10 @@ export class McpTools {
         let message: string;
 
         if (dropdownIntent.kind === 'open-and-select') {
-          await selectFromDropdown(page, dropdownIntent.dropdownLabel, dropdownIntent.optionLabel);
+          const selectionResult = await selectFromDropdown(page, dropdownIntent.dropdownLabel, dropdownIntent.optionLabel);
 
           // Record this as two high-level steps for downstream Selenium
-          // generation: open dropdown (click) + select via keyboard.
+          // generation: open dropdown (click) + select option (click with REAL selector).
           this.sessionHistory.push(
             {
               action: 'click',
@@ -71,9 +71,10 @@ export class McpTools {
               description: `Open dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
             {
-              action: 'type',
-              target: dropdownIntent.dropdownLabel,
-              value: dropdownIntent.optionLabel,
+              action: 'click',
+              // Use the REAL selector captured during the click, or fall back to
+              // a semantic description if keyboard selection was used.
+              target: selectionResult.optionSelector || dropdownIntent.optionLabel,
               description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
           );
@@ -81,12 +82,12 @@ export class McpTools {
           message = `Selected option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`;
         } else {
           // Dropdown already open; just select the option.
-          await selectOptionInOpenDropdown(page, dropdownIntent.optionLabel);
+          const selectionResult = await selectOptionInOpenDropdown(page, dropdownIntent.optionLabel);
 
           this.sessionHistory.push({
-            action: 'type',
-            target: 'dropdown-option',
-            value: dropdownIntent.optionLabel,
+            action: 'click',
+            // Use the REAL selector if we have it, otherwise fall back to semantic target
+            target: selectionResult.optionSelector || dropdownIntent.optionLabel,
             description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`, 
           });
 
@@ -1164,18 +1165,19 @@ export class McpTools {
           } catch(e: any) { return { success: false, message: e.message, error: e.message, failedSelector: targetClick }; }
       }
 
-      // FIX: Robust Dropdown Handling
+      // Robust Dropdown Handling: Use REAL selectors from the dropdown utility
       case 'select_option': {
         const trigger = resolveSelector(action.elementId, action.selector, action.semanticTarget);
         if (!trigger) {
           return { success: false, message: 'No dropdown trigger found', error: 'Missing trigger' };
         }
         try {
-          // 1. Browser Action
-          await selectFromDropdown(page, trigger, action.option);
+          // 1. Browser Action - now returns the REAL selector of the clicked option
+          const selectionResult = await selectFromDropdown(page, trigger, action.option);
           
-          // 2. Record 2-step history for Selenium (Trigger Click + Option Click)
-          // We use the "xpath=" prefix so SeleniumGenerator knows to use By.XPATH
+          // 2. Record 2-step history for Selenium with REAL selectors
+          // The trigger is already a real selector from the element pool.
+          // For the option, use the captured CSS selector if available.
           this.sessionHistory.push(
             { 
               action: 'click', 
@@ -1184,12 +1186,14 @@ export class McpTools {
             },
             { 
               action: 'click', 
-              target: `xpath=//*[contains(text(), '${action.option}')]`, 
+              // Use the REAL selector captured during the click operation.
+              // If keyboard selection was used (no click), fall back to semantic text.
+              target: selectionResult.optionSelector || action.option,
               description: `Select "${action.option}"` 
             }
           );
           
-          return { success: true, message: `Selected "${action.option}" from dropdown` };
+          return { success: true, message: `Selected "${action.option}" from dropdown (method: ${selectionResult.method})` };
         } catch (err) {
           return { success: false, message: `Dropdown select failed: ${err}`, error: String(err), failedSelector: trigger };
         }
