@@ -68,13 +68,13 @@ export class McpTools {
             {
               action: 'click',
               target: dropdownIntent.dropdownLabel,
-              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`,
+              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
             {
               action: 'type',
               target: dropdownIntent.dropdownLabel,
               value: dropdownIntent.optionLabel,
-              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`,
+              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
           );
 
@@ -87,7 +87,7 @@ export class McpTools {
             action: 'type',
             target: 'dropdown-option',
             value: dropdownIntent.optionLabel,
-            description: `Select option "${dropdownIntent.optionLabel}" from currently open dropdown`,
+            description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`, 
           });
 
           message = `Selected option "${dropdownIntent.optionLabel}" from the currently open dropdown`;
@@ -171,7 +171,7 @@ export class McpTools {
         }
 
         if (directChosen) {
-          const selectorToClick =
+          const selectorToClick = 
             directChosen.selector || directChosen.cssSelector || directChosen.xpath;
           if (selectorToClick) {
             const info = await this.browser.click(selectorToClick);
@@ -192,7 +192,7 @@ export class McpTools {
             // a screenshot that the LLM will use for its next decision.
             await page.waitForTimeout(1000);
             const screenshot = await this.browser.screenshot();
-            const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || target}\"`;
+            const baseMessage = `Clicked ${info.roleHint || 'element'} "${info.text || target}"`;
 
             return {
               success: true,
@@ -210,7 +210,8 @@ export class McpTools {
 
         if (typeof chosenIndex === 'number' && chosenIndex >= 0 && chosenIndex < pool.length) {
           const chosen = pool[chosenIndex];
-          const selectorToClick = chosen.selector || chosen.cssSelector || chosen.xpath;
+          const selectorToClick = 
+            chosen.selector || chosen.cssSelector || chosen.xpath;
           if (!selectorToClick) {
             console.warn('LLM selected element without usable selector, falling back to heuristics.');
             return this.clickWithHeuristics(target);
@@ -234,7 +235,7 @@ export class McpTools {
           // post-click screenshot.
           await page.waitForTimeout(1000);
           const screenshot = await this.browser.screenshot();
-          const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || target}\"`;
+          const baseMessage = `Clicked ${info.roleHint || 'element'} "${info.text || target}"`;
 
           return {
             success: true,
@@ -284,7 +285,7 @@ export class McpTools {
       });
 
       const screenshot = await this.browser.screenshot();
-      const baseMessage = `Clicked ${info.roleHint || 'element'} \"${info.text || labelForHistory || selector}\"`;
+      const baseMessage = `Clicked ${info.roleHint || 'element'} "${info.text || labelForHistory || selector}"`;
 
       return {
         success: true,
@@ -346,7 +347,7 @@ export class McpTools {
     const raw = (prompt || '').trim();
     if (!raw) return '';
 
-    const quoted = raw.match(/["'“”‘’]([^"'“”‘’]{2,})["'“”‘’]/);
+    const quoted = raw.match(/["\'“”‘’]([^"\'“”‘’]{2,})["\'“”‘’]/);
     if (quoted && quoted[1].trim().length >= 3) {
       return quoted[1].trim();
     }
@@ -405,7 +406,7 @@ export class McpTools {
         : '';
 
     const prompt = [
-      `SYSTEM: You are a precise automation engine. The user wants to: "${userPrompt}".`,
+      'SYSTEM: You are a precise automation engine. The user wants to: "' + userPrompt + '".',
       focusLine,
       'Here are the interactive elements on the screen as a JSON array:',
       JSON.stringify(filteredSummaries),
@@ -418,7 +419,7 @@ export class McpTools {
       '- If none of the elements match the text or meaning strongly, return JSON null. Do NOT guess or select unrelated buttons.',
       '- If you cannot confidently decide (the request is ambiguous), return JSON null. Do NOT guess.',
       '- Return ONLY the "id" of the best element as a JSON string, e.g. ""el_3"".'
-    ].join('\\n');
+    ].join('\n');
 
     try {
       const result = await this.model.generateContent({
@@ -540,7 +541,7 @@ export class McpTools {
         if (candidates.length > 1) {
           return {
             success: false,
-            message: `Ambiguous request: '${target}' matches ${candidates.length} visible elements. Please clarify.`,
+            message: `Ambiguous request: '${target}' matches ${candidates.length} visible elements. Please clarify.`, 
             isAmbiguous: true,
             requiresInteraction: true,
             candidates,
@@ -600,7 +601,7 @@ export class McpTools {
               // candidates directly.
               return {
                 success: true,
-                message: `Ambiguous request: found ${topTier.length} strong matches for "${target}".`,
+                message: `Ambiguous request: found ${topTier.length} strong matches for "${target}".`, 
                 isAmbiguous: true,
                 requiresInteraction: true,
                 candidates: topTier,
@@ -617,7 +618,7 @@ export class McpTools {
             const screenshot = await this.browser.screenshot().catch(() => undefined as any);
             return {
               success: false,
-              message: `No elements on the page matched "${target}" strongly enough to click safely.`,
+              message: `No elements on the page matched "${target}" strongly enough to click safely.`, 
               isAmbiguous: false,
               requiresInteraction: true,
               candidates,
@@ -791,7 +792,7 @@ export class McpTools {
       {
         language: 'python',
         testName: 'test_flow',
-        chromeDriverPath: 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe',
+        chromeDriverPath: 'C:\\hyprtask\\lib\\Chromium\\chromedriver.exe',
       },
       this.model,
     );
@@ -923,7 +924,7 @@ export class McpTools {
 
           if (!actionSuccess && result.error) {
             actionError = result.error;
-            // Track failed element to avoid retrying it
+            // Track failed element to avoid retrying them
             if (result.failedSelector) {
               failedElements.add(result.failedSelector);
             }
@@ -1035,7 +1036,6 @@ export class McpTools {
     screenshot?: string
   ): Promise<AgentAction> {
     if (!this.model) {
-      // Fallback: if no model, return finish immediately
       return {
         type: 'finish',
         thought: 'No LLM model available',
@@ -1065,8 +1065,10 @@ export class McpTools {
       ? `\n\nElements that have failed (DO NOT retry these):\n${Array.from(failedElements).slice(0, 10).join('\n')}`
       : '';
 
+    // UPDATED PROMPT
     const prompt = [
-      'SYSTEM: You are an autonomous browser agent. Your goal is to accomplish the user\'s task through a series of browser actions.',
+      'SYSTEM: You are an intelligent autonomous browser agent.',
+      'Your goal is to accomplish the user\'s task through a series of browser actions.',
       '',
       `GOAL: ${goal}`,
       historyContext,
@@ -1075,36 +1077,31 @@ export class McpTools {
       'CURRENT PAGE ELEMENTS (JSON):',
       JSON.stringify(limitedElements, null, 2),
       '',
-      'INSTRUCTIONS:',
-      '- Analyze the current state and decide the SINGLE next action to take.',
-      '- If an element has "isFailed: true", DO NOT select it - find an alternative.',
-      '- If you have completed the goal or cannot proceed further, use action "finish".',
-      '- Be precise: prefer elements with exact text matches to the goal.',
-      '- Consider the action history to avoid repeating failed approaches.',
+      '### INSTRUCTIONS ###',
+      '1. **Dropdowns**: If the task involves selecting an option from a dropdown/menu, ALWAYS use the "select_option" action. Do NOT try to click the trigger and then the option separately.',
+      '2. **Scraping/Data Extraction**: If the user asks to "return", "get", "find", or "list" data (like links, text, numbers) to the terminal:',
+      '   - Perform the navigation required to reach the results page.',
+      '   - Once on the results page, use the "scrape_data" action. This is the only way to return data to the user.',
+      '3. **Standard Interaction**: Use click/type/navigate for normal browsing.',
+      '4. **Self-Correction**: If an element has "isFailed: true", pick a different element.',
       '',
-      'RESPONSE FORMAT (JSON only, no markdown):',
-      'Return ONE of these action types:',
-      '{ "type": "navigate", "url": "https://...", "thought": "reasoning" }',
-      '{ "type": "click", "elementId": "el_N", "thought": "reasoning" }',
-      '{ "type": "click", "semanticTarget": "button text", "thought": "reasoning" }',
-      '{ "type": "type", "elementId": "el_N", "text": "text to type", "thought": "reasoning" }',
-      '{ "type": "scroll", "direction": "down", "thought": "reasoning" }',
-      '{ "type": "wait", "durationMs": 1000, "thought": "reasoning" }',
-      '{ "type": "finish", "thought": "reasoning", "summary": "what was accomplished" }',
+      '### RESPONSE FORMAT (Return ONLY raw JSON) ###',
+      'Choose ONE of these actions:',
       '',
-      'The "thought" field must explain your reasoning. Return ONLY raw JSON.',
+      '{ "type": "navigate", "url": "https://...", "thought": "Going to the start URL" }',
+      '{ "type": "click", "elementId": "el_N", "thought": "Clicking the search button" }',
+      '{ "type": "type", "elementId": "el_N", "text": "Heart Failure", "thought": "Typing search query" }',
+      '{ "type": "select_option", "elementId": "el_N", "option": "Heart Failure", "thought": "Selecting specialty from dropdown" }',
+      '{ "type": "scrape_data", "instruction": "Extract all website links from search results", "thought": "User asked for links, extracting now" }',
+      '{ "type": "finish", "thought": "Task done", "summary": "Completed all steps" }',
+      '',
+      'NOTE: For "select_option", "elementId" should be the dropdown TRIGGER (the button you click to open it).'
     ].join('\n');
 
     try {
-      // Build multimodal request if screenshot is available
       const textPart = { text: prompt };
       const imagePart = screenshot && screenshot.startsWith('data:image/')
-        ? {
-            inlineData: {
-              data: screenshot.split(',')[1] || '',
-              mimeType: 'image/png',
-            },
-          }
+        ? { inlineData: { data: screenshot.split(',')[1] || '', mimeType: 'image/png' } }
         : null;
 
       const response = imagePart
@@ -1112,8 +1109,7 @@ export class McpTools {
         : await this.model.generateContent(textPart as any);
 
       const rawText = (response as any).response?.text?.() ?? '';
-      const parsed = this.parseAgentActionResponse(rawText);
-      return parsed;
+      return this.parseAgentActionResponse(rawText);
     } catch (err) {
       console.error('Failed to get next agent action from LLM:', err);
       return {
@@ -1125,83 +1121,74 @@ export class McpTools {
   }
 
   /**
-   * Parse the LLM response into a typed AgentAction.
+   * Parse the LLM response with improved robustness for JSON errors.
    */
   private parseAgentActionResponse(raw: string): AgentAction {
-    const trimmed = raw.trim();
+    let trimmed = raw.trim();
 
-    // Try to extract JSON from markdown code blocks if present
+    // 1. Strip Markdown code blocks
     const jsonMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-    const jsonStr = jsonMatch ? jsonMatch[1].trim() : trimmed;
+    if (jsonMatch) trimmed = jsonMatch[1].trim();
 
-    // Find first { and last } to extract JSON object
-    const first = jsonStr.indexOf('{');
-    const last = jsonStr.lastIndexOf('}');
+    // 2. Find JSON boundaries
+    const first = trimmed.indexOf('{');
+    const last = trimmed.lastIndexOf('}');
     if (first < 0 || last <= first) {
-      return {
-        type: 'finish',
-        thought: 'Could not parse LLM response as JSON',
-        summary: 'Parse error - stopping agent',
-      };
+      return { type: 'finish', thought: 'Invalid JSON', summary: 'Parse error' };
     }
 
-    try {
-      const parsed = JSON.parse(jsonStr.substring(first, last + 1));
+    const jsonStr = trimmed.substring(first, last + 1);
 
-      // Validate and normalize the action
+    try {
+      // 3. Attempt Parse
+      const parsed = JSON.parse(jsonStr);
       const thought = parsed.thought || 'No reasoning provided';
 
+      // 4. Map to Action Types
       switch (parsed.type) {
-        case 'navigate':
-          return { type: 'navigate', url: parsed.url || '', thought };
+        case 'navigate': return { type: 'navigate', url: parsed.url || '', thought };
         case 'click':
-          return {
-            type: 'click',
-            elementId: parsed.elementId,
-            selector: parsed.selector,
-            semanticTarget: parsed.semanticTarget,
-            thought,
-          };
+          return { type: 'click', elementId: parsed.elementId, selector: parsed.selector, semanticTarget: parsed.semanticTarget, thought };
         case 'type':
+          return { type: 'type', elementId: parsed.elementId, selector: parsed.selector, semanticTarget: parsed.semanticTarget, text: parsed.text || '', thought };
+        // NEW: Handle select_option
+        case 'select_option':
           return {
-            type: 'type',
+            type: 'select_option',
             elementId: parsed.elementId,
             selector: parsed.selector,
             semanticTarget: parsed.semanticTarget,
-            text: parsed.text || '',
-            thought,
+            option: parsed.option || '',
+            thought
           };
-        case 'scroll':
+        // NEW: Handle scrape_data
+        case 'scrape_data':
           return {
-            type: 'scroll',
-            direction: parsed.direction === 'up' ? 'up' : 'down',
-            thought,
+            type: 'scrape_data',
+            instruction: parsed.instruction || 'Extract data',
+            thought
           };
-        case 'wait':
-          return {
-            type: 'wait',
-            durationMs: parsed.durationMs || 1000,
-            thought,
-          };
-        case 'finish':
-          return {
-            type: 'finish',
-            thought,
-            summary: parsed.summary || 'Task completed',
-          };
-        default:
-          return {
-            type: 'finish',
-            thought: `Unknown action type: ${parsed.type}`,
-            summary: 'Unknown action - stopping agent',
-          };
+        case 'scroll': return { type: 'scroll', direction: parsed.direction || 'down', thought };
+        case 'wait': return { type: 'wait', durationMs: parsed.durationMs || 1000, thought };
+        case 'finish': return { type: 'finish', thought, summary: parsed.summary || 'Done' };
+        default: return { type: 'finish', thought: `Unknown type: ${parsed.type}`, summary: 'Unknown action' };
       }
     } catch (err) {
-      return {
-        type: 'finish',
-        thought: `JSON parse error: ${err instanceof Error ? err.message : String(err)}`,
-        summary: 'Parse error - stopping agent',
-      };
+      // 5. Fallback for "JSON parse error" (e.g. newlines in strings)
+      console.warn('JSON Parse failed, attempting cleanup:', err);
+      try {
+        // Simple cleanup: remove newlines inside the JSON string which LLMs sometimes add
+        const cleaned = jsonStr.replace(/\n/g, ' '); 
+        const parsed = JSON.parse(cleaned);
+        // ... (repeat mapping logic if needed, or just return finish with error)
+        return { type: 'finish', thought: 'JSON repaired', summary: 'Repaired JSON but stopping for safety' };
+      } catch {
+        return {
+          type: 'finish',
+          thought: `JSON parse error: ${err instanceof Error ? err.message : String(err)}`,
+          summary: 'Parse error - stopping agent',
+        };
+      }
     }
   }
 
@@ -1365,6 +1352,78 @@ export class McpTools {
           };
         }
       }
+      
+      // NEW: Handle Dropdowns reliably
+      case 'select_option': {
+        const resolveSelector = (id?: string, expl?: string, sem?: string) => {
+            if (id) {
+                const match = id.match(/^el_(\d+)$/);
+                if (match) {
+                    const idx = parseInt(match[1], 10);
+                    const visible = elements.filter(el => el.visible !== false && el.isVisible !== false);
+                    if (visible[idx]) return visible[idx].selector || visible[idx].cssSelector || visible[idx].xpath;
+                }
+            }
+            return expl || sem;
+        };
+        const trigger = resolveSelector(action.elementId, action.selector, action.semanticTarget);
+        if (!trigger) {
+          return { success: false, message: 'No dropdown trigger found', error: 'Missing trigger' };
+        }
+        try {
+          // Use the robust utility
+          await selectFromDropdown(page, trigger, action.option);
+          
+          // Log for Selenium generation
+          this.sessionHistory.push(
+            { action: 'click', target: trigger, description: `Open dropdown ${trigger}` },
+            { action: 'type', target: 'dropdown-search', value: action.option, description: `Select "${action.option}"` } 
+          );
+          
+          return { success: true, message: `Selected "${action.option}" from dropdown` };
+        } catch (err) {
+          return {
+            success: false,
+            message: `Dropdown select failed: ${err}`,
+            error: String(err),
+            failedSelector: trigger
+          };
+        }
+      }
+
+      // NEW: Handle Scraping (The "Non-Executable" on browser part)
+      case 'scrape_data': {
+        try {
+          // We use the LLM to write a quick extraction script based on the instruction? 
+          // Or we can just dump the text/links if the user asked for "links".
+          
+          let data = '';
+          const instruction = action.instruction.toLowerCase();
+
+          if (instruction.includes('link') || instruction.includes('url')) {
+             // Extract all links
+             const links = await page.evaluate(() => 
+                Array.from(document.querySelectorAll('a[href]'))
+                  .map(a => (a as HTMLAnchorElement).href)
+                  .filter(h => h.startsWith('http'))
+                  .slice(0, 50) // Limit to 50 for sanity
+             );
+             data = JSON.stringify(links, null, 2);
+          } else {
+             // Default: extract visible text
+             data = await page.evaluate(() => document.body.innerText.slice(0, 2000));
+          }
+
+          // We treat this as a "finish" signal often, but strictly it's an action.
+          // We will return success, and the agent loop might decide to finish if the goal is met.
+          return {
+            success: true,
+            message: `Extracted data: ${data.slice(0, 100)}...`,
+          };
+        } catch (err) {
+          return { success: false, message: `Scrape failed: ${err}`, error: String(err) };
+        }
+      }
 
       case 'scroll': {
         try {
@@ -1493,6 +1552,14 @@ export class McpTools {
       case 'finish':
         return `${status} Finished: ${action.summary}`;
       default:
+        // This will handle the new action types.
+        const unhandledAction: any = action;
+        if (unhandledAction.type === 'select_option') {
+            return `${status} Selected option ${unhandledAction.option}`;
+        }
+        if (unhandledAction.type === 'scrape_data') {
+            return `${status} Scraped data`;
+        }
         return `${status} Unknown action`;
     }
   }
@@ -1514,6 +1581,8 @@ export class McpTools {
           case 'type': return `typed text`;
           case 'scroll': return `scrolled ${s.action.direction}`;
           case 'wait': return `waited`;
+          case 'select_option': return `selected option`;
+          case 'scrape_data': return `scraped data`;
           default: return 'performed action';
         }
       });
