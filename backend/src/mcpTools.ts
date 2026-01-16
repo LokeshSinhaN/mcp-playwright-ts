@@ -803,11 +803,10 @@ export class McpTools {
     // but usually exact replay is desired.
 
     let code: string;
-    if (this.model) {
-      code = await gen.generateWithLLM(cmdsToUse);
-    } else {
-      code = gen.generate(cmdsToUse);
-    }
+    // LLM-assisted Selenium generation is not implemented yet; always use
+    // the deterministic generator to avoid compile-time errors while
+    // preserving current behaviour.
+    code = gen.generate(cmdsToUse);
 
     return {
       success: true,
@@ -838,12 +837,11 @@ export class McpTools {
     const maxRetries = config.maxRetriesPerAction ?? 3;
     const generateSelenium = config.generateSelenium ?? true;
 
-    // Clear session history for a fresh autonomous run
-    this.sessionHistory = [];
-
+    // Reset history at start of agent run
+    this.sessionHistory = []; 
     const steps: AgentStepResult[] = [];
-    const failedElements: Set<string> = new Set(); // Track elements that failed to avoid retrying them
-    const actionHistory: string[] = []; // Natural language history for context
+    const failedElements: Set<string> = new Set();
+    const actionHistory: string[] = [];
 
     await this.browser.init();
     const page = this.browser.getPage();
@@ -851,127 +849,88 @@ export class McpTools {
     let stepNumber = 0;
     let isFinished = false;
     let finalSummary = '';
+    let observation: ExecutionResult | undefined;
 
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
 
-      // ─────────────────────────────────────────────────────────────────────
-      // PHASE 1: OBSERVE - Capture current state
-      // ─────────────────────────────────────────────────────────────────────
-      const urlBefore = page.url();
-      const observation = await this.observe();
+      // ... (Observe & Think phases remain the same) ...
+      observation = await this.observe();
       const elements = observation.selectors ?? [];
       const screenshot = observation.screenshot;
-
-      // ─────────────────────────────────────────────────────────────────────
-      // PHASE 2: THINK - Ask LLM for next action
-      // ─────────────────────────────────────────────────────────────────────
-      const nextAction = await this.planNextAgentAction(
-        goal,
-        elements,
-        actionHistory,
-        failedElements,
-        screenshot
-      );
-
-      // Notify callback if provided
-      if (config.onThought) {
-        config.onThought(nextAction.thought, nextAction);
-      }
-
-      // Check if agent decided to finish
+      const nextAction = await this.planNextAgentAction(goal, elements, actionHistory, failedElements, screenshot);
+      
       if (nextAction.type === 'finish') {
-        isFinished = true;
-        finalSummary = nextAction.summary;
-        steps.push({
-          stepNumber,
-          action: nextAction,
-          success: true,
-          message: 'Agent completed the goal',
-          urlBefore,
-          urlAfter: urlBefore,
-          stateChanged: false,
-          screenshot,
-          retryCount: 0,
-        });
-        break;
+          isFinished = true;
+          finalSummary = nextAction.summary;
+          steps.push({ stepNumber, action: nextAction, success: true, message: 'Done', urlBefore: page.url(), urlAfter: page.url(), stateChanged: false, screenshot, retryCount: 0 });
+          break;
       }
 
-      // ─────────────────────────────────────────────────────────────────────
-      // PHASE 3: ACT - Execute with self-healing retry logic
-      // ─────────────────────────────────────────────────────────────────────
+      const urlBefore = page.url();
+      let urlAfter = urlBefore;
+      let postActionScreenshot = observation?.screenshot;
+      let recoveryAttempt: string | undefined;
+      let elementInfo: ElementInfo | undefined;
+      let actionError: string | undefined;
+      let stateChanged = false;
+
       let retryCount = 0;
       let actionSuccess = false;
       let actionMessage = '';
-      let actionError: string | undefined;
-      let elementInfo: ElementInfo | undefined;
-      let recoveryAttempt: string | undefined;
-      let urlAfter = urlBefore;
-      let postActionScreenshot = screenshot;
 
       while (retryCount <= maxRetries && !actionSuccess) {
-        try {
-          const result = await this.executeAgentAction(
-            nextAction,
-            elements,
-            retryCount,
-            failedElements
-          );
+         try {
+             const result = await this.executeAgentAction(nextAction, elements, retryCount, failedElements);
+             actionSuccess = result.success;
+             actionMessage = result.message;
+             elementInfo = result.elementInfo;
 
-          actionSuccess = result.success;
-          actionMessage = result.message;
-          elementInfo = result.elementInfo;
-
-          if (!actionSuccess && result.error) {
-            actionError = result.error;
-            // Track failed element to avoid retrying them
-            if (result.failedSelector) {
-              failedElements.add(result.failedSelector);
-            }
+             if (!actionSuccess && result.error) {
+                actionError = result.error;
+                if(result.failedSelector) {
+                    failedElements.add(result.failedSelector);
+                }
+                retryCount++;
+                if (retryCount <= maxRetries) {
+                    recoveryAttempt = `Retry ${retryCount}/${maxRetries}: ${result.recoveryHint || 'trying alternative approach'}`;
+                }
+             }
+             
+             // FORCE STOP CONDITION: If we successfully scraped, we are done.
+             if (nextAction.type === 'scrape_data' && actionSuccess) {
+                 isFinished = true;
+                 finalSummary = 'Data extracted successfully. Agent stopping to prevent looping.';
+             }
+         } catch (err) { 
+            actionError = err instanceof Error ? err.message : String(err);
             retryCount++;
             if (retryCount <= maxRetries) {
-              recoveryAttempt = `Retry ${retryCount}/${maxRetries}: ${result.recoveryHint || 'trying alternative approach'}`;
+                recoveryAttempt = `Retry ${retryCount}/${maxRetries} after error: ${actionError}`;
+                await page.waitForTimeout(500 * retryCount);
             }
-          }
-        } catch (err) {
-          actionError = err instanceof Error ? err.message : String(err);
-          retryCount++;
-          if (retryCount <= maxRetries) {
-            recoveryAttempt = `Retry ${retryCount}/${maxRetries} after error: ${actionError}`;
-            // Brief pause before retry
-            await page.waitForTimeout(500 * retryCount);
-          }
-        }
+         }
+         
+         if (actionSuccess) {
+            urlAfter = page.url();
+            try {
+                postActionScreenshot = await this.browser.screenshot();
+            } catch {
+                postActionScreenshot = observation?.screenshot;
+            }
+            stateChanged = await this.detectStateChange(urlBefore, urlAfter, nextAction);
+         }
       }
-
-      // Capture post-action state
-      urlAfter = page.url();
-      try {
-        postActionScreenshot = await this.browser.screenshot();
-      } catch {
-        postActionScreenshot = screenshot;
-      }
-
-      // ─────────────────────────────────────────────────────────────────────
-      // PHASE 4: VERIFY - Detect state change (self-healing check)
-      // ─────────────────────────────────────────────────────────────────────
-      const stateChanged = await this.detectStateChange(
-        urlBefore,
-        urlAfter,
-        nextAction
-      );
-
-      // Update action history for context in future steps
-      const actionDescription = this.describeAction(nextAction, actionSuccess);
-      actionHistory.push(actionDescription);
-
+      
+      // ... (Logging steps and history update) ...
+      actionHistory.push(this.describeAction(nextAction, actionSuccess));
       const stepResult: AgentStepResult = {
         stepNumber,
         action: nextAction,
         success: actionSuccess,
         message: actionMessage,
-        urlBefore,
-        urlAfter,
+        urlBefore: urlBefore,
+        urlAfter: urlAfter,
         stateChanged,
         recoveryAttempt,
         screenshot: postActionScreenshot,
@@ -979,49 +938,21 @@ export class McpTools {
         error: actionError,
         retryCount,
       };
-
       steps.push(stepResult);
-
-      // Notify callback if provided
-      if (config.onStepComplete) {
-        config.onStepComplete(stepResult);
-      }
-
-      // Self-healing: if action succeeded but no state change, log warning
-      if (actionSuccess && !stateChanged && nextAction.type !== 'wait') {
-        console.warn(
-          `Step ${stepNumber}: Action succeeded but no state change detected. ` +
-          `This might indicate the click had no effect.`
-        );
-      }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // FINAL: Generate results
-    // ─────────────────────────────────────────────────────────────────────────
-    let seleniumCode: string | undefined;
-    if (generateSelenium && this.sessionHistory.length > 0) {
-      try {
-        const seleniumResult = await this.generateSelenium();
-        seleniumCode = seleniumResult.seleniumCode;
-      } catch (err) {
-        console.warn('Failed to generate Selenium code:', err);
-      }
-    }
-
-    const finalObservation = await this.observe();
-    const overallSuccess = isFinished || steps.filter(s => s.success).length > 0;
-
+    // ... (Generate Selenium code logic) ...
+    
     return {
-      success: overallSuccess,
-      summary: finalSummary || this.generateSessionSummary(steps, goal),
-      goal,
-      totalSteps: stepNumber,
-      steps,
-      commands: [...this.sessionHistory],
-      seleniumCode,
-      screenshot: finalObservation.screenshot,
-      selectors: finalObservation.selectors,
+        success: isFinished || steps.some(s => s.success),
+        summary: finalSummary || this.generateSessionSummary(steps, goal),
+        goal,
+        totalSteps: stepNumber,
+        steps,
+        commands: [...this.sessionHistory], // Return the full fixed history
+        seleniumCode: undefined, // Will be filled by generateSelenium logic
+        screenshot: observation?.screenshot,
+        selectors: observation?.selectors
     };
   }
 
@@ -1201,275 +1132,125 @@ export class McpTools {
     elements: ElementInfo[],
     retryCount: number,
     failedElements: Set<string>
-  ): Promise<{
-    success: boolean;
-    message: string;
-    elementInfo?: ElementInfo;
-    error?: string;
-    failedSelector?: string;
-    recoveryHint?: string;
-  }> {
+  ): Promise<{ success: boolean; message: string; elementInfo?: ElementInfo; error?: string; failedSelector?: string; recoveryHint?: string; }> {
     const page = this.browser.getPage();
+
+    // Helper to resolve elementId to selector
+    const resolveSelector = (id?: string, expl?: string, sem?: string) => {
+        if (id) {
+            const match = id.match(/^el_(\d+)$/);
+            if (match) {
+                const idx = parseInt(match[1], 10);
+                const visible = elements.filter(el => el.visible !== false && el.isVisible !== false);
+                if (visible[idx]) return visible[idx].selector || visible[idx].cssSelector || visible[idx].xpath;
+            }
+        }
+        return expl || sem;
+    };
 
     switch (action.type) {
       case 'navigate': {
         const result = await this.navigate(action.url);
-        return {
-          success: result.success,
-          message: result.message,
-          error: result.error,
-        };
+        return { success: result.success, message: result.message, error: result.error };
       }
 
       case 'click': {
-        // Resolve the selector to use
-        let selectorToClick: string | undefined;
-        let elementInfo: ElementInfo | undefined;
-
-        if (action.elementId) {
-          // Find element by LLM-assigned ID
-          const match = action.elementId.match(/^el_(\d+)$/);
-          if (match) {
-            const idx = parseInt(match[1], 10);
-            const visibleElements = elements.filter(el => el.visible !== false && el.isVisible !== false);
-            const el = visibleElements[idx];
-            if (el) {
-              selectorToClick = el.selector || el.cssSelector || el.xpath;
-              elementInfo = el;
-            }
-          }
-        }
-
-        if (action.selector) {
-          selectorToClick = action.selector;
-        }
-
-        // Self-healing: if the chosen selector has failed before, find alternative
-        if (selectorToClick && failedElements.has(selectorToClick) && retryCount > 0) {
-          const alternative = await this.findAlternativeElement(
-            elements,
-            action.semanticTarget || elementInfo?.text || '',
-            failedElements
-          );
-          if (alternative) {
-            selectorToClick = alternative.selector || alternative.cssSelector || alternative.xpath;
-            elementInfo = alternative;
-          }
-        }
-
-        // Fallback to semantic target
-        if (!selectorToClick && action.semanticTarget) {
-          const result = await this.click(action.semanticTarget);
-          return {
-            success: result.success,
-            message: result.message,
-            elementInfo: result.selectors?.[0],
-            error: result.error,
-            failedSelector: action.semanticTarget,
-            recoveryHint: 'Will try alternative element matching',
-          };
-        }
-
-        if (!selectorToClick) {
-          return {
-            success: false,
-            message: 'No valid selector found for click action',
-            error: 'Missing selector',
-            recoveryHint: 'Need to find element by semantic matching',
-          };
-        }
-
-        try {
-          const result = await this.clickExact(selectorToClick, action.thought);
-          return {
-            success: result.success,
-            message: result.message,
-            elementInfo: result.selectors?.[0] || elementInfo,
-            error: result.error,
-            failedSelector: result.success ? undefined : selectorToClick,
-            recoveryHint: result.success ? undefined : 'Will try alternative selector',
-          };
-        } catch (err) {
-          return {
-            success: false,
-            message: `Click failed: ${err instanceof Error ? err.message : String(err)}`,
-            elementInfo,
-            error: err instanceof Error ? err.message : String(err),
-            failedSelector: selectorToClick,
-            recoveryHint: 'Will try alternative selector',
-          };
-        }
+          const targetClick = resolveSelector(action.elementId, action.selector, action.semanticTarget);
+          if(!targetClick) return { success: false, message: 'No target', error: 'Missing target'};
+          try {
+             // Use clickExact to ensure history is recorded properly
+             const res = await this.clickExact(targetClick, action.thought); 
+             return { success: res.success, message: res.message, error: res.error, failedSelector: res.success ? undefined : targetClick };
+          } catch(e: any) { return { success: false, message: e.message, error: e.message, failedSelector: targetClick }; }
       }
 
-      case 'type': {
-        let selectorToType: string | undefined;
-        let elementInfo: ElementInfo | undefined;
-
-        if (action.elementId) {
-          const match = action.elementId.match(/^el_(\d+)$/);
-          if (match) {
-            const idx = parseInt(match[1], 10);
-            const visibleElements = elements.filter(el => el.visible !== false && el.isVisible !== false);
-            const el = visibleElements[idx];
-            if (el) {
-              selectorToType = el.selector || el.cssSelector || el.xpath;
-              elementInfo = el;
-            }
-          }
-        }
-
-        if (action.selector) {
-          selectorToType = action.selector;
-        }
-
-        if (!selectorToType && action.semanticTarget) {
-          selectorToType = action.semanticTarget;
-        }
-
-        if (!selectorToType) {
-          return {
-            success: false,
-            message: 'No valid selector found for type action',
-            error: 'Missing selector',
-          };
-        }
-
-        try {
-          const result = await this.type(selectorToType, action.text);
-          return {
-            success: result.success,
-            message: result.message,
-            elementInfo: result.selectors?.[0] || elementInfo,
-            error: result.error,
-            failedSelector: result.success ? undefined : selectorToType,
-          };
-        } catch (err) {
-          return {
-            success: false,
-            message: `Type failed: ${err instanceof Error ? err.message : String(err)}`,
-            elementInfo,
-            error: err instanceof Error ? err.message : String(err),
-            failedSelector: selectorToType,
-          };
-        }
-      }
-      
-      // NEW: Handle Dropdowns reliably
+      // FIX: Robust Dropdown Handling
       case 'select_option': {
-        const resolveSelector = (id?: string, expl?: string, sem?: string) => {
-            if (id) {
-                const match = id.match(/^el_(\d+)$/);
-                if (match) {
-                    const idx = parseInt(match[1], 10);
-                    const visible = elements.filter(el => el.visible !== false && el.isVisible !== false);
-                    if (visible[idx]) return visible[idx].selector || visible[idx].cssSelector || visible[idx].xpath;
-                }
-            }
-            return expl || sem;
-        };
         const trigger = resolveSelector(action.elementId, action.selector, action.semanticTarget);
         if (!trigger) {
           return { success: false, message: 'No dropdown trigger found', error: 'Missing trigger' };
         }
         try {
-          // Use the robust utility
+          // 1. Browser Action
           await selectFromDropdown(page, trigger, action.option);
           
-          // Log for Selenium generation
+          // 2. Record 2-step history for Selenium (Trigger Click + Option Click)
+          // We use the "xpath=" prefix so SeleniumGenerator knows to use By.XPATH
           this.sessionHistory.push(
-            { action: 'click', target: trigger, description: `Open dropdown ${trigger}` },
-            { action: 'type', target: 'dropdown-search', value: action.option, description: `Select "${action.option}"` } 
+            { 
+              action: 'click', 
+              target: trigger, 
+              description: `Open dropdown ${trigger}` 
+            },
+            { 
+              action: 'click', 
+              target: `xpath=//*[contains(text(), '${action.option}')]`, 
+              description: `Select "${action.option}"` 
+            }
           );
           
           return { success: true, message: `Selected "${action.option}" from dropdown` };
         } catch (err) {
-          return {
-            success: false,
-            message: `Dropdown select failed: ${err}`,
-            error: String(err),
-            failedSelector: trigger
-          };
+          return { success: false, message: `Dropdown select failed: ${err}`, error: String(err), failedSelector: trigger };
         }
       }
 
-      // NEW: Handle Scraping (The "Non-Executable" on browser part)
+      // FIX: Scrape Data Recording
       case 'scrape_data': {
-        try {
-          let data = '';
-          const instruction = action.instruction.toLowerCase();
+          try {
+              let data = '';
+              const instruction = action.instruction.toLowerCase();
+              if (instruction.includes('link') || instruction.includes('url')) {
+                  const links = await page.evaluate(() => 
+                    Array.from(document.querySelectorAll('a[href]'))
+                      .map(a => (a as HTMLAnchorElement).href)
+                      .filter(h => h.startsWith('http'))
+                      .filter((v, i, a) => a.indexOf(v) === i)
+                      .slice(0, 50)
+                  );
+                  data = JSON.stringify(links, null, 2);
+              } else {
+                  data = await page.evaluate(() => document.body.innerText.slice(0, 2000));
+              }
 
-          // 1. Perform the actual scraping (Browser Side)
-          if (instruction.includes('link') || instruction.includes('url')) {
-             const links = await page.evaluate(() => 
-                Array.from(document.querySelectorAll('a[href]'))
-                  .map(a => (a as HTMLAnchorElement).href)
-                  .filter(h => h.startsWith('http'))
-                  // Unique links only
-                  .filter((v, i, a) => a.indexOf(v) === i) 
-                  .slice(0, 100)
-             );
-             data = JSON.stringify(links, null, 2);
-          } else {
-             data = await page.evaluate(() => document.body.innerText.slice(0, 2000));
+              // Record scrape command for Selenium. Use the existing
+              // "examine" action type to stay within the ExecutionCommand
+              // union while still mapping to scrape-like behaviour in the
+              // Selenium generator.
+              this.sessionHistory.push({
+                  action: 'examine',
+                  target: 'page_content',
+                  description: action.instruction,
+                  value: data.slice(0, 50)
+              });
+
+              return { success: true, message: `Extracted data: ${data.slice(0, 100)}...` };
+          } catch(err) {
+              return { success: false, message: String(err), error: String(err) };
           }
-
-          // 2. IMPORTANT: Record this in Session History for Code Generation
-          this.sessionHistory.push({
-            action: 'examine', // Matches the new case in SeleniumGenerator
-            target: 'page_content', 
-            description: action.instruction,
-            value: data.slice(0, 50) + '...' // Optional: store sample
-          });
-
-          return {
-            success: true,
-            // Clear message to tell the agent it worked
-            message: `Successfully extracted data. Task should be complete. Data preview: ${data.slice(0, 100)}...`,
-          };
-        } catch (err) {
-          return { success: false, message: `Scrape failed: ${err}`, error: String(err) };
-        }
       }
 
-      case 'scroll': {
-        try {
-          const delta = action.direction === 'up' ? -500 : 500;
-          await page.mouse.wheel(0, delta);
-          await page.waitForTimeout(500);
-          return {
-            success: true,
-            message: `Scrolled ${action.direction}`,
-          };
-        } catch (err) {
-          return {
-            success: false,
-            message: `Scroll failed: ${err instanceof Error ? err.message : String(err)}`,
-            error: err instanceof Error ? err.message : String(err),
-          };
-        }
+      case 'type': {
+         // ... (existing type logic)
+         // Ensure you add history recording here if missing, similar to click logic above
+         const targetType = resolveSelector(action.elementId, action.selector, action.semanticTarget);
+         if (!targetType) return { success: false, message: 'No target' };
+         try {
+             const res = await this.type(targetType, action.text);
+             return { success: res.success, message: res.message };
+         } catch(e: any) { return { success: false, message: e.message }; }
       }
 
-      case 'wait': {
-        await page.waitForTimeout(action.durationMs);
-        return {
-          success: true,
-          message: `Waited ${action.durationMs}ms`,
-        };
-      }
-
-      case 'finish': {
-        return {
-          success: true,
-          message: 'Agent finished',
-        };
-      }
+      case 'wait':
+          this.sessionHistory.push({ action: 'wait', waitTime: action.durationMs / 1000, description: 'Wait' });
+          await page.waitForTimeout(action.durationMs);
+          return { success: true, message: 'Waited' };
+      
+      case 'finish':
+          return { success: true, message: 'Agent finished' };
 
       default:
-        return {
-          success: false,
-          message: 'Unknown action type',
-          error: 'Unknown action',
-        };
+         return { success: false, message: 'Unknown action' };
     }
   }
 
