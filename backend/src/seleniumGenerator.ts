@@ -141,44 +141,55 @@ export class SeleniumGenerator {
       'from selenium.webdriver.support.ui import WebDriverWait',
       'from selenium.webdriver.support import expected_conditions as EC',
       'from selenium.webdriver.chrome.service import Service',
+      'from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException',
       'import json',
       'import time',
       '',
       'def inject_cookies(driver, raw_cookies_json):',
-      '    """Inject cookies given a raw JSON string dumped from the browser.',
-      '',
-      '    The JSON is expected to be a list of cookie dicts in the standard',
-      '    Selenium/add_cookie format. This keeps cookie handling explicit and',
-      '    reusable across generated scripts without having to edit the core',
-      '    test body. Pass the raw JSON string through your prompt context or',
-      '    load it from disk before calling this function.',
-      '    """',
+      '    # ... (keep existing cookie helper comment/code) ...',
       '    cookies = json.loads(raw_cookies_json)',
       '    for c in cookies:',
       '        driver.add_cookie(c)',
       '',
+      'def safe_click(driver, element):',
+      '    """Robust click that handles obstructions and overlays automatically."""',
+      '    try:',
+      '        element.click()',
+      '    except ElementClickInterceptedException:',
+      '        print("    ! Standard click intercepted, attempting JS click...")',
+      '        driver.execute_script("arguments[0].click();", element)',
+      '',
       `def ${testName}():`,
       `    options = webdriver.ChromeOptions()`,
-      `    # options.add_argument('--headless')  # if needed`,
+      `    # options.add_argument('--headless')`,
+      `    options.add_argument('--start-maximized')`,
       `    service = Service(r'${driverPath}')`,
       `    driver = webdriver.Chrome(service=service, options=options)`,
-      `    wait = WebDriverWait(driver, 10)`,
+      `    wait = WebDriverWait(driver, 15)`,
       '    try:'
     ];
 
     const body: string[] = [];
     for (const cmd of commands) {
+      // Add a comment for readability
+      if (cmd.description) {
+        body.push(`        # ${cmd.description.replace(/\n/g, ' ')}`);
+      }
+
       switch (cmd.action.toLowerCase()) {
         case 'navigate':
         case 'goto':
           body.push(`        driver.get("${cmd.target}")`);
           break;
+
         case 'click':
+          // Use the new safe_click helper
           body.push(
             `        elem = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "${cmd.target}")))`,
-            '        elem.click()'
+            '        safe_click(driver, elem)'
           );
           break;
+
         case 'type':
           body.push(
             `        elem = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "${cmd.target}")))`,
@@ -186,16 +197,45 @@ export class SeleniumGenerator {
             `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`
           );
           break;
+
+        case 'scrape':
+          // Universal scraping generation
+          const intent = (cmd.description || '').toLowerCase();
+          if (intent.includes('link') || intent.includes('href') || intent.includes('url')) {
+            body.push(
+              '        print("\\n--- Scraped Links ---")',
+              '        links = driver.find_elements(By.TAG_NAME, "a")',
+              '        for link in links:',
+              '            href = link.get_attribute("href")',
+              '            if href and href.startswith("http"):',
+              '                print(href)',
+              '        print("---------------------")'
+            );
+          } else {
+            body.push(
+              '        print("\\n--- Scraped Text ---")',
+              '        print(driver.find_element(By.TAG_NAME, "body").text[:2000])',
+              '        print("... (truncated) ...")'
+            );
+          }
+          break;
+
         case 'wait':
           body.push(`        time.sleep(${cmd.waitTime ?? 1})`);
           break;
+
         default:
           body.push(`        # TODO: implement action "${cmd.action}"`);
       }
+      
+      // Add a small sleep between steps for stability (as requested by user preference often)
+      body.push('        time.sleep(1)');
     }
 
     const footer = [
       '    finally:',
+      '        # Keep browser open if needed, or close',
+      '        # input("Press Enter to close...")',
       '        driver.quit()',
       '',
       "if __name__ == '__main__':",

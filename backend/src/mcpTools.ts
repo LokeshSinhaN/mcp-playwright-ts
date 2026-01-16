@@ -1081,7 +1081,8 @@ export class McpTools {
       '1. **Dropdowns**: If the task involves selecting an option from a dropdown/menu, ALWAYS use the "select_option" action. Do NOT try to click the trigger and then the option separately.',
       '2. **Scraping/Data Extraction**: If the user asks to "return", "get", "find", or "list" data (like links, text, numbers) to the terminal:',
       '   - Perform the navigation required to reach the results page.',
-      '   - Once on the results page, use the "scrape_data" action. This is the only way to return data to the user.',
+      '   - Use "scrape_data" to extract the info.',
+       '   - **IMMEDIATELY AFTER scraping, you MUST use the "finish" action.** Do not scrape the same page twice.',
       '3. **Standard Interaction**: Use click/type/navigate for normal browsing.',
       '4. **Self-Correction**: If an element has "isFailed: true", pick a different element.',
       '',
@@ -1394,31 +1395,36 @@ export class McpTools {
       // NEW: Handle Scraping (The "Non-Executable" on browser part)
       case 'scrape_data': {
         try {
-          // We use the LLM to write a quick extraction script based on the instruction? 
-          // Or we can just dump the text/links if the user asked for "links".
-          
           let data = '';
           const instruction = action.instruction.toLowerCase();
 
+          // 1. Perform the actual scraping (Browser Side)
           if (instruction.includes('link') || instruction.includes('url')) {
-             // Extract all links
              const links = await page.evaluate(() => 
                 Array.from(document.querySelectorAll('a[href]'))
                   .map(a => (a as HTMLAnchorElement).href)
                   .filter(h => h.startsWith('http'))
-                  .slice(0, 50) // Limit to 50 for sanity
+                  // Unique links only
+                  .filter((v, i, a) => a.indexOf(v) === i) 
+                  .slice(0, 100)
              );
              data = JSON.stringify(links, null, 2);
           } else {
-             // Default: extract visible text
              data = await page.evaluate(() => document.body.innerText.slice(0, 2000));
           }
 
-          // We treat this as a "finish" signal often, but strictly it's an action.
-          // We will return success, and the agent loop might decide to finish if the goal is met.
+          // 2. IMPORTANT: Record this in Session History for Code Generation
+          this.sessionHistory.push({
+            action: 'examine', // Matches the new case in SeleniumGenerator
+            target: 'page_content', 
+            description: action.instruction,
+            value: data.slice(0, 50) + '...' // Optional: store sample
+          });
+
           return {
             success: true,
-            message: `Extracted data: ${data.slice(0, 100)}...`,
+            // Clear message to tell the agent it worked
+            message: `Successfully extracted data. Task should be complete. Data preview: ${data.slice(0, 100)}...`,
           };
         } catch (err) {
           return { success: false, message: `Scrape failed: ${err}`, error: String(err) };
