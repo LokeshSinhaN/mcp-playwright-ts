@@ -57,38 +57,37 @@ function extractUrlFromPrompt(prompt: string): string | null {
 function detectMultiStepPrompt(prompt: string): boolean {
   const lower = prompt.toLowerCase();
 
-  // Strong indicators of multi-step tasks
-  const multiStepPatterns = [
-    // Sequential conjunctions
-    /\b(then|next|after|and then|followed by)\b/,
-    // Multiple action verbs in sequence
-    /(click|type|enter|select|choose|navigate|go to|search|fill).*\b(then|and|next|after)\b.*(click|type|enter|select|choose|navigate|search|fill)/,
-    // Repetitive actions
-    /\b(all|each|every|one by one|for each)\b/,
-    // Explicit counting
-    /\b(first|second|third|1st|2nd|3rd|multiple|several)\b.*\b(then|and|next)/,
-    // Complex workflows
-    /\buntil\b/,
+  // 1. Explicit Agent Keywords
+  if (lower.includes('agent') || lower.includes('step by step') || lower.includes('steps')) return true;
+
+  // 2. Complex Workflow Indicators - count connector words
+  const complexConnectors = [
+    ' and ', ' then ', ' after ', ' followed by ', ' next ', ',',
+    ' first ', ' second ', ' finally '
   ];
 
-  // Check for multiple action keywords (suggests sequence)
+  // Count how many connectors appear
+  const connectorCount = complexConnectors.reduce((count, word) =>
+    lower.includes(word) ? count + 1 : count, 0);
+
+  // If we see 2 or more connectors, it's a workflow.
+  if (connectorCount >= 2) return true;
+
+  // 3. Action Verb Density
   const actionVerbs = [
     'click', 'type', 'enter', 'fill', 'select', 'choose',
     'navigate', 'go to', 'visit', 'open', 'search', 'submit',
-    'scroll', 'wait', 'verify', 'check'
+    'scroll', 'wait', 'verify', 'check', 'extract', 'scrape'
   ];
-  
+
   const actionCount = actionVerbs.filter(verb => {
+    // strict word boundary matching to avoid false positives
     const regex = new RegExp(`\\b${verb}\\b`, 'i');
     return regex.test(lower);
   }).length;
 
-  // If prompt has 3+ action verbs or matches multi-step patterns, use agent mode
-  if (actionCount >= 3) return true;
-  
-  for (const pattern of multiStepPatterns) {
-    if (pattern.test(lower)) return true;
-  }
+  // Reduced threshold: If prompt has 2+ action verbs, treat as Agent task
+  if (actionCount >= 2) return true;
 
   return false;
 }

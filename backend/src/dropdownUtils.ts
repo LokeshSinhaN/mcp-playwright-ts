@@ -292,7 +292,7 @@ export async function selectFromDropdown(
         } catch {
           const escaped = optionText
             .trim()
-            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')
             .replace(/\s+/g, '\\s+');
           const re = new RegExp(escaped, 'i');
           const fallbackOption = triggerLocator.locator('option').filter({ hasText: re }).first();
@@ -321,7 +321,7 @@ export async function selectFromDropdown(
         } catch {
           const escaped = optionText
             .trim()
-            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')
             .replace(/\s+/g, '\\s+');
           const re = new RegExp(escaped, 'i');
           const fallbackOption = firstSelect.locator('option').filter({ hasText: re }).first();
@@ -343,25 +343,64 @@ export async function selectFromDropdown(
     // If selectOption fails, fall back to generic menu logic.
   }
 
-  // 3. Click the trigger to open the dropdown/combobox.
-  await triggerLocator.click({ timeout: 5000 });
-
-  // Give the menu time to animate/mount.
-  await page.waitForTimeout(250);
-
-  // Ensure focus so subsequent keyboard operations go to the right widget.
+  // 3. Click trigger
   try {
-    await triggerLocator.focus();
+    await triggerLocator.click({ timeout: 5000 });
   } catch {
-    // Some wrappers are not focusable; this is best-effort.
+    // ignore but continue; some dropdowns open via focus/keyboard only
+  }
+  
+  await page.waitForTimeout(500); // Wait for animation
+
+  // --- IMPROVED SELECTION LOGIC ---
+  
+  // Try to find the option explicitly first (to capture its selector)
+  // We do this BEFORE interaction to ensure we have the specific element handle.
+  const escaped = optionText.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+  const optionRe = new RegExp(escaped, 'i');
+  
+  // Broad search for the option in likely containers
+  const candidateOption = page.locator([
+    '[role="option"]', 'li', 'a', 'div[role="button"]', 
+    '.dropdown-item', '.MuiMenuItem-root'
+  ].join(', ')).filter({ hasText: optionRe }).first();
+
+  let capturedSelector: string | undefined;
+
+  // Attempt to resolve the REAL selector for the option
+  try {
+    if (await candidateOption.count() > 0 && await candidateOption.isVisible()) {
+      const handle = await candidateOption.elementHandle();
+      if (handle) {
+        capturedSelector = await generateCssForHandle(handle);
+      }
+    }
+  } catch (e) {
+    console.log("Could not pre-calculate selector", e);
   }
 
-  const result = await selectOptionByStrategies(page, optionText);
+  // PERFORM ACTION
+  // If we found the element, CLICK it (Most reliable & gives us a selector)
+  if (capturedSelector) {
+    await candidateOption.click({ force: true });
+    return { method: 'click', optionSelector: capturedSelector };
+  }
 
-  // We intentionally do not attempt to assert success here, because many UIs do
-  // not update visible text in a consistent way. Callers who need verification
-  // should assert on the resulting DOM state separately.
-  return result;
+  // Fallback: If we couldn't find/click the element, use Keyboard
+  // BUT... we still need to try and find a selector for the report/selenium code
+  await page.keyboard.type(optionText);
+  await page.keyboard.press('Enter');
+
+  // Post-action: Try to find what we just selected to avoid hallucination
+  if (!capturedSelector) {
+    try {
+      const hiddenOption = page.locator(`text=${optionText}`).first();
+      const handle = await hiddenOption.elementHandle();
+      if (handle) capturedSelector = await generateCssForHandle(handle);
+    } catch {}
+  }
+
+  return { method: 'keyboard', optionSelector: capturedSelector };
 }
 
 /**

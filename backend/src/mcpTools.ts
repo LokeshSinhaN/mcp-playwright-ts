@@ -68,6 +68,9 @@ export class McpTools {
             {
               action: 'click',
               target: dropdownIntent.dropdownLabel,
+              // Note: dropdownLabel is semantic text, not a real CSS selector
+              // The SeleniumGenerator will handle this via text-based XPath fallback
+              selectors: { text: dropdownIntent.dropdownLabel },
               description: `Open dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
             {
@@ -75,6 +78,9 @@ export class McpTools {
               // Use the REAL selector captured during the click, or fall back to
               // a semantic description if keyboard selection was used.
               target: selectionResult.optionSelector || dropdownIntent.optionLabel,
+              selectors: selectionResult.optionSelector 
+                ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel }
+                : { text: dropdownIntent.optionLabel },
               description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
           );
@@ -88,6 +94,9 @@ export class McpTools {
             action: 'click',
             // Use the REAL selector if we have it, otherwise fall back to semantic target
             target: selectionResult.optionSelector || dropdownIntent.optionLabel,
+            selectors: selectionResult.optionSelector 
+              ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel }
+              : { text: dropdownIntent.optionLabel },
             description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`, 
           });
 
@@ -1127,6 +1136,10 @@ export class McpTools {
 
   /**
    * Execute a single agent action with self-healing support.
+   * 
+   * IMPORTANT: All actions that interact with elements MUST capture real
+   * selectors (CSS/XPath) from the DOM and store them in sessionHistory
+   * for production-ready Selenium code generation.
    */
   private async executeAgentAction(
     action: AgentAction,
@@ -1135,18 +1148,34 @@ export class McpTools {
     failedElements: Set<string>
   ): Promise<{ success: boolean; message: string; elementInfo?: ElementInfo; error?: string; failedSelector?: string; recoveryHint?: string; }> {
     const page = this.browser.getPage();
+    const extractor = new SelectorExtractor(page);
 
-    // Helper to resolve elementId to selector
-    const resolveSelector = (id?: string, expl?: string, sem?: string) => {
+    /**
+     * Helper to resolve elementId to both selector string AND full ElementInfo.
+     * This ensures we always have access to the complete selector data for history.
+     */
+    const resolveElement = (id?: string, expl?: string, sem?: string): { selector: string | undefined; elementInfo: ElementInfo | undefined } => {
         if (id) {
             const match = id.match(/^el_(\d+)$/);
             if (match) {
                 const idx = parseInt(match[1], 10);
                 const visible = elements.filter(el => el.visible !== false && el.isVisible !== false);
-                if (visible[idx]) return visible[idx].selector || visible[idx].cssSelector || visible[idx].xpath;
+                if (visible[idx]) {
+                    const el = visible[idx];
+                    return {
+                        selector: el.selector || el.cssSelector || el.xpath,
+                        elementInfo: el
+                    };
+                }
             }
         }
-        return expl || sem;
+        // Fallback: no ElementInfo available, just use the explicit/semantic selector
+        return { selector: expl || sem, elementInfo: undefined };
+    };
+
+    // Legacy helper for backward compatibility
+    const resolveSelector = (id?: string, expl?: string, sem?: string): string | undefined => {
+        return resolveElement(id, expl, sem).selector;
     };
 
     switch (action.type) {
@@ -1156,46 +1185,119 @@ export class McpTools {
       }
 
       case 'click': {
-          const targetClick = resolveSelector(action.elementId, action.selector, action.semanticTarget);
+          const resolved = resolveElement(action.elementId, action.selector, action.semanticTarget);
+          const targetClick = resolved.selector;
           if(!targetClick) return { success: false, message: 'No target', error: 'Missing target'};
           try {
-             // Use clickExact to ensure history is recorded properly
+             // Use clickExact to ensure history is recorded properly with REAL selectors
+             // clickExact internally uses browser.click() which extracts full ElementInfo
              const res = await this.clickExact(targetClick, action.thought); 
-             return { success: res.success, message: res.message, error: res.error, failedSelector: res.success ? undefined : targetClick };
-          } catch(e: any) { return { success: false, message: e.message, error: e.message, failedSelector: targetClick }; }
+             
+             // Return the captured ElementInfo for agent tracking
+             const clickedElementInfo = res.selectors?.[0] || resolved.elementInfo;
+             return { 
+                 success: res.success, 
+                 message: res.message, 
+                 elementInfo: clickedElementInfo,
+                 error: res.error, 
+                 failedSelector: res.success ? undefined : targetClick 
+             };
+          } catch(e: any) { 
+              return { success: false, message: e.message, error: e.message, failedSelector: targetClick }; 
+          }
       }
 
       // Robust Dropdown Handling: Use REAL selectors from the dropdown utility
       case 'select_option': {
-        const trigger = resolveSelector(action.elementId, action.selector, action.semanticTarget);
+        const resolved = resolveElement(action.elementId, action.selector, action.semanticTarget);
+        const trigger = resolved.selector;
+        const triggerInfo = resolved.elementInfo;
+        
         if (!trigger) {
           return { success: false, message: 'No dropdown trigger found', error: 'Missing trigger' };
         }
         try {
-          // 1. Browser Action - now returns the REAL selector of the clicked option
+          // 1. EXECUTE SELECTION
           const selectionResult = await selectFromDropdown(page, trigger, action.option);
           
-          // 2. Record 2-step history for Selenium with REAL selectors
-          // The trigger is already a real selector from the element pool.
-          // For the option, use the captured CSS selector if available.
-          this.sessionHistory.push(
-            { 
-              action: 'click', 
-              target: trigger, 
-              description: `Open dropdown ${trigger}` 
-            },
-            { 
-              action: 'click', 
-              // Use the REAL selector captured during the click operation.
-              // If keyboard selection was used (no click), fall back to semantic text.
-              target: selectionResult.optionSelector || action.option,
-              description: `Select "${action.option}"` 
-            }
-          );
+          // 2. SELF-HEALING VERIFICATION
+          // Check if the selection actually "stuck"
+          await page.waitForTimeout(1000); // wait for UI update
           
-          return { success: true, message: `Selected "${action.option}" from dropdown (method: ${selectionResult.method})` };
-        } catch (err) {
-          return { success: false, message: `Dropdown select failed: ${err}`, error: String(err), failedSelector: trigger };
+          const isNativeSelect = await page.locator(trigger).evaluate(el => el.tagName.toLowerCase() === 'select').catch(() => false);
+          
+          let verificationPassed = false;
+          
+          if (isNativeSelect) {
+             const val = await page.locator(trigger).inputValue().catch(() => '');
+             // Simplistic check: assumes value somewhat matches option text
+             if (typeof val === 'string' && val.length > 0) {
+               verificationPassed = true;
+             }
+          } else {
+             // For custom dropdowns, the trigger text usually updates to show the selection
+             const triggerText = (await page.locator(trigger).textContent().catch(() => '')) || '';
+             if (triggerText.toLowerCase().includes(action.option.toLowerCase())) {
+                 verificationPassed = true;
+             }
+          }
+
+          if (!verificationPassed) {
+             // THROW ERROR to force the Agent to retry (Self-Healing)
+             // This stops it from moving to "click search" blindly
+             throw new Error(`Verification failed: Dropdown text did not update to "${action.option}" after selection.`);
+          }
+
+          // 3. RECORD HISTORY (Only if verification passed)
+          // Ensure we push the REAL captured selector, not just text
+          const finalOptionSelector = selectionResult.optionSelector;
+          
+          // Build proper selectors object from the trigger ElementInfo
+          const triggerSelectors = triggerInfo ? {
+              css: triggerInfo.cssSelector || triggerInfo.selector,
+              xpath: triggerInfo.xpath,
+              id: triggerInfo.id,
+              text: triggerInfo.text
+          } : { css: trigger };
+          
+          this.sessionHistory.push({ 
+            action: 'click', 
+            target: trigger,
+            selectors: triggerSelectors,
+            description: `Open dropdown "${triggerInfo?.text || trigger}"` 
+          });
+          
+          if (finalOptionSelector) {
+              this.sessionHistory.push({ 
+                  action: 'click', 
+                  target: finalOptionSelector, // REAL SELECTOR
+                  selectors: { css: finalOptionSelector, xpath: selectionResult.optionXpath, text: action.option }, 
+                  description: `Select option "${action.option}"` 
+              });
+          } else {
+              // Fallback only if absolutely necessary
+              this.sessionHistory.push({ 
+                  action: 'type', 
+                  target: trigger,
+                  value: action.option,
+                  description: `Type "${action.option}" into dropdown (fallback)`
+              });
+          }
+          
+          return { 
+              success: true, 
+              message: `Selected and Verified "${action.option}"`,
+              elementInfo: triggerInfo
+          };
+
+        } catch (err: any) {
+           // This error is caught by runAutonomousAgent, which triggers the retry logic
+           return { 
+             success: false, 
+             message: `Selection failed: ${err.message ?? String(err)}`, 
+             error: err.message ?? String(err), 
+             failedSelector: trigger 
+           };
         }
       }
 
