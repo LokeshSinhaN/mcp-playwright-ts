@@ -1133,74 +1133,152 @@ export class McpTools {
   }
 
   /**
-   * Parse the LLM response with improved robustness for JSON errors.
+   * Best-effort JSON parser for agent plans with small automatic repairs
+   * (trailing commas, single-quoted strings, etc.).
    */
-  private parseAgentActionResponse(raw: string): AgentAction {
-    let trimmed = raw.trim();
+  private tryParseAgentJson(candidate: string): any {
+    const trimmed = candidate.trim();
 
-    // 1. Strip Markdown code blocks
-    const jsonMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
-    if (jsonMatch) trimmed = jsonMatch[1].trim();
+    // Fast path
+    try {
+      return JSON.parse(trimmed);
+    } catch (err) {
+      let repaired = trimmed;
 
-    // 2. Find JSON boundaries
-    const first = trimmed.indexOf('{');
-    const last = trimmed.lastIndexOf('}');
-    if (first < 0 || last <= first) {
-      return { type: 'finish', thought: 'Invalid JSON', summary: 'Parse error' };
+      // 1) Remove trailing commas before } or ]
+      repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+      if (repaired !== trimmed) {
+        try {
+          return JSON.parse(repaired);
+        } catch {
+          // fall through
+        }
+      }
+
+      // 2) Convert simple single-quoted strings to double-quoted JSON strings.
+      repaired = repaired.replace(/'([^'"\\]*?)'/g, (_m, inner) => {
+        const escaped = String(inner).replace(/"/g, '\\"');
+        return `"${escaped}"`;
+      });
+      if (repaired !== trimmed) {
+        try {
+          return JSON.parse(repaired);
+        } catch {
+          // fall through
+        }
+      }
+
+      throw err;
+    }
+  }
+
+  /**
+   * Extract a JSON object from an LLM response that may include markdown or
+   * extra prose, using the same style of repairs as single-step AI mode.
+   */
+  private parseAgentJsonWithRepairs(text: string): any {
+    // 1) Direct/repairing parse first.
+    try {
+      return this.tryParseAgentJson(text);
+    } catch {
+      // fall through
     }
 
-    const jsonStr = trimmed.substring(first, last + 1);
+    // 2) Explicit ```json code block.
+    const markdownMatch = text.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (markdownMatch && markdownMatch[1]) {
+      return this.tryParseAgentJson(markdownMatch[1]);
+    }
 
+    // 3) Any fenced code block.
+    const genericBlockMatch = text.match(/```\s*([\s\S]*?)\s*```/);
+    if (genericBlockMatch && genericBlockMatch[1]) {
+      return this.tryParseAgentJson(genericBlockMatch[1]);
+    }
+
+    // 4) Fallback: substring between first '{' and last '}'.
+    const first = text.indexOf('{');
+    const last = text.lastIndexOf('}');
+    if (first >= 0 && last > first) {
+      const jsonCandidate = text.substring(first, last + 1);
+      return this.tryParseAgentJson(jsonCandidate);
+    }
+
+    throw new Error('Invalid JSON format in agent response');
+  }
+
+  /**
+   * Parse the LLM response with improved robustness for JSON errors.
+   *
+   * IMPORTANT: On parse failure we return a small "wait" action instead of
+   * forcing the agent to finish. This lets the self-healing loop re-plan on
+   * the next iteration instead of giving up with a parse error.
+   */
+  private parseAgentActionResponse(raw: string): AgentAction {
+    let parsed: any;
     try {
-      // 3. Attempt Parse
-      const parsed = JSON.parse(jsonStr);
-      const thought = parsed.thought || 'No reasoning provided';
-
-      // 4. Map to Action Types
-      switch (parsed.type) {
-        case 'navigate': return { type: 'navigate', url: parsed.url || '', thought };
-        case 'click':
-          return { type: 'click', elementId: parsed.elementId, selector: parsed.selector, semanticTarget: parsed.semanticTarget, thought };
-        case 'type':
-          return { type: 'type', elementId: parsed.elementId, selector: parsed.selector, semanticTarget: parsed.semanticTarget, text: parsed.text || '', thought };
-        // NEW: Handle select_option
-        case 'select_option':
-          return {
-            type: 'select_option',
-            elementId: parsed.elementId,
-            selector: parsed.selector,
-            semanticTarget: parsed.semanticTarget,
-            option: parsed.option || '',
-            thought
-          };
-        // NEW: Handle scrape_data
-        case 'scrape_data':
-          return {
-            type: 'scrape_data',
-            instruction: parsed.instruction || 'Extract data',
-            thought
-          };
-        case 'scroll': return { type: 'scroll', direction: parsed.direction || 'down', thought };
-        case 'wait': return { type: 'wait', durationMs: parsed.durationMs || 1000, thought };
-        case 'finish': return { type: 'finish', thought, summary: parsed.summary || 'Done' };
-        default: return { type: 'finish', thought: `Unknown type: ${parsed.type}`, summary: 'Unknown action' };
-      }
+      parsed = this.parseAgentJsonWithRepairs(raw);
     } catch (err) {
-      // 5. Fallback for "JSON parse error" (e.g. newlines in strings)
-      console.warn('JSON Parse failed, attempting cleanup:', err);
-      try {
-        // Simple cleanup: remove newlines inside the JSON string which LLMs sometimes add
-        const cleaned = jsonStr.replace(/\n/g, ' '); 
-        const parsed = JSON.parse(cleaned);
-        // ... (repeat mapping logic if needed, or just return finish with error)
-        return { type: 'finish', thought: 'JSON repaired', summary: 'Repaired JSON but stopping for safety' };
-      } catch {
+      console.error('Failed to parse agent action JSON, will wait and re-plan:', err);
+      console.error('Raw agent response (truncated):', raw.substring(0, 400));
+      // Soft failure: do not stop the agent, just perform a short wait so the
+      // next loop iteration can ask the model again with updated history.
+      return {
+        type: 'wait',
+        durationMs: 1000,
+        thought: 'JSON parse error while planning next step; waiting briefly and then re-planning.',
+      };
+    }
+
+    const thought: string = parsed.thought || 'No reasoning provided';
+
+    switch (parsed.type) {
+      case 'navigate':
+        return { type: 'navigate', url: parsed.url || '', thought };
+      case 'click':
         return {
-          type: 'finish',
-          thought: `JSON parse error: ${err instanceof Error ? err.message : String(err)}`,
-          summary: 'Parse error - stopping agent',
+          type: 'click',
+          elementId: parsed.elementId,
+          selector: parsed.selector,
+          semanticTarget: parsed.semanticTarget,
+          thought,
         };
-      }
+      case 'type':
+        return {
+          type: 'type',
+          elementId: parsed.elementId,
+          selector: parsed.selector,
+          semanticTarget: parsed.semanticTarget,
+          text: parsed.text || '',
+          thought,
+        };
+      case 'select_option':
+        return {
+          type: 'select_option',
+          elementId: parsed.elementId,
+          selector: parsed.selector,
+          semanticTarget: parsed.semanticTarget,
+          option: parsed.option || '',
+          thought,
+        };
+      case 'scrape_data':
+        return {
+          type: 'scrape_data',
+          instruction: parsed.instruction || 'Extract data',
+          thought,
+        };
+      case 'scroll':
+        return { type: 'scroll', direction: parsed.direction || 'down', thought };
+      case 'wait':
+        return { type: 'wait', durationMs: parsed.durationMs || 1000, thought };
+      case 'finish':
+        return { type: 'finish', thought, summary: parsed.summary || 'Done' };
+      default:
+        return {
+          type: 'wait',
+          durationMs: 1000,
+          thought: `Unknown agent action type "${String(parsed.type)}"; waiting and re-planning.`,
+        };
     }
   }
 
