@@ -521,7 +521,29 @@ export class McpTools {
     const tokens = lowerPrompt.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
     if (tokens.length === 0) return true;
 
-    const label = `${el.text ?? ''} ${el.ariaLabel ?? ''} ${el.dataTestId ?? ''}`.toLowerCase();
+    const attrs = el.attributes || {};
+    const attrLabelParts = [
+      attrs.id,
+      attrs.name,
+      attrs.value,
+      attrs.placeholder,
+      attrs.title,
+      attrs['aria-label'],
+      attrs['data-testid'],
+    ].filter(Boolean);
+
+    const label = [
+      el.text ?? '',
+      el.ariaLabel ?? '',
+      el.placeholder ?? '',
+      el.title ?? '',
+      el.dataTestId ?? '',
+      el.context ?? '',
+      ...attrLabelParts,
+    ]
+      .join(' ')
+      .toLowerCase();
+
     if (!label.trim()) return false;
 
     return tokens.some((tok) => label.includes(tok));
@@ -1123,11 +1145,14 @@ export class McpTools {
       const rawText = (response as any).response?.text?.() ?? '';
       return this.parseAgentActionResponse(rawText);
     } catch (err) {
+      // Treat planning failures as a soft error so the agent can self-heal by
+      // retrying on the next loop iteration instead of hard-stopping.
+      const msg = err instanceof Error ? err.message : String(err);
       console.error('Failed to get next agent action from LLM:', err);
       return {
-        type: 'finish',
-        thought: `LLM error: ${err instanceof Error ? err.message : String(err)}`,
-        summary: 'Agent stopped due to LLM error',
+        type: 'wait',
+        durationMs: 1000,
+        thought: `LLM error while planning next step: ${msg}. Waiting briefly, then re-planning.`,
       };
     }
   }
@@ -1334,8 +1359,38 @@ export class McpTools {
 
       case 'click': {
           const resolved = resolveElement(action.elementId, action.selector, action.semanticTarget);
-          const targetClick = resolved.selector;
-          if(!targetClick) return { success: false, message: 'No target', error: 'Missing target'};
+          let targetClick = resolved.selector;
+
+          // If the planner did not provide a usable selector/elementId, fall
+          // back to semantic matching over the observed elements instead of
+          // immediately giving up with "No target". This makes the agent more
+          // robust on pages where the model only emits a natural-language
+          // description like "Python radio button".
+          if (!targetClick) {
+            const fallbackDescription =
+              action.semanticTarget || action.thought || '';
+
+            if (fallbackDescription.trim().length > 0) {
+              const alt = await this.findAlternativeElement(
+                elements,
+                fallbackDescription,
+                failedElements,
+              );
+
+              if (alt) {
+                targetClick = alt.selector || alt.cssSelector || alt.xpath;
+              }
+            }
+          }
+
+          if (!targetClick) {
+            return {
+              success: false,
+              message: 'No target element could be resolved for click action',
+              error: 'Missing target',
+            };
+          }
+
           try {
              // Use clickExact to ensure history is recorded properly with REAL selectors
              // clickExact internally uses browser.click() which extracts full ElementInfo
@@ -1343,6 +1398,40 @@ export class McpTools {
              
              // Return the captured ElementInfo for agent tracking
              const clickedElementInfo = res.selectors?.[0] || resolved.elementInfo;
+
+             // For radios/checkboxes, verify that the checked state actually
+             // changed; if it did not, treat this as a soft failure so the
+             // self-healing loop can try an alternative element (e.g., the
+             // associated label instead of the input).
+             let verificationError: string | undefined;
+             try {
+               const attrs = clickedElementInfo?.attributes || {};
+               const isToggleLike =
+                 (attrs.type === 'radio' || attrs.type === 'checkbox' || attrs.role === 'radio' || attrs.role === 'checkbox');
+
+               if (isToggleLike) {
+                 const locator = page.locator(targetClick);
+                 const checked = await locator.isChecked().catch(() => false);
+                 if (!checked) {
+                   verificationError = 'Element was clicked but is not in a checked state afterwards.';
+                 }
+               }
+             } catch {
+               // If verification fails for any reason, we just skip it and
+               // trust the click result.
+             }
+
+             if (verificationError) {
+               return {
+                 success: false,
+                 message: verificationError,
+                 elementInfo: clickedElementInfo,
+                 error: verificationError,
+                 failedSelector: targetClick,
+                 recoveryHint: 'Try clicking the associated label or a nearby control with the same text.',
+               };
+             }
+
              return { 
                  success: res.success, 
                  message: res.message, 
@@ -1358,9 +1447,29 @@ export class McpTools {
       // Robust Dropdown Handling: Use REAL selectors from the dropdown utility
       case 'select_option': {
         const resolved = resolveElement(action.elementId, action.selector, action.semanticTarget);
-        const trigger = resolved.selector;
-        const triggerInfo = resolved.elementInfo;
+        let trigger = resolved.selector;
+        let triggerInfo = resolved.elementInfo;
         
+        // If the LLM did not give us a concrete trigger selector, try to
+        // infer a suitable dropdown control from the elements list using the
+        // option text and any semantic target as a hint.
+        if (!trigger) {
+          const descriptionParts = [action.semanticTarget, action.option, action.thought]
+            .filter(Boolean)
+            .join(' ');
+
+          const alt = await this.findAlternativeElement(
+            elements,
+            descriptionParts,
+            failedElements,
+          );
+
+          if (alt) {
+            trigger = alt.selector || alt.cssSelector || alt.xpath;
+            triggerInfo = alt;
+          }
+        }
+
         if (!trigger) {
           return { success: false, message: 'No dropdown trigger found', error: 'Missing trigger' };
         }
@@ -1532,7 +1641,29 @@ export class McpTools {
         return true;
       })
       .map(el => {
-        const label = `${el.text || ''} ${el.ariaLabel || ''} ${el.placeholder || ''}`.toLowerCase();
+        const attrs = el.attributes || {};
+        const attrLabelParts = [
+          attrs.id,
+          attrs.name,
+          attrs.value,
+          attrs.placeholder,
+          attrs.title,
+          attrs['aria-label'],
+          attrs['data-testid'],
+        ].filter(Boolean);
+
+        const label = `${
+          [
+            el.text || '',
+            el.ariaLabel || '',
+            el.placeholder || '',
+            el.title || '',
+            el.dataTestId || '',
+            el.context || '',
+            ...attrLabelParts,
+          ].join(' ')
+        }`.toLowerCase();
+
         const matchCount = targetTokens.filter(tok => label.includes(tok)).length;
         return { el, score: matchCount };
       })
