@@ -23,25 +23,87 @@ function setWsStatus(state: 'connected' | 'disconnected' | 'error', label: strin
   wsStatusText.textContent = label;
 }
 
+function describeMeta(p: WsPayload): string | null {
+  const anyPayload: any = p;
+  const data: any = anyPayload.data ?? {};
+
+  // Agent reasoning events
+  if (data.role === 'agent-reasoning') {
+    const actionType = typeof data.actionType === 'string' ? data.actionType : 'action';
+    return `Agent is planning the next ${actionType} step...`;
+  }
+
+  // Agent step completion events
+  if (typeof data.stepNumber === 'number') {
+    const parts: string[] = [];
+    if (data.action && typeof data.action.type === 'string') {
+      parts.push(`action: ${data.action.type}`);
+    }
+    if (typeof data.retryCount === 'number') {
+      parts.push(`retries: ${data.retryCount}`);
+    }
+    if (typeof data.stateChanged === 'boolean') {
+      parts.push(data.stateChanged ? 'state changed' : 'no state change');
+    }
+    return parts.length ? parts.join(' • ') : null;
+  }
+
+  // Final agent summary events
+  if (typeof data.totalSteps === 'number') {
+    const parts: string[] = [`steps: ${data.totalSteps}`];
+    if (typeof data.success === 'boolean') {
+      parts.push(data.success ? 'session success' : 'session failed');
+    }
+    return parts.join(' • ');
+  }
+
+  return null;
+}
+
 function appendLog(p: WsPayload | { type: string; message: string; timestamp?: string; role?: 'user' }) {
   const entry = document.createElement('div');
-  entry.className = `chat-entry ${p.type} ${'role' in p ? p.role : 'system'}`;
+
+  const anyPayload: any = p;
+  const data: any = anyPayload.data ?? {};
+  const inferredRole =
+    (anyPayload.role as string | undefined) ||
+    (data.role as string | undefined) ||
+    (p.type === 'log' && typeof data.stepNumber === 'number' ? 'agent-step' : undefined) ||
+    (p.type === 'action' ? 'action' : undefined) ||
+    'system';
+
+  entry.className = `chat-entry ${p.type} role-${inferredRole}`;
+
   const ts = document.createElement('span');
   ts.className = 'timestamp';
   ts.textContent = (p as any).timestamp
     ? new Date((p as any).timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : '';
-  const msg = document.createElement('span');
-  msg.className = 'message';
-  msg.textContent = p.message;
+
+  const msgContainer = document.createElement('div');
+  msgContainer.className = 'message';
+
+  const mainLine = document.createElement('div');
+  mainLine.className = 'message-main';
+  mainLine.textContent = p.message;
+  msgContainer.appendChild(mainLine);
+
+  const metaText = 'type' in p ? describeMeta(p as WsPayload) : null;
+  if (metaText) {
+    const meta = document.createElement('div');
+    meta.className = 'message-meta';
+    meta.textContent = metaText;
+    msgContainer.appendChild(meta);
+  }
+
   entry.appendChild(ts);
-  entry.appendChild(msg);
+  entry.appendChild(msgContainer);
   chatLog.appendChild(entry);
   chatLog.scrollTop = chatLog.scrollHeight;
 }
 
 wsClient.on((p) => {
-  if (p.type === 'log') {
+  if (p.type === 'log' || p.type === 'action' || p.type === 'success') {
     setWsStatus('connected', 'Connected');
   } else if (p.type === 'error') {
     setWsStatus('error', 'Error');

@@ -236,6 +236,18 @@ body {
   border-radius: 0.55rem;
   background: rgba(15, 23, 42, 0.95);
   border: 1px solid rgba(15, 23, 42, 0.95);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.message-main {
+  white-space: pre-wrap;
+}
+
+.message-meta {
+  font-size: 0.7rem;
+  color: var(--text-muted);
 }
 
 .chat-entry.log .message {
@@ -248,6 +260,19 @@ body {
 
 .chat-entry.info.role-user .message {
   border-color: rgba(129, 140, 248, 0.7);
+}
+
+/* Highlight autonomous agent loop events */
+.chat-entry.log.role-agent-reasoning .message {
+  border-color: var(--accent-strong);
+}
+
+.chat-entry.log.role-agent-step .message {
+  border-color: var(--accent);
+}
+
+.chat-entry.action .message {
+  border-color: rgba(59, 130, 246, 0.75);
 }
 
 .chat-input {
