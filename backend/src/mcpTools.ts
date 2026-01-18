@@ -324,6 +324,25 @@ export class McpTools {
     }
   }
 
+/**
+   * Small helper to guard long-running LLM calls so the autonomous agent
+   * cannot stall indefinitely while waiting for a model response.
+   */
+  private async withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`${label} timed out after ${ms}ms`));
+      }, ms);
+    });
+
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   /**
    * Sanitize ElementInfo list down to a minimal, JSON-safe structure for LLM
    * consumption. This avoids passing complex prototypes or huge attribute
@@ -432,14 +451,18 @@ export class McpTools {
     ].join('\n');
 
     try {
-      const result = await this.model.generateContent({
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: prompt }]
-          }
-        ]
-      } as any);
+      const result = await this.withTimeout(
+        this.model.generateContent({
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: prompt }]
+            }
+          ]
+        } as any),
+        45000,
+        'LLM selector'
+      );
 
       const raw = (result as any).response?.text?.() ?? '';
       const chosenId = this.parseLlmChosenId(raw);
@@ -846,6 +869,8 @@ export class McpTools {
     const maxSteps = config.maxSteps ?? 20;
     const maxRetries = config.maxRetriesPerAction ?? 3;
     const generateSelenium = config.generateSelenium ?? true;
+    const onStepComplete = config.onStepComplete;
+    const onThought = config.onThought;
 
     // Reset history at start of agent run
     this.sessionHistory = []; 
@@ -864,19 +889,52 @@ export class McpTools {
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
 
-      // ... (Observe & Think phases remain the same) ...
+      // OBSERVE
       observation = await this.observe();
       const elements = observation.selectors ?? [];
       const screenshot = observation.screenshot;
-      const nextAction = await this.planNextAgentAction(goal, elements, actionHistory, failedElements, screenshot);
+
+      // THINK
+      const nextAction = await this.planNextAgentAction(
+        goal,
+        elements,
+        actionHistory,
+        failedElements,
+        screenshot,
+      );
+
+      // Broadcast agent "thought" before acting, if a callback is wired.
+      if (onThought && (nextAction as any).thought) {
+        try {
+          onThought((nextAction as any).thought, nextAction);
+        } catch {
+          // Never let UI callbacks break the agent loop.
+        }
+      }
       
       if (nextAction.type === 'finish') {
           isFinished = true;
           finalSummary = nextAction.summary;
-          steps.push({ stepNumber, action: nextAction, success: true, message: 'Done', urlBefore: page.url(), urlAfter: page.url(), stateChanged: false, screenshot, retryCount: 0 });
+          const finishStep: AgentStepResult = {
+            stepNumber,
+            action: nextAction,
+            success: true,
+            message: 'Done',
+            urlBefore: page.url(),
+            urlAfter: page.url(),
+            stateChanged: false,
+            screenshot,
+            retryCount: 0,
+          };
+          steps.push(finishStep);
+
+          if (onStepComplete) {
+            try { onStepComplete(finishStep); } catch {/* ignore */}
+          }
           break;
       }
 
+      // ACT
       const urlBefore = page.url();
       let urlAfter = urlBefore;
       let postActionScreenshot = observation?.screenshot;
@@ -932,7 +990,7 @@ export class McpTools {
          }
       }
       
-      // ... (Logging steps and history update) ...
+      // LOG & NOTIFY
       actionHistory.push(this.describeAction(nextAction, actionSuccess));
       const stepResult: AgentStepResult = {
         stepNumber,
@@ -949,6 +1007,10 @@ export class McpTools {
         retryCount,
       };
       steps.push(stepResult);
+
+      if (onStepComplete) {
+        try { onStepComplete(stepResult); } catch {/* ignore */}
+      }
     }
 
     // ... (Generate Selenium code logic) ...
@@ -1047,8 +1109,16 @@ export class McpTools {
         : null;
 
       const response = imagePart
-        ? await this.model.generateContent([textPart, imagePart] as any)
-        : await this.model.generateContent(textPart as any);
+        ? await this.withTimeout(
+            this.model.generateContent([textPart, imagePart] as any),
+            60000,
+            'Agent planning'
+          )
+        : await this.withTimeout(
+            this.model.generateContent(textPart as any),
+            60000,
+            'Agent planning'
+          );
 
       const rawText = (response as any).response?.text?.() ?? '';
       return this.parseAgentActionResponse(rawText);
