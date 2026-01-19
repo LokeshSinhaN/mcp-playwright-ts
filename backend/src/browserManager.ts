@@ -61,10 +61,10 @@ export class BrowserManager {
   }
 
   // Default per-click timeout (in ms). Navigation and other operations can
-  // still use the broader session timeout, but individual clicks should not
-  // fail too aggressively on slower, hydrated UIs.
+  // still use the broader session timeout, but individual clicks should fail
+  // fast so the manager can escalate to force/JS clicks instead of hanging.
   private get clickTimeout(): number {
-    return 10000; // 10 seconds
+    return 2000; // 2 seconds
   }
 
   async init(): Promise<void> {
@@ -330,7 +330,7 @@ export class BrowserManager {
 
     // 2. "Soft" wait for visibility to handle hydration delays. We log but do
     // not immediately fail if the wait times out; a later forced click may
-    // still succeed.
+    // still succeed. Keep this short so we can escalate quickly.
     try {
       await locator.waitFor({ state: 'visible', timeout: this.clickTimeout });
     } catch (err) {
@@ -338,7 +338,13 @@ export class BrowserManager {
       console.warn(`Soft wait for click target timed out for selector "${selector}": ${msg}`);
     }
 
-    await locator.scrollIntoViewIfNeeded();
+    // Best-effort scroll only; cap the timeout so we never hang here.
+    try {
+      await locator.scrollIntoViewIfNeeded({ timeout: this.clickTimeout });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`scrollIntoViewIfNeeded timeout for selector "${selector}": ${msg}`);
+    }
 
     // Briefly highlight the chosen element for visual debugging and to make it
     // obvious which node the AI decided to interact with.
@@ -376,14 +382,15 @@ export class BrowserManager {
       await locator.click({ timeout: 2000 });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`Primary click failed for selector "${selector}": ${msg}. Retrying with force.`);
+      console.warn(`Standard click failed for selector "${selector}": ${msg}. Escalating to FORCE click...`);
       try {
         // Tier 2: force click, still with a short timeout.
-        await locator.click({ timeout: 2000, force: true });
+        // Use noWaitAfter so we do not block on navigation/loads here.
+        await locator.click({ timeout: 2000, force: true, noWaitAfter: true });
       } catch (forceErr) {
         const forceMsg = forceErr instanceof Error ? forceErr.message : String(forceErr);
         console.warn(
-          `Force click also failed for selector "${selector}": ${forceMsg}. Attempting JS click fallback.`,
+          `Force click also failed for selector "${selector}": ${forceMsg}. Attempting JS click fallback...`,
         );
         try {
           const handle = await locator.elementHandle();

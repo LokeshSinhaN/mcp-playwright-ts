@@ -995,20 +995,17 @@ export class McpTools {
       }
 
       // ═══════════════════════════════════════════════════════════════════
-      // LOOP BREAKER: Prevent mindless repetition of the same action
+      // LOOP BREAKERS: Prevent mindless repetition of the same action
       // ═══════════════════════════════════════════════════════════════════
-      // If the agent is about to perform the EXACT same action as the
-      // previous step (same type, same target element), and that previous
-      // action was successful, this is a "doom loop" - the agent lacks
-      // self-awareness that repeating won't yield different results.
-      //
-      // We intercept and force re-planning with an explicit warning.
       if (steps.length > 0) {
         const prevStep = steps[steps.length - 1];
         const prevAction = prevStep.action;
-        
-        // Only intervene if previous action succeeded - failures are already
-        // handled by the retry mechanism.
+
+        // 1) High-level loop breaker for repeated successful actions with the
+        //    same semantic target (description-based comparison).
+        //    If the agent is about to perform the EXACT same action as the
+        //    previous step (same type, same target element), and that previous
+        //    action was successful, this is a "doom loop" - the agent lacksn        //    self-awareness that repeating won't yield different results.
         if (prevStep.success && this.isIdenticalAction(prevAction, nextAction)) {
           // Inject a system warning and force re-planning
           const warningMessage = [
@@ -1041,6 +1038,42 @@ export class McpTools {
 
           // Replace nextAction with the alternative
           Object.assign(nextAction, alternativeAction);
+        } else {
+          // 2) Selector-based loop breaker for failed actions. Even if the
+          //    command description changes (e.g., "Click Go button" vs
+          //    "Click el_28"), if they resolve to the same underlying selector
+          //    (e.g., "#Btn_go_input") and the previous attempt FAILED, we
+          //    should not let the agent hammer the same element again.
+
+          // Resolve the current action's target to a concrete selector string
+          // using the latest observation snapshot.
+          let nextTargetResolved: string | null = null;
+          if ((nextAction as any).selector) {
+            nextTargetResolved = String((nextAction as any).selector);
+          } else if ((nextAction as any).elementId) {
+            const rawId = String((nextAction as any).elementId);
+            const match = rawId.match(/^el_(\d+)$/);
+            if (match) {
+              const idx = parseInt(match[1], 10);
+              if (!Number.isNaN(idx) && idx >= 0 && idx < elements.length) {
+                const el = elements[idx];
+                nextTargetResolved = el?.selector || el?.cssSelector || el?.xpath || null;
+              }
+            }
+          }
+
+          if (
+            prevStep.action.type === nextAction.type &&
+            !!prevStep.elementInfo?.selector &&
+            !!nextTargetResolved &&
+            prevStep.elementInfo.selector === nextTargetResolved &&
+            !prevStep.success
+          ) {
+            console.warn('Loop detected on same SELECTOR. Forcing skip and marking as failed.');
+            failedElements.add(nextTargetResolved);
+            // Skip directly to the next observe/plan cycle.
+            continue;
+          }
         }
       }
 
