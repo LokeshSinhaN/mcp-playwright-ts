@@ -15,15 +15,36 @@ import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstructio
 
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
+  /**
+   * When the autonomous agent is running we buffer commands for the
+   * current high-level step here instead of writing directly to
+   * sessionHistory. The step is only committed if the action is
+   * ultimately considered successful.
+   */
+  private agentCommandBuffer: ExecutionCommand[] | null = null;
 
   constructor(private readonly browser: BrowserManager, private readonly model?: GenerativeModel) {}
+
+  /**
+   * Centralised history recording so we can transparently switch between
+   * immediate logging (single-step mode) and per-step buffering
+   * (autonomous agent mode).
+   */
+  private recordCommand(cmd: ExecutionCommand | ExecutionCommand[]): void {
+    const cmds = Array.isArray(cmd) ? cmd : [cmd];
+    if (this.agentCommandBuffer) {
+      this.agentCommandBuffer.push(...cmds);
+    } else {
+      this.sessionHistory.push(...cmds);
+    }
+  }
 
   async navigate(url: string): Promise<ExecutionResult> {
     await this.browser.init();
     await this.browser.goto(url);
 
     // Record a high-level navigation step; description is the raw URL or prompt.
-    this.sessionHistory.push({
+    this.recordCommand({
       action: 'navigate',
       target: url,
       description: url,
@@ -64,40 +85,40 @@ export class McpTools {
 
           // Record this as two high-level steps for downstream Selenium
           // generation: open dropdown (click) + select option (click with REAL selector).
-          this.sessionHistory.push(
+          this.recordCommand([
             {
               action: 'click',
               target: dropdownIntent.dropdownLabel,
               // Note: dropdownLabel is semantic text, not a real CSS selector
               // The SeleniumGenerator will handle this via text-based XPath fallback
               selectors: { text: dropdownIntent.dropdownLabel },
-              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`, 
+              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`,
             },
             {
               action: 'click',
               // Use the REAL selector captured during the click, or fall back to
               // a semantic description if keyboard selection was used.
               target: selectionResult.optionSelector || dropdownIntent.optionLabel,
-              selectors: selectionResult.optionSelector 
+              selectors: selectionResult.optionSelector
                 ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel }
                 : { text: dropdownIntent.optionLabel },
-              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`, 
+              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`,
             },
-          );
+          ]);
 
           message = `Selected option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`;
         } else {
           // Dropdown already open; just select the option.
           const selectionResult = await selectOptionInOpenDropdown(page, dropdownIntent.optionLabel);
 
-          this.sessionHistory.push({
+          this.recordCommand({
             action: 'click',
             // Use the REAL selector if we have it, otherwise fall back to semantic target
             target: selectionResult.optionSelector || dropdownIntent.optionLabel,
-            selectors: selectionResult.optionSelector 
+            selectors: selectionResult.optionSelector
               ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel }
               : { text: dropdownIntent.optionLabel },
-            description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`, 
+            description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`,
           });
 
           message = `Selected option "${dropdownIntent.optionLabel}" from the currently open dropdown`;
@@ -186,7 +207,7 @@ export class McpTools {
           if (selectorToClick) {
             const info = await this.browser.click(selectorToClick);
             const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
-            this.sessionHistory.push({
+            this.recordCommand({
               action: 'click',
               target: robustSelector,
               selectors: {
@@ -229,7 +250,7 @@ export class McpTools {
 
           const info = await this.browser.click(selectorToClick);
           const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
-          this.sessionHistory.push({
+          this.recordCommand({
             action: 'click',
             target: robustSelector,
             selectors: {
@@ -282,7 +303,7 @@ export class McpTools {
     try {
       const info = await this.browser.click(selector);
       const robustSelector = info.selector || info.cssSelector || info.xpath || selector;
-      this.sessionHistory.push({
+      this.recordCommand({
         action: 'click',
         target: robustSelector,
         selectors: {
@@ -694,7 +715,7 @@ export class McpTools {
       // Step 4: Execute Click (Unique Match / Intelligent Locator)
       const info = await this.browser.click(selectorToClick);
       const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
-      this.sessionHistory.push({
+      this.recordCommand({
         action: 'click',
         target: robustSelector,
         selectors: {
@@ -748,7 +769,7 @@ export class McpTools {
       const info = await this.browser.type(selector, text);
       
       const robustSelector = info.cssSelector || selector;
-      this.sessionHistory.push({
+      this.recordCommand({
         action: 'type',
         target: robustSelector,
         value: text,
@@ -965,16 +986,31 @@ export class McpTools {
       let actionError: string | undefined;
       let stateChanged = false;
 
-      let retryCount = 0;
-      let actionSuccess = false;
-      let actionMessage = '';
+    let retryCount = 0;
+    let actionSuccess = false;
+    let actionMessage = '';
+    // Commands recorded during the final successful attempt for this step.
+    let stepCommands: ExecutionCommand[] | null = null;
 
-      while (retryCount <= maxRetries && !actionSuccess) {
+    while (retryCount <= maxRetries && !actionSuccess) {
          try {
+             // Buffer commands for this specific attempt so failed retries
+             // do not pollute the final Selenium history.
+             this.agentCommandBuffer = [];
+
              const result = await this.executeAgentAction(nextAction, elements, retryCount, failedElements);
+
+             const buffered = this.agentCommandBuffer;
+             this.agentCommandBuffer = null;
+
              actionSuccess = result.success;
              actionMessage = result.message;
              elementInfo = result.elementInfo;
+
+             if (actionSuccess && buffered && buffered.length) {
+               // Only keep commands from the last successful attempt.
+               stepCommands = [...buffered];
+             }
 
              if (!actionSuccess && result.error) {
                 actionError = result.error;
@@ -993,6 +1029,9 @@ export class McpTools {
                  finalSummary = 'Data extracted successfully. Agent stopping to prevent looping.';
              }
          } catch (err) { 
+            // Ensure we never leak a partially-filled buffer across attempts.
+            this.agentCommandBuffer = null;
+
             actionError = err instanceof Error ? err.message : String(err);
             retryCount++;
             if (retryCount <= maxRetries) {
@@ -1012,6 +1051,19 @@ export class McpTools {
          }
       }
       
+      // Commit only successful, state-changing commands into the agent history.
+      const shouldCommitCommands =
+        actionSuccess &&
+        (
+          stateChanged ||
+          // Scrape actions are terminal and meaningful even without URL/DOM heuristics.
+          nextAction.type === 'scrape_data'
+        );
+
+      if (shouldCommitCommands && stepCommands && stepCommands.length) {
+        this.sessionHistory.push(...stepCommands);
+      }
+
       // LOG & NOTIFY
       actionHistory.push(this.describeAction(nextAction, actionSuccess));
       const stepResult: AgentStepResult = {
@@ -1543,7 +1595,7 @@ export class McpTools {
               text: triggerInfo.text
           } : { css: trigger };
           
-          this.sessionHistory.push({ 
+          this.recordCommand({ 
             action: 'click', 
             target: trigger,
             selectors: triggerSelectors,
@@ -1551,7 +1603,7 @@ export class McpTools {
           });
           
           if (finalOptionSelector) {
-              this.sessionHistory.push({ 
+              this.recordCommand({ 
                   action: 'click', 
                   target: finalOptionSelector, // REAL SELECTOR
                   selectors: { css: finalOptionSelector, xpath: selectionResult.optionXpath, text: action.option }, 
@@ -1559,7 +1611,7 @@ export class McpTools {
               });
           } else {
               // Fallback only if absolutely necessary
-              this.sessionHistory.push({ 
+              this.recordCommand({ 
                   action: 'type', 
                   target: trigger,
                   value: action.option,
@@ -1606,7 +1658,7 @@ export class McpTools {
               // "examine" action type to stay within the ExecutionCommand
               // union while still mapping to scrape-like behaviour in the
               // Selenium generator.
-              this.sessionHistory.push({
+              this.recordCommand({
                   action: 'examine',
                   target: 'page_content',
                   description: action.instruction,
@@ -1631,7 +1683,7 @@ export class McpTools {
       }
 
       case 'wait':
-          this.sessionHistory.push({ action: 'wait', waitTime: action.durationMs / 1000, description: 'Wait' });
+          this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000, description: 'Wait' });
           await page.waitForTimeout(action.durationMs);
           return { success: true, message: 'Waited' };
       
