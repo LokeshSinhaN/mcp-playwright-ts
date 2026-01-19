@@ -994,6 +994,56 @@ export class McpTools {
           break;
       }
 
+      // ═══════════════════════════════════════════════════════════════════
+      // LOOP BREAKER: Prevent mindless repetition of the same action
+      // ═══════════════════════════════════════════════════════════════════
+      // If the agent is about to perform the EXACT same action as the
+      // previous step (same type, same target element), and that previous
+      // action was successful, this is a "doom loop" - the agent lacks
+      // self-awareness that repeating won't yield different results.
+      //
+      // We intercept and force re-planning with an explicit warning.
+      if (steps.length > 0) {
+        const prevStep = steps[steps.length - 1];
+        const prevAction = prevStep.action;
+        
+        // Only intervene if previous action succeeded - failures are already
+        // handled by the retry mechanism.
+        if (prevStep.success && this.isIdenticalAction(prevAction, nextAction)) {
+          // Inject a system warning and force re-planning
+          const warningMessage = [
+            `⚠️ LOOP DETECTED: You just performed this exact action in Step ${prevStep.stepNumber}.`,
+            `Previous action: ${this.describeAction(prevAction, true)}`,
+            `It succeeded but did not advance your goal.`,
+            `DO NOT REPEAT IT. Try a different approach:`,
+            `- If you clicked an input, try TYPING into it instead`,
+            `- If you clicked a button, try a DIFFERENT button`,
+            `- If you're stuck, use SCRAPE_DATA or FINISH`,
+            `Think creatively - what would a human do differently?`,
+          ].join(' ');
+
+          // Re-plan with the warning injected into the history
+          const warningHistory = [...actionHistory, warningMessage];
+          const alternativeAction = await this.planNextAgentAction(
+            goal,
+            elements,
+            warningHistory,
+            failedElements,
+            screenshot,
+          );
+
+          // Use the alternative action and broadcast the intervention
+          if (onThought) {
+            try {
+              onThought(warningMessage, alternativeAction);
+            } catch {/* ignore */}
+          }
+
+          // Replace nextAction with the alternative
+          Object.assign(nextAction, alternativeAction);
+        }
+      }
+
       // ACT
       const urlBefore = page.url();
       let urlAfter = urlBefore;
@@ -1104,16 +1154,43 @@ export class McpTools {
       }
     }
 
-    // ... (Generate Selenium code logic) ...
+    // Generate Selenium code if requested and there's command history to convert
+    let seleniumCode: string | undefined;
+    if (generateSelenium && this.sessionHistory.length > 0) {
+      try {
+        const seleniumResult = await this.generateSelenium();
+        seleniumCode = seleniumResult.seleniumCode;
+      } catch (err) {
+        console.warn('Failed to generate Selenium code:', err);
+      }
+    }
+
+    // GOAL-ORIENTED SUCCESS DETECTION
+    // A session is successful ONLY if:
+    // 1. The agent explicitly triggered the 'finish' action with a completion summary, OR
+    // 2. A specific stop condition was met (like successful scraping)
+    //
+    // If the loop terminated because maxSteps was reached WITHOUT the agent
+    // calling finish, we treat this as a FAILURE and report it truthfully.
+    let actualSuccess = isFinished;
+    let actualSummary = finalSummary || this.generateSessionSummary(steps, goal);
+
+    if (!isFinished) {
+      // Agent did NOT explicitly finish - this means it either:
+      // - Hit the maxSteps limit, or
+      // - Encountered an unrecoverable error
+      actualSuccess = false;
+      actualSummary = `FAILED: Maximum step limit (${maxSteps}) reached without completing the goal. ${actualSummary}`;
+    }
     
     return {
-        success: isFinished || steps.some(s => s.success),
-        summary: finalSummary || this.generateSessionSummary(steps, goal),
+        success: actualSuccess,
+        summary: actualSummary,
         goal,
         totalSteps: stepNumber,
         steps,
-        commands: [...this.sessionHistory], // Return the full fixed history
-        seleniumCode: undefined, // Will be filled by generateSelenium logic
+        commands: [...this.sessionHistory],
+        seleniumCode,
         screenshot: observation?.screenshot,
         selectors: observation?.selectors
     };
@@ -1784,6 +1861,56 @@ export class McpTools {
       .sort((a, b) => b.score - a.score);
 
     return candidates.length > 0 ? candidates[0].el : null;
+  }
+
+  /**
+   * Check if two agent actions are functionally identical (same type,
+   * targeting the same element). Used by the loop breaker to detect
+   * when the agent is mindlessly repeating itself.
+   */
+  private isIdenticalAction(prev: AgentAction, next: AgentAction): boolean {
+    // Different action types = not identical
+    if (prev.type !== next.type) return false;
+
+    // For actions that target elements, check if they target the same element
+    switch (prev.type) {
+      case 'click':
+      case 'type':
+      case 'select_option': {
+        const prevTarget = (prev as any).elementId || (prev as any).selector || (prev as any).semanticTarget;
+        const nextTarget = (next as any).elementId || (next as any).selector || (next as any).semanticTarget;
+        
+        // If both have targets, compare them
+        if (prevTarget && nextTarget) {
+          // Normalize: strip quotes, lowercase, trim for semantic comparison
+          const normPrev = String(prevTarget).toLowerCase().replace(/["']/g, '').trim();
+          const normNext = String(nextTarget).toLowerCase().replace(/["']/g, '').trim();
+          return normPrev === normNext;
+        }
+        return false;
+      }
+
+      case 'navigate': {
+        return (prev as any).url === (next as any).url;
+      }
+
+      case 'scroll': {
+        return (prev as any).direction === (next as any).direction;
+      }
+
+      case 'scrape_data': {
+        // Scraping is terminal, but if somehow repeated, treat as identical
+        return true;
+      }
+
+      case 'wait':
+      case 'finish':
+        // These are considered unique each time
+        return false;
+
+      default:
+        return false;
+    }
   }
 
   /**
