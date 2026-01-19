@@ -272,7 +272,7 @@ export async function selectFromDropdown(
     // If the wait fails, we still attempt to click/press; some UIs mount late.
   }
 
-  // 2. SPECIAL CASE: native <select> controls. Prefer selectOption() over
+  // 2. SPECIAL CASE: native <select> controls. Prefer selectOption over
   // clicking menus rendered by the OS, which Playwright cannot see.
   try {
     const handle = await triggerLocator.elementHandle();
@@ -286,8 +286,26 @@ export async function selectFromDropdown(
         // strongly preferring precise matches.
         try {
           await triggerLocator.selectOption({ label: optionText });
-          // For native <select>, we use the option[value] or option text as selector
-          const optionSelector = `${trigger} option:checked`;
+
+          // IMPORTANT: capture the *actual* option element that became selected,
+          // not a generic ":checked" pseudo-selector. Using "#sortBy option:checked"
+          // in Selenium causes it to always point at whatever is currently
+          // selected (e.g., the default "ID"), which does NOT reliably
+          // reproduce the agent behaviour.
+          let optionSelector: string | undefined;
+          try {
+            const selectedOption = triggerLocator.locator('option:checked').first();
+            if (await selectedOption.count()) {
+              const optHandle = await selectedOption.elementHandle();
+              if (optHandle) {
+                optionSelector = await generateCssForHandle(optHandle);
+              }
+            }
+          } catch {
+            // If anything goes wrong while resolving the concrete option
+            // selector, we still rely on the selectOption effect itself.
+          }
+
           return { method: 'native-select', optionSelector };
         } catch {
           const escaped = optionText
@@ -317,7 +335,25 @@ export async function selectFromDropdown(
         const firstSelect = innerSelect.first();
         try {
           await firstSelect.selectOption({ label: optionText });
-          return { method: 'native-select', optionSelector: `${trigger} select option:checked` };
+
+          // As above, resolve the concrete selected <option> element so the
+          // Selenium generator gets a stable, specific locator instead of a
+          // dynamic ":checked" pseudo-class.
+          let optionSelector: string | undefined;
+          try {
+            const selectedOption = firstSelect.locator('option:checked').first();
+            if (await selectedOption.count()) {
+              const optHandle = await selectedOption.elementHandle();
+              if (optHandle) {
+                optionSelector = await generateCssForHandle(optHandle);
+              }
+            }
+          } catch {
+            // Ignore selector capture failures; the visual selection still
+            // occurred via selectOption.
+          }
+
+          return { method: 'native-select', optionSelector };
         } catch {
           const escaped = optionText
             .trim()
