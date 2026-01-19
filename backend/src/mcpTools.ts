@@ -1473,6 +1473,12 @@ export class McpTools {
         if (!trigger) {
           return { success: false, message: 'No dropdown trigger found', error: 'Missing trigger' };
         }
+        
+        // Capture URL before the selection so we can detect navigation even if
+        // the DOM label on the dropdown fails to update 
+        // case where the page navigates correctly but the trigger text is stale).
+        const urlBeforeSelection = page.url();
+
         try {
           // 1. EXECUTE SELECTION
           const selectionResult = await selectFromDropdown(page, trigger, action.option);
@@ -1480,6 +1486,10 @@ export class McpTools {
           // 2. SELF-HEALING VERIFICATION
           // Check if the selection actually "stuck"
           await page.waitForTimeout(1000); // wait for UI update
+          
+          // Capture URL after selection to detect state changes independent of
+          // brittle label text comparisons.
+          const urlAfterSelection = page.url();
           
           const isNativeSelect = await page.locator(trigger).evaluate(el => el.tagName.toLowerCase() === 'select').catch(() => false);
           
@@ -1499,9 +1509,19 @@ export class McpTools {
              }
           }
 
+          // --- STATE-BASED OVERRIDE ---
+          // If the strict text/attribute check failed but the URL changed, we
+          // treat the action as successful based on application state. This
+          // prevents the agent from looping when the app navigated correctly
+          // but the label is glitchy or delayed.
+          if (!verificationPassed && urlBeforeSelection !== urlAfterSelection) {
+             verificationPassed = true;
+          }
+
           if (!verificationPassed) {
              // THROW ERROR to force the Agent to retry (Self-Healing)
-             // This stops it from moving to "click search" blindly
+             // This stops it from moving to "click search" blindly when *no*
+             // meaningful state change was detected.
              throw new Error(`Verification failed: Dropdown text did not update to "${action.option}" after selection.`);
           }
 
