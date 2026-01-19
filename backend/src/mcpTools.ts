@@ -1122,7 +1122,7 @@ export class McpTools {
 
     // Build element context for LLM
     const visibleElements = elements.filter(el => el.visible !== false && el.isVisible !== false);
-    const limitedElements = visibleElements.slice(0, 150).map((el, idx) => ({
+    const limitedElements = visibleElements.slice(0, 500).map((el, idx) => ({
       id: `el_${idx}`,
       tag: el.tagName,
       text: (el.text || '').slice(0, 100),

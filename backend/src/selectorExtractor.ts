@@ -20,13 +20,30 @@ export class SelectorExtractor {
         'li[onclick]',
         'img[onclick]',
         'div[onclick]',
+        'span[onclick]',
+        'td[onclick]',
+        'tr[onclick]',
         // Button-like and icon/search affordances commonly used with event delegation.
         '[class*="btn" i]',
         '[class*="button" i]',
         '[class*="icon" i]',
         '[class*="search" i]',
+        '[class*="link" i]',
+        '[class*="click" i]',
+        // ASP.NET LinkButton and similar server controls
+        'a[href*="javascript:__doPostBack"]',
+        'a[href*="javascript:WebForm_DoPostBackWithOptions"]',
+        '[id*="LinkButton"]',
+        '[id*="lnk"]',
+        // Elements with pointer cursor (commonly clickable)
+        '[style*="cursor: pointer"]',
+        '[style*="cursor:pointer"]',
         // SVG icons that explicitly indicate pointer interactions.
-        'svg[cursor="pointer"]'
+        'svg[cursor="pointer"]',
+        'svg[style*="cursor: pointer"]',
+        'svg[style*="cursor:pointer"]',
+        // Any element with tabindex (keyboard-accessible, often clickable)
+        '[tabindex]:not([tabindex="-1"])'
       ].join(', ')
     );
 
