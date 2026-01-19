@@ -760,6 +760,11 @@ export class McpTools {
   /**
    * Type into an element. Similar to click(), we always return a rich
    * ExecutionResult and never throw for normal locator issues.
+   *
+   * Universal "Commit Protocol": after typing the requested text, we
+   * automatically press Enter to commit the value (e.g., submit search
+   * queries or dates) so sites that rely on Enter/focus-change handlers
+   * register the input.
    */
   async type(selector: string, text: string): Promise<ExecutionResult> {
     const page = this.browser.getPage();
@@ -767,12 +772,24 @@ export class McpTools {
 
     try {
       const info = await this.browser.type(selector, text);
-      
+
+      // Commit Protocol: press Enter after typing to trigger common
+      // on-change/on-submit handlers (search boxes, date pickers, etc.).
+      try {
+        await page.keyboard.press('Enter');
+      } catch {
+        // Keyboard press is best-effort; failures here should not
+        // invalidate an otherwise successful type action.
+      }
+
       const robustSelector = info.cssSelector || selector;
+      // Record the committed value with an explicit newline so that
+      // generated Selenium scripts also send an Enter key.
+      const committedValue = `${text}\n`;
       this.recordCommand({
         action: 'type',
         target: robustSelector,
-        value: text,
+        value: committedValue,
         selectors: {
           css: info.cssSelector ?? info.selector,
           xpath: info.xpath,
@@ -783,11 +800,11 @@ export class McpTools {
       });
 
       const screenshot = await this.browser.screenshot();
-      return { 
-        success: true, 
-        message: `Typed into ${selector}`, 
+      return {
+        success: true,
+        message: `Typed into ${selector}`,
         screenshot,
-        selectors: [info] 
+        selectors: [info],
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -803,7 +820,7 @@ export class McpTools {
         message: msg,
         error: msg,
         screenshot,
-        selectors
+        selectors,
       };
     }
   }
