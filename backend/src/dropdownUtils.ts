@@ -227,13 +227,47 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
           await option.click({ timeout: 1500 });
           return { method: 'click', optionSelector };
         } catch {
-          // if this specific option fails, continue to keyboard fallback
+          // if this specific option fails, continue to visual-scan fallback
           break;
         }
       }
     }
   } catch {
-    // If menu containers are not found, continue to keyboard fallback.
+    // If menu containers are not found, continue to visual-scan fallback.
+  }
+
+  // Strategy B2 (Visual Scan): as a last-resort DOM-based strategy before we
+  // fall back to raw keyboard typing, perform a loose text-based scan across
+  // the visible page content. This mirrors how a human would "just click the
+  // text" when the menu is rendered with non-semantic tags (div/span/a) or
+  // non-standard classes.
+  try {
+    const looseMatches = page.locator('*').filter({ hasText: optionRe });
+    const maxToCheck = Math.min(await looseMatches.count(), 20);
+
+    for (let i = 0; i < maxToCheck; i++) {
+      const candidate = looseMatches.nth(i);
+      if (!(await candidate.isVisible())) continue;
+
+      try {
+        const handle = await candidate.elementHandle();
+        let optionSelector: string | undefined;
+        if (handle) {
+          try {
+            optionSelector = await generateCssForHandle(handle);
+          } catch {
+            // If selector generation fails, we still click but won't have the selector
+          }
+        }
+
+        await candidate.click({ timeout: 1500, force: true });
+        return { method: 'click', optionSelector };
+      } catch {
+        // Try next candidate if this one fails.
+      }
+    }
+  } catch {
+    // If the visual scan fails entirely, fall through to keyboard fallback.
   }
 
   // Strategy C (universal fallback): as a last resort for highly
@@ -243,7 +277,31 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
   // brittle, site-specific selectors.
   await page.keyboard.type(optionText, { delay: 50 });
   await page.keyboard.press('Enter');
-  return { method: 'keyboard' };
+
+  // After the keyboard interaction, attempt a best-effort post-action scan to
+  // infer which element likely represents the selected option so downstream
+  // tools can record a concrete selector instead of only noting that keyboard
+  // input occurred.
+  let optionSelector: string | undefined;
+  try {
+    const postActionCandidate = page.locator('*').filter({ hasText: optionRe }).first();
+    if (await postActionCandidate.count()) {
+      const handle = await postActionCandidate.elementHandle();
+      if (handle) {
+        try {
+          optionSelector = await generateCssForHandle(handle);
+        } catch {
+          // Ignore selector capture failures; the visual selection still
+          // occurred via keyboard interaction.
+        }
+      }
+    }
+  } catch {
+    // Best-effort only; if this fails we still return a keyboard-based result
+    // without a concrete selector.
+  }
+
+  return { method: 'keyboard', optionSelector };
 }
 
 /**
@@ -385,58 +443,14 @@ export async function selectFromDropdown(
   } catch {
     // ignore but continue; some dropdowns open via focus/keyboard only
   }
-  
+
   await page.waitForTimeout(500); // Wait for animation
 
-  // --- IMPROVED SELECTION LOGIC ---
-  
-  // Try to find the option explicitly first (to capture its selector)
-  // We do this BEFORE interaction to ensure we have the specific element handle.
-  const escaped = optionText.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
-  const optionRe = new RegExp(escaped, 'i');
-  
-  // Broad search for the option in likely containers
-  const candidateOption = page.locator([
-    '[role="option"]', 'li', 'a', 'div[role="button"]', 
-    '.dropdown-item', '.MuiMenuItem-root'
-  ].join(', ')).filter({ hasText: optionRe }).first();
-
-  let capturedSelector: string | undefined;
-
-  // Attempt to resolve the REAL selector for the option
-  try {
-    if (await candidateOption.count() > 0 && await candidateOption.isVisible()) {
-      const handle = await candidateOption.elementHandle();
-      if (handle) {
-        capturedSelector = await generateCssForHandle(handle);
-      }
-    }
-  } catch (e) {
-    console.log("Could not pre-calculate selector", e);
-  }
-
-  // PERFORM ACTION
-  // If we found the element, CLICK it (Most reliable & gives us a selector)
-  if (capturedSelector) {
-    await candidateOption.click({ force: true });
-    return { method: 'click', optionSelector: capturedSelector };
-  }
-
-  // Fallback: If we couldn't find/click the element, use Keyboard
-  // BUT... we still need to try and find a selector for the report/selenium code
-  await page.keyboard.type(optionText);
-  await page.keyboard.press('Enter');
-
-  // Post-action: Try to find what we just selected to avoid hallucination
-  if (!capturedSelector) {
-    try {
-      const hiddenOption = page.locator(`text=${optionText}`).first();
-      const handle = await hiddenOption.elementHandle();
-      if (handle) capturedSelector = await generateCssForHandle(handle);
-    } catch {}
-  }
-
-  return { method: 'keyboard', optionSelector: capturedSelector };
+  // 4. With the dropdown open, use the shared option-selection strategies
+  // (roles, menu containers, visual scan, keyboard) to pick the option. This
+  // centralises the behaviour used both for "open and select" and
+  // "select-only" flows so improvements apply everywhere.
+  return await selectOptionByStrategies(page, optionText);
 }
 
 /**
