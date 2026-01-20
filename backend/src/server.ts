@@ -70,8 +70,8 @@ function detectMultiStepPrompt(prompt: string): boolean {
   const connectorCount = complexConnectors.reduce((count, word) =>
     lower.includes(word) ? count + 1 : count, 0);
 
-  // If we see 2 or more connectors, it's a workflow.
-  if (connectorCount >= 2) return true;
+  // If we see 1 or more connectors, it's a workflow.
+  if (connectorCount >= 1) return true;
 
   // 3. Action Verb Density
   const actionVerbs = [
@@ -86,8 +86,8 @@ function detectMultiStepPrompt(prompt: string): boolean {
     return regex.test(lower);
   }).length;
 
-  // Reduced threshold: If prompt has 2+ action verbs, treat as Agent task
-  if (actionCount >= 2) return true;
+  // Reduced threshold: If prompt has 1+ action verbs, treat as Agent task
+  if (actionCount >= 1) return true;
 
   return false;
 }
@@ -680,42 +680,16 @@ export function createServer(port: number, chromePath?: string) {
           if (isMultiStep) {
             // Auto-route to autonomous agent for complex tasks
             broadcast({
-              type: 'action',
+              type: 'log',
               timestamp: new Date().toISOString(),
-              message: `ai_agent (auto-detected multi-step): "${prompt.slice(0, 100)}"`
+              message: `Prompt detected as multi-step. Starting agent: "${prompt.slice(0, 100)}"`
             });
 
             const config: AgentConfig = {
               maxSteps: agentConfig?.maxSteps ?? 20,
-              // REDUCE retries to 1. If it fails once, the LLM should re-plan immediately.
               maxRetriesPerAction: 1,
               generateSelenium: agentConfig?.generateSelenium ?? true,
-              onStepComplete: (step) => {
-                broadcast({
-                  type: 'log',
-                  timestamp: new Date().toISOString(),
-                  message: `Step ${step.stepNumber}: ${step.message}`,
-                  data: {
-                    stepNumber: step.stepNumber,
-                    action: step.action,
-                    success: step.success,
-                    stateChanged: step.stateChanged,
-                    retryCount: step.retryCount,
-                  }
-                });
-              },
-              onThought: (thought, action) => {
-                broadcast({
-                  type: 'log',
-                  timestamp: new Date().toISOString(),
-                  message: `ai_thought: ${thought.slice(0, 200)}`,
-                  data: {
-                    role: 'agent-reasoning',
-                    thought,
-                    actionType: action.type,
-                  }
-                });
-              }
+              broadcast,
             };
 
             const agentResult: AgentSessionResult = await tools.runAutonomousAgent(prompt, config);
@@ -746,9 +720,9 @@ export function createServer(port: number, chromePath?: string) {
           } else {
             // Single-step mode for simple tasks
             broadcast({
-              type: 'action',
+              type: 'log',
               timestamp: new Date().toISOString(),
-              message: `ai_plan "${prompt.slice(0, 120)}"`
+              message: `Prompt detected as single-step. Planning one action.`
             });
 
             result = await handleAiAction(prompt, selector);
@@ -769,38 +743,9 @@ export function createServer(port: number, chromePath?: string) {
           // Build agent config with real-time broadcasting
           const config: AgentConfig = {
             maxSteps: agentConfig?.maxSteps ?? 20,
-            // REDUCE retries to 1. If it fails once, the LLM should re-plan immediately.
             maxRetriesPerAction: 1,
             generateSelenium: agentConfig?.generateSelenium ?? true,
-            onStepComplete: (step) => {
-              // Broadcast each step as it completes
-              broadcast({
-                type: 'log',
-                timestamp: new Date().toISOString(),
-                message: `Step ${step.stepNumber}: ${step.message}`,
-                data: {
-                  stepNumber: step.stepNumber,
-                  action: step.action,
-                  success: step.success,
-                  stateChanged: step.stateChanged,
-                  retryCount: step.retryCount,
-                  recoveryAttempt: step.recoveryAttempt,
-                }
-              });
-            },
-            onThought: (thought, action) => {
-              // Broadcast agent reasoning
-              broadcast({
-                type: 'log',
-                timestamp: new Date().toISOString(),
-                message: `ai_thought: ${thought.slice(0, 200)}`,
-                data: {
-                  role: 'agent-reasoning',
-                  thought,
-                  actionType: action.type,
-                }
-              });
-            }
+            broadcast,
           };
 
           // --- START SCREENSHOT STREAM ---

@@ -122,36 +122,24 @@ export class BrowserManager {
 
   async screenshot(): Promise<string> {
     const page = this.getPage();
-
     try {
-      // For live preview, capture the viewport only. It's much faster than
-      // a full-page screenshot, which can time out on complex sites while
-      // waiting for fonts or stitching large images.
-      const buf = await page.screenshot({
-        fullPage: false,
-        timeout: 2500,
-        animations: 'disabled'
-      });
-      const base64 = buf.toString('base64');
-      const dataUrl = `data:image/png;base64,${base64}`;
-      this.state.lastScreenshot = dataUrl;
-      return dataUrl;
+        if (page.isClosed()) return ''; // Handle closed page gracefully
+
+        // Reduced timeout to fail fast without hanging the agent
+        const buf = await page.screenshot({ 
+            fullPage: false, 
+            timeout: 1500,
+            animations: 'disabled' 
+        });
+        const dataUrl = `data:image/png;base64,${buf.toString('base64')}`;
+        this.state.lastScreenshot = dataUrl;
+        return dataUrl;
     } catch (err) {
-      // If screenshot capture times out, fall back to the last successful
-      // screenshot instead of failing. This keeps the automation flow alive
-      // even when the visual snapshot is slightly stale.
-      console.warn(
-        'BrowserManager.screenshot failed, using lastScreenshot if available:',
-        err
-      );
-      if (this.state.lastScreenshot) {
-        return this.state.lastScreenshot;
-      }
-      // As an absolute fallback, return an empty data URL so callers still
-      // receive a string and do not crash.
-      return 'data:image/png;base64,';
+        // Return the last known good screenshot instead of crashing
+        // or a blank placeholder if none exists
+        return this.state.lastScreenshot || 'data:image/png;base64,';
     }
-  }
+}
 
   /**
    * Smart locator resolution that:
@@ -164,6 +152,22 @@ export class BrowserManager {
   private async smartLocate(selector: string, timeoutMs: number): Promise<Locator> {
     const page = this.getPage();
     const frames = [page, ...page.frames().filter(f => f !== page.mainFrame())];
+
+    // --- CRASH FIX ---
+    // Guard against undefined/null selectors which cause the "reading 'trim'" error.
+    if (!selector || typeof selector !== 'string') {
+        console.warn('smartLocate received invalid selector:', selector);
+        // Return a dummy locator that will simply fail to count/click gracefully
+        // instead of crashing the entire Node process.
+        return page.locator('body').filter({ hasText: '_____NON_EXISTENT_____' });
+    }
+
+    // Normalize selector
+    const raw = selector.trim(); 
+    if (!raw) {
+         return page.locator('body').filter({ hasText: '_____NON_EXISTENT_____' });
+    }
+    // -----------------
 
     // Helper to generate candidate locators for a given frame/page
     const getCandidates = (scope: Page | typeof frames[0]) => {

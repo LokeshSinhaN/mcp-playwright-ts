@@ -174,4 +174,6 @@ export interface AgentConfig {
   onStepComplete?: (step: AgentStepResult) => void;
   /** Callback for agent thoughts/reasoning */
   onThought?: (thought: string, action: AgentAction) => void;
+  /** Direct access to the WebSocket broadcast function for real-time logging. */
+  broadcast?: (msg: WebSocketMessage) => void;
 }
