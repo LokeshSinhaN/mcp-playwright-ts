@@ -1307,10 +1307,6 @@ export class McpTools {
     // string matching against the current DOM, without involving the LLM at
     // all. This dramatically reduces JSON parse errors and speeds up flows
     // like the CyberMed EHR Practice → Appointment View navigation.
-    const directAction = this.findDirectLabelClick(goal, limitedElements, failedElements);
-    if (directAction) {
-      return directAction;
-    }
 
     // UPDATED PROMPT: INTELLIGENT STRATEGY SWITCHING
     const prompt = [
@@ -2245,23 +2241,24 @@ export class McpTools {
     urlAfter: string,
     action: AgentAction
   ): Promise<boolean> {
-    // URL change is a definite state change
+    // 1. URL change is the gold standard
     if (urlBefore !== urlAfter) {
       return true;
     }
 
-    // Navigate actions should always result in URL change
+    // 2. Navigation actions must change URL
     if (action.type === 'navigate') {
-      return urlBefore !== urlAfter;
+      return false; // If URL didn't change, navigation failed
     }
 
-    // For click/type, we assume state changed if the action succeeded
-    // A more sophisticated implementation could compare DOM snapshots
+    // 3. For clicks/types, DO NOT assume success blindly. 
+    // If the URL is identical, we treat it as "no change" to force the agent 
+    // to re-evaluate the page content in the next step.
     if (action.type === 'click' || action.type === 'type') {
-      return true; // Optimistic - assume UI updated
+      return false; // Force the AI to "look" again to confirm the action worked
     }
 
-    // Scroll and wait don't typically change URL
+    // Scroll and wait are passive
     if (action.type === 'scroll' || action.type === 'wait') {
       return true;
     }
