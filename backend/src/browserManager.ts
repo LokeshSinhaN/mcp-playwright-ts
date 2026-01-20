@@ -493,16 +493,16 @@ export class BrowserManager {
   }
 
   async type(selector: string, text: string): Promise<ElementInfo> {
-    // 1. Find best locator
+    // 1. Find best locator using smart fuzzy matching
     const base = await this.smartLocate(selector, this.defaultTimeout);
     
-    // 2. Drill down to input if it's a wrapper
+    // 2. Drill down to input if the selector points to a wrapper/container
     const locator = await this.resolveFillTarget(base);
 
-    // 3. Type
+    // 3. Ensure visibility
     await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
     
-    // Extract info
+    // Extract info for return
     let info: ElementInfo | undefined;
     try {
       const handle = await locator.elementHandle();
@@ -512,13 +512,36 @@ export class BrowserManager {
       }
     } catch (e) {}
 
+    // 4. AGGRESSIVE CLEAR STRATEGY (Universal Fix)
+    // Standard .fill() often fails on masked inputs (like dates). 
+    // We simulate a human "Select All + Delete" to guarantee a clean slate.
     try {
-      await locator.fill('');
+      await locator.focus(); // Ensure focus
+      
+      // Attempt standard clear first
+      await locator.fill(''); 
+      
+      // Double check: if value persists, use keyboard shortcuts
+      const val = await locator.inputValue().catch(() => '');
+      if (val) {
+          // Universal "Select All + Delete" works on almost all OS/Browsers
+          await locator.press('Control+A'); 
+          await locator.press('Backspace');
+      }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`Unable to fill element found by "${selector}": ${msg}`);
+      console.warn(`Non-fatal error during input clearing for "${selector}": ${err}`);
     }
-    await locator.type(text, { timeout: this.defaultTimeout });
+
+    try {
+        // Now type the actual text
+        await locator.type(text, { timeout: this.defaultTimeout });
+        
+        // Universal Commit: Press Enter to trigger any "on change" or "search" listeners
+        await locator.press('Enter');
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`Unable to fill element found by "${selector}": ${msg}`);
+    }
     
     return info || { tagName: 'input', attributes: {}, cssSelector: selector };
   }

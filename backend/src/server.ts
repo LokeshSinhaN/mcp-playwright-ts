@@ -687,7 +687,8 @@ export function createServer(port: number, chromePath?: string) {
 
             const config: AgentConfig = {
               maxSteps: agentConfig?.maxSteps ?? 20,
-              maxRetriesPerAction: agentConfig?.maxRetriesPerAction ?? 3,
+              // REDUCE retries to 1. If it fails once, the LLM should re-plan immediately.
+              maxRetriesPerAction: 1,
               generateSelenium: agentConfig?.generateSelenium ?? true,
               onStepComplete: (step) => {
                 broadcast({
@@ -768,7 +769,8 @@ export function createServer(port: number, chromePath?: string) {
           // Build agent config with real-time broadcasting
           const config: AgentConfig = {
             maxSteps: agentConfig?.maxSteps ?? 20,
-            maxRetriesPerAction: agentConfig?.maxRetriesPerAction ?? 3,
+            // REDUCE retries to 1. If it fails once, the LLM should re-plan immediately.
+            maxRetriesPerAction: 1,
             generateSelenium: agentConfig?.generateSelenium ?? true,
             onStepComplete: (step) => {
               // Broadcast each step as it completes

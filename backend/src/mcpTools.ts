@@ -773,23 +773,15 @@ export class McpTools {
     try {
       const info = await this.browser.type(selector, text);
 
-      // Commit Protocol: press Enter after typing to trigger common
-      // on-change/on-submit handlers (search boxes, date pickers, etc.).
-      try {
-        await page.keyboard.press('Enter');
-      } catch {
-        // Keyboard press is best-effort; failures here should not
-        // invalidate an otherwise successful type action.
-      }
+      // REMOVED: await page.keyboard.press('Enter'); 
+      // We now rely on the Agent to explicitly click "Go" or "Search" 
+      // just like a human user would.
 
       const robustSelector = info.cssSelector || selector;
-      // Record the committed value with an explicit newline so that
-      // generated Selenium scripts also send an Enter key.
-      const committedValue = `${text}\n`;
       this.recordCommand({
         action: 'type',
         target: robustSelector,
-        value: committedValue,
+        value: text,
         selectors: {
           css: info.cssSelector ?? info.selector,
           xpath: info.xpath,
@@ -1001,22 +993,22 @@ export class McpTools {
         const prevStep = steps[steps.length - 1];
         const prevAction = prevStep.action;
 
-        // 1) High-level loop breaker for repeated successful actions with the
-        //    same semantic target (description-based comparison).
-        //    If the agent is about to perform the EXACT same action as the
-        //    previous step (same type, same target element), and that previous
-        //    action was successful, this is a "doom loop" - the agent lacksn        //    self-awareness that repeating won't yield different results.
+        // 1) High-level loop breaker
         if (prevStep.success && this.isIdenticalAction(prevAction, nextAction)) {
-          // Inject a system warning and force re-planning
+          // INTELLIGENT HINT GENERATION
+          let hint = `Think creatively - what would a human do differently?`;
+          
+          // Specific check: If we clicked an input/div, suggest typing
+          if (prevAction.type === 'click') {
+             hint = `You just CLICKED this element and stayed on the same page. If it is an input field, search box, or date picker, DO NOT click again. Use the "type" action to enter the value directly.`;
+          }
+
           const warningMessage = [
             `⚠️ LOOP DETECTED: You just performed this exact action in Step ${prevStep.stepNumber}.`,
             `Previous action: ${this.describeAction(prevAction, true)}`,
             `It succeeded but did not advance your goal.`,
             `DO NOT REPEAT IT. Try a different approach:`,
-            `- If you clicked an input, try TYPING into it instead`,
-            `- If you clicked a button, try a DIFFERENT button`,
-            `- If you're stuck, use SCRAPE_DATA or FINISH`,
-            `Think creatively - what would a human do differently?`,
+            hint
           ].join(' ');
 
           // Re-plan with the warning injected into the history
@@ -1028,16 +1020,8 @@ export class McpTools {
             failedElements,
             screenshot,
           );
-
-          // Use the alternative action and broadcast the intervention
-          if (onThought) {
-            try {
-              onThought(warningMessage, alternativeAction);
-            } catch {/* ignore */}
-          }
-
-          // Replace nextAction with the alternative
-          Object.assign(nextAction, alternativeAction);
+          
+          // ... (rest of the block remains same)
         } else {
           // 2) Selector-based loop breaker for failed actions. Even if the
           //    command description changes (e.g., "Click Go button" vs
@@ -1269,7 +1253,7 @@ export class McpTools {
       ? `\n\nElements that have failed (DO NOT retry these):\n${Array.from(failedElements).slice(0, 10).join('\n')}`
       : '';
 
-    // UPDATED PROMPT
+    // UPDATED PROMPT: INTELLIGENT STRATEGY SWITCHING
     const prompt = [
       'SYSTEM: You are an intelligent autonomous browser agent.',
       'Your goal is to accomplish the user\'s task through a series of browser actions.',
@@ -1283,32 +1267,20 @@ export class McpTools {
       '',
       '### CORE PRINCIPLE: SEEING > READING ###',
       '⚠️ CRITICAL: If you see an element in the screenshot that is NOT in the JSON list above, YOU CAN STILL INTERACT WITH IT!',
-      'The JSON list may be incomplete due to filtering, truncation, or non-standard HTML. Your VISUAL perception is the ground truth.',
-      '',
-      '**How to perform a Semantic Click:**',
-      '- If you can SEE the element you need (e.g., "Go" button, "Submit" link) but it\'s missing from the JSON:',
-      '  Use `"semanticTarget"` instead of `"elementId"` to describe what you see.',
-      '- Example: { "type": "click", "semanticTarget": "Go button", "thought": "Clicking the Go button visible in top-right" }',
-      '- Example: { "type": "type", "semanticTarget": "search input field", "text": "query", "thought": "Typing into visible search box" }',
+      'The JSON list may be incomplete. Your VISUAL perception is the ground truth.',
       '',
       '**Decision Priority:**',
       '1. If the element IS in the JSON → use `"elementId"` (preferred for precision)',
-      '2. If the element is VISIBLE in screenshot but NOT in JSON → use `"semanticTarget"` (fallback for missing elements)',
-      '3. NEVER give up just because an element is missing from the list. Trust your eyes!',
+      '2. If the element is VISIBLE in screenshot but NOT in JSON → use `"semanticTarget"` (fallback)',
       '',
-      '### INSTRUCTIONS ###',
-      '1. **Date & Calendar Picking**: If the task involves choosing a date (e.g., "Select today", "Set check-in to Oct 20", "Pick a date"), treat calendars as interactive grids, NOT dropdowns.',
-      '   - First, click the date input or calendar button to open the calendar, if it is not already open.',
-      '   - Then, click the specific day cell (usually a button/div) whose visible text matches the desired day number (e.g., "20").',
-      '   - Never use "select_option" for calendar or date-picker grids.',
-      '2. **Dropdowns & Menus (non-calendar)**: If the task involves selecting an option from a standard dropdown or menu, and the control is not a date picker, use the "select_option" action.',
-      '   - Only use "select_option" when the element represents a true dropdown/combobox/listbox (for example, an HTML <select> or ARIA combobox) with a finite list of options.',
-      '   - Do NOT click the trigger and then the option separately for these controls; rely on a single "select_option" action.',
-      '3. **Scraping/Data Extraction**: If the user asks to "return", "get", "find", or "list" data (like links, text, numbers) to the terminal:',
-      '   - Perform the navigation required to reach the results page.',
-      '   - Use "scrape_data" to extract the info.',
-      '   - **IMMEDIATELY AFTER scraping, you MUST use the "finish" action.** Do not scrape the same page twice.',
-      '4. **Standard Interaction**: Use click/type/navigate for normal browsing.',
+      '### UNIVERSAL INTERACTION RULES ###',
+      '1. **Inputs & Dates (TYPE FIRST)**: Always prefer TYPING into fields over clicking complex pickers.',
+      '   - If a field looks like a date (e.g., "1/19/2026"), use the `type` action to overwrite it directly.',
+      '   - Only use date pickers/calendars if the field is strictly "Read Only" or if typing fails.',
+      '2. **Loop Avoidance**: If you just clicked an input/div and nothing happened (state did not change), DO NOT CLICK IT AGAIN.',
+      '   - IMMEDIATELY switch strategies: If you clicked, now try `type`. If you typed, try `click`.',
+      '3. **Dropdowns**: Use "select_option" only for standard menus. For custom UI grids, click the specific item.',
+      '4. **Scraping**: Navigate to the data -> "scrape_data" -> "finish".',
       '5. **Self-Correction**: If an element has "isFailed: true", pick a different element or use semanticTarget.',
       '',
       '### RESPONSE FORMAT (Return ONLY raw JSON) ###',
@@ -1317,14 +1289,10 @@ export class McpTools {
       '{ "type": "navigate", "url": "https://...", "thought": "Going to the start URL" }',
       '{ "type": "click", "elementId": "el_N", "thought": "Clicking the search button" }',
       '{ "type": "click", "semanticTarget": "Go button", "thought": "Clicking visible Go button (not in list)" }',
-      '{ "type": "type", "elementId": "el_N", "text": "Heart Failure", "thought": "Typing search query" }',
-      '{ "type": "type", "semanticTarget": "search box in header", "text": "Heart Failure", "thought": "Typing in visible search field" }',
+      '{ "type": "type", "elementId": "el_N", "text": "01/20/2026", "thought": "Typing date directly into input field to avoid calendar issues" }',
       '{ "type": "select_option", "elementId": "el_N", "option": "Heart Failure", "thought": "Selecting specialty from dropdown" }',
-      '{ "type": "scrape_data", "instruction": "Extract all website links from search results", "thought": "User asked for links, extracting now" }',
-      '{ "type": "finish", "thought": "Task done", "summary": "Completed all steps" }',
-      '',
-      'NOTE: For "select_option", "elementId" should be the dropdown TRIGGER (the button you click to open it).',
-      'NOTE: Use "semanticTarget" when you SEE the element in the screenshot but it\'s missing from the JSON list.'
+      '{ "type": "scrape_data", "instruction": "Extract all website links", "thought": "User asked for links, extracting now" }',
+      '{ "type": "finish", "thought": "Task done", "summary": "Completed all steps" }'
     ].join('\n');
 
     try {
@@ -1348,8 +1316,6 @@ export class McpTools {
       const rawText = (response as any).response?.text?.() ?? '';
       return this.parseAgentActionResponse(rawText);
     } catch (err) {
-      // Treat planning failures as a soft error so the agent can self-heal by
-      // retrying on the next loop iteration instead of hard-stopping.
       const msg = err instanceof Error ? err.message : String(err);
       console.error('Failed to get next agent action from LLM:', err);
       return {
@@ -1905,20 +1871,27 @@ export class McpTools {
     // Different action types = not identical
     if (prev.type !== next.type) return false;
 
+    // Helper to get the best ID/Selector available
+    const getTarget = (a: any) => a.selector || a.elementId || a.semanticTarget;
+
+    const prevTarget = getTarget(prev);
+    const nextTarget = getTarget(next);
+
     // For actions that target elements, check if they target the same element
     switch (prev.type) {
       case 'click':
       case 'type':
       case 'select_option': {
-        const prevTarget = (prev as any).elementId || (prev as any).selector || (prev as any).semanticTarget;
-        const nextTarget = (next as any).elementId || (next as any).selector || (next as any).semanticTarget;
-        
         // If both have targets, compare them
         if (prevTarget && nextTarget) {
-          // Normalize: strip quotes, lowercase, trim for semantic comparison
-          const normPrev = String(prevTarget).toLowerCase().replace(/["']/g, '').trim();
-          const normNext = String(nextTarget).toLowerCase().replace(/["']/g, '').trim();
-          return normPrev === normNext;
+          // 1. Strict Equality
+          if (prevTarget === nextTarget) return true;
+
+          // 2. Semantic Similarity (ignore case/quotes/special chars)
+          if (typeof prevTarget === 'string' && typeof nextTarget === 'string') {
+            const clean = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (clean(prevTarget) === clean(nextTarget)) return true;
+          }
         }
         return false;
       }

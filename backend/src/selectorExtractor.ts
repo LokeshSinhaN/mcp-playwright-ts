@@ -109,6 +109,7 @@ export class SelectorExtractor {
       const typeAttr = getAttr('type');
       const placeholder = getAttr('placeholder');
       const ariaLabel = getAttr('aria-label');
+      const valueAttr = getAttr('value'); // <--- ADD THIS
       const titleAttr = getAttr('title');
       const dataTestId = getAttr('data-testid');
       const href = getAttr('href');
@@ -232,7 +233,12 @@ export class SelectorExtractor {
       }
 
       const rawText = (el.textContent || '').trim();
-      const mainText = (srOnlyText || rawText) || undefined;
+
+      // INTELLIGENT FALLBACK: If text content is empty, check the 'value' attribute.
+      // This is critical for <input type="submit" value="Go">
+      const effectiveText = rawText || (tagName === 'input' ? valueAttr : '') || '';
+
+      const mainText = (srOnlyText || effectiveText) || undefined;
 
       return {
         tagName,
