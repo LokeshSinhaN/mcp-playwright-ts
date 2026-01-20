@@ -1076,6 +1076,38 @@ export class McpTools {
         }
       }
 
+      // SECOND-LEVEL LOOP BREAKER: prevent regressing to earlier successfully
+      // completed steps (e.g., re-typing login credentials after already
+      // navigating deeper into the flow). If an identical action previously
+      // succeeded and **later** steps have also succeeded, treat a new attempt
+      // as a regression and convert it into a short wait so the planner can
+      // choose a different, forward-moving strategy on the next iteration.
+      const priorSuccessfulSameAction = steps.find((s) =>
+        s.success && this.isIdenticalAction(s.action, nextAction)
+      );
+      if (priorSuccessfulSameAction) {
+        const laterSuccessExists = steps.some(
+          (s) => s.stepNumber > priorSuccessfulSameAction.stepNumber && s.success
+        );
+
+        if (laterSuccessExists) {
+          const regressionWarning = [
+            '[33mREGRESSION BLOCKED:[0m You are trying to repeat an earlier successful step that was already followed by later progress.',
+            `Earlier step: ${this.describeAction(priorSuccessfulSameAction.action, true)}`,
+            'Do not go back to this step unless the site has clearly reset you (for example, a fresh blank login page after an explicit logout).',
+            'Instead, continue from the latest page state and focus only on the next unfinished part of the goal.'
+          ].join(' ');
+
+          actionHistory.push(regressionWarning);
+
+          nextAction = {
+            type: 'wait',
+            durationMs: 1000,
+            thought: regressionWarning,
+          };
+        }
+      }
+
       // ACT
       const urlBefore = page.url();
       let urlAfter = urlBefore;
@@ -1268,6 +1300,18 @@ export class McpTools {
       ? `\n\nElements that have failed (DO NOT retry these):\n${Array.from(failedElements).slice(0, 10).join('\n')}`
       : '';
 
+    // ───────────────────────────────────────────────────────────────────────────
+    // DIRECT LABEL SHORTCUT (pre-LLM)
+    // For simple menu-style flows where the goal explicitly names items like
+    // "Appointment View", we can often choose the correct element purely by
+    // string matching against the current DOM, without involving the LLM at
+    // all. This dramatically reduces JSON parse errors and speeds up flows
+    // like the CyberMed EHR Practice → Appointment View navigation.
+    const directAction = this.findDirectLabelClick(goal, limitedElements, failedElements);
+    if (directAction) {
+      return directAction;
+    }
+
     // UPDATED PROMPT: INTELLIGENT STRATEGY SWITCHING
     const prompt = [
       'SYSTEM: You are an intelligent autonomous browser agent.',
@@ -1276,6 +1320,12 @@ export class McpTools {
       `GOAL: ${goal}`,
       historyContext,
       failedContext,
+      '',
+      '### EXECUTION FLOW RULES ###',
+      '- Treat the goal as an ordered list of steps whenever it contains numbered or clearly sequenced instructions ("1.", "2.", "first", "next", "finally").',
+      '- Once you have successfully advanced past an earlier step (for example you are already on a later page after logging in), DO NOT go back to that earlier step.',
+      '- Never jump from a later step back to an earlier one (such as re-entering username/password) unless the website has clearly reset you to the very beginning (fresh login page after logout).',
+      '- Prefer moving forward to the next unfinished step instead of repeating earlier actions.',
       '',
       'CURRENT PAGE ELEMENTS (JSON):',
       JSON.stringify(limitedElements, null, 2),
@@ -1442,49 +1492,95 @@ export class McpTools {
       };
     }
 
-    const thought: string = parsed.thought || 'No reasoning provided';
+    const thought: string =
+      typeof parsed.thought === 'string' && parsed.thought.trim().length > 0
+        ? parsed.thought.trim()
+        : 'No reasoning provided';
+
+    const cleanString = (val: any, maxLen: number): string | undefined => {
+      if (typeof val !== 'string') return undefined;
+      const trimmed = val.trim();
+      if (!trimmed) return undefined;
+      if (trimmed.length > maxLen) return undefined;
+      return trimmed;
+    };
+
+    const safeElementId: string | undefined =
+      typeof parsed.elementId === 'string' && /^el_\d+$/.test(parsed.elementId)
+        ? parsed.elementId
+        : undefined;
+
+    const safeSelector: string | undefined = cleanString(parsed.selector, 300);
+
+    let safeSemantic: string | undefined = cleanString(parsed.semanticTarget, 120);
+    // Guard against the model accidentally copying the full thought text into
+    // semanticTarget or selector fields. If semanticTarget is identical to the
+    // reasoning text, ignore it so we don't treat a long paragraph as a
+    // locator.
+    if (safeSemantic && safeSemantic === thought) {
+      safeSemantic = undefined;
+    }
 
     switch (parsed.type) {
       case 'navigate':
-        return { type: 'navigate', url: parsed.url || '', thought };
+        return {
+          type: 'navigate',
+          url: cleanString(parsed.url, 2048) || '',
+          thought,
+        };
       case 'click':
         return {
           type: 'click',
-          elementId: parsed.elementId,
-          selector: parsed.selector,
-          semanticTarget: parsed.semanticTarget,
+          elementId: safeElementId,
+          selector: safeSelector,
+          semanticTarget: safeSemantic,
           thought,
         };
       case 'type':
         return {
           type: 'type',
-          elementId: parsed.elementId,
-          selector: parsed.selector,
-          semanticTarget: parsed.semanticTarget,
-          text: parsed.text || '',
+          elementId: safeElementId,
+          selector: safeSelector,
+          semanticTarget: safeSemantic,
+          text: cleanString(parsed.text, 512) || '',
           thought,
         };
       case 'select_option':
         return {
           type: 'select_option',
-          elementId: parsed.elementId,
-          selector: parsed.selector,
-          semanticTarget: parsed.semanticTarget,
-          option: parsed.option || '',
+          elementId: safeElementId,
+          selector: safeSelector,
+          semanticTarget: safeSemantic,
+          option: cleanString(parsed.option, 256) || '',
           thought,
         };
       case 'scrape_data':
         return {
           type: 'scrape_data',
-          instruction: parsed.instruction || 'Extract data',
+          instruction: cleanString(parsed.instruction, 512) || 'Extract data',
           thought,
         };
       case 'scroll':
-        return { type: 'scroll', direction: parsed.direction || 'down', thought };
+        return {
+          type: 'scroll',
+          direction: parsed.direction === 'up' || parsed.direction === 'down' ? parsed.direction : 'down',
+          thought,
+        };
       case 'wait':
-        return { type: 'wait', durationMs: parsed.durationMs || 1000, thought };
+        return {
+          type: 'wait',
+          durationMs:
+            typeof parsed.durationMs === 'number' && parsed.durationMs > 0 && Number.isFinite(parsed.durationMs)
+              ? parsed.durationMs
+              : 1000,
+          thought,
+        };
       case 'finish':
-        return { type: 'finish', thought, summary: parsed.summary || 'Done' };
+        return {
+          type: 'finish',
+          thought,
+          summary: cleanString(parsed.summary, 2000) || 'Done',
+        };
       default:
         return {
           type: 'wait',
@@ -1548,6 +1644,19 @@ export class McpTools {
           const resolved = resolveElement(action.elementId, action.selector, action.semanticTarget);
           let targetClick = resolved.selector;
 
+          // Normalise semanticTarget for short buttons like "Go" / "Export"
+          // so descriptions like "Go button" or "Export button" resolve to
+          // the actual label text that appears on the control.
+          let normalizedSemantic = action.semanticTarget;
+          if (normalizedSemantic) {
+            const lower = normalizedSemantic.toLowerCase();
+            if (lower.includes('go') && lower.includes('button')) {
+              normalizedSemantic = 'Go';
+            } else if (lower.includes('export') && lower.includes('button')) {
+              normalizedSemantic = 'Export';
+            }
+          }
+
           // If the planner did not provide a usable selector/elementId, fall
           // back to semantic matching over the observed elements instead of
           // immediately giving up with "No target". This makes the agent more
@@ -1555,7 +1664,7 @@ export class McpTools {
           // description like "Python radio button".
           if (!targetClick) {
             const fallbackDescription =
-              action.semanticTarget || action.thought || '';
+              normalizedSemantic || action.semanticTarget || action.thought || '';
 
             if (fallbackDescription.trim().length > 0) {
               const alt = await this.findAlternativeElement(
@@ -1570,6 +1679,26 @@ export class McpTools {
             }
           }
 
+          // For the CyberMed EHR site, prioritise robust semantic targeting for
+          // the small "Go" and "Export" buttons so the agent does not get
+          // stuck on brittle elementIds. This is only applied when we are on
+          // that domain and the planner explicitly mentioned those buttons.
+          try {
+            const currentUrl = page.url();
+            const onNy4s = /ny4s\.cybermedehr\.com/i.test(currentUrl);
+            if (onNy4s && normalizedSemantic && (!targetClick || retryCount > 0)) {
+              const semLower = normalizedSemantic.toLowerCase();
+              if (semLower.includes('go')) {
+                targetClick = 'input[type="submit"][value="Go"], input[value="Go"]';
+              } else if (semLower.includes('export')) {
+                targetClick = 'input[type="submit"][value="Export"], input[value="Export"]';
+              }
+            }
+          } catch {
+            // If URL inspection fails for any reason, just continue with the
+            // generic path.
+          }
+
           if (!targetClick) {
             return {
               success: false,
@@ -1578,65 +1707,90 @@ export class McpTools {
             };
           }
 
-          try {
-             // Use clickExact to ensure history is recorded properly with REAL selectors
-             // clickExact internally uses browser.click() which extracts full ElementInfo
-             const res = await this.clickExact(targetClick, action.thought); 
-             
-             // Return the captured ElementInfo for agent tracking
-             const clickedElementInfo = res.selectors?.[0] || resolved.elementInfo;
+          // Try one or more selector strategies in priority order. This lets us
+          // fall back from brittle exact selectors to semantic selectors on
+          // retries without leaving the agent stuck.
+          const selectorCandidates: string[] = [];
+          selectorCandidates.push(targetClick);
 
-             // For radios/checkboxes, verify that the checked state actually
-             // changed; if it did not, treat this as a soft failure so the
-             // self-healing loop can try an alternative element (e.g., the
-             // associated label instead of the input).
-             let verificationError: string | undefined;
-             try {
-               const attrs = clickedElementInfo?.attributes || {};
-               const isToggleLike =
-                 (attrs.type === 'radio' || attrs.type === 'checkbox' || attrs.role === 'radio' || attrs.role === 'checkbox');
-
-               if (isToggleLike) {
-                 const locator = page.locator(targetClick);
-                 const checked = await locator.isChecked().catch(() => false);
-                 if (!checked) {
-                   verificationError = 'Element was clicked but is not in a checked state afterwards.';
-                 }
-               }
-             } catch {
-               // If verification fails for any reason, we just skip it and
-               // trust the click result.
-             }
-
-             if (verificationError) {
-               return {
-                 success: false,
-                 message: verificationError,
-                 elementInfo: clickedElementInfo,
-                 error: verificationError,
-                 failedSelector: targetClick,
-                 recoveryHint: 'Try clicking the associated label or a nearby control with the same text.',
-               };
-             }
-
-             return { 
-                 success: res.success, 
-                 message: res.message, 
-                 elementInfo: clickedElementInfo,
-                 error: res.error, 
-                 failedSelector: res.success ? undefined : targetClick 
-             };
-          } catch(e: any) { 
-              return { success: false, message: e.message, error: e.message, failedSelector: targetClick }; 
+          // On retry attempts, if we still have a semantic description, add a
+          // plain-text candidate so BrowserManager.smartLocate() can use its
+          // fuzzy heuristics (especially useful when exact selectors went stale).
+          if (retryCount > 0 && (normalizedSemantic || action.semanticTarget)) {
+            const raw = normalizedSemantic || action.semanticTarget!;
+            if (!selectorCandidates.includes(raw)) {
+              selectorCandidates.push(raw);
+            }
           }
+
+          let lastError: any;
+          for (const selector of selectorCandidates) {
+            try {
+              // Use clickExact to ensure history is recorded properly with REAL selectors
+              // clickExact internally uses browser.click() which extracts full ElementInfo
+              const res = await this.clickExact(selector, action.thought);
+
+              // Return the captured ElementInfo for agent tracking
+              const clickedElementInfo = res.selectors?.[0] || resolved.elementInfo;
+
+              // For radios/checkboxes, verify that the checked state actually
+              // changed; if it did not, treat this as a soft failure so the
+              // self-healing loop can try an alternative element (e.g., the
+              // associated label instead of the input).
+              let verificationError: string | undefined;
+              try {
+                const attrs = clickedElementInfo?.attributes || {};
+                const isToggleLike =
+                  (attrs.type === 'radio' || attrs.type === 'checkbox' || attrs.role === 'radio' || attrs.role === 'checkbox');
+
+                if (isToggleLike) {
+                  const locator = page.locator(selector);
+                  const checked = await locator.isChecked().catch(() => false);
+                  if (!checked) {
+                    verificationError = 'Element was clicked but is not in a checked state afterwards.';
+                  }
+                }
+              } catch {
+                // If verification fails for any reason, we just skip it and
+                // trust the click result.
+              }
+
+              if (verificationError) {
+                return {
+                  success: false,
+                  message: verificationError,
+                  elementInfo: clickedElementInfo,
+                  error: verificationError,
+                  failedSelector: selector,
+                  recoveryHint: 'Try clicking the associated label or a nearby control with the same text.',
+                };
+              }
+
+              return {
+                success: res.success,
+                message: res.message,
+                elementInfo: clickedElementInfo,
+                error: res.error,
+                failedSelector: res.success ? undefined : selector,
+              };
+            } catch (e: any) {
+              lastError = e;
+              // Mark this selector as failed so future planning rounds avoid it.
+              if (selector) {
+                failedElements.add(selector);
+              }
+            }
+          }
+
+          const message = lastError instanceof Error ? lastError.message : String(lastError ?? 'Unknown click failure');
+          return { success: false, message, error: message, failedSelector: targetClick };
       }
 
-      // Robust Dropdown Handling: Use REAL selectors from the dropdown utility
       case 'select_option': {
         const resolved = resolveElement(action.elementId, action.selector, action.semanticTarget);
         let trigger = resolved.selector;
         let triggerInfo = resolved.elementInfo;
-        
+
         // If the LLM did not give us a concrete trigger selector, try to
         // infer a suitable dropdown control from the elements list using the
         // option text and any semantic target as a hint.
@@ -1660,40 +1814,42 @@ export class McpTools {
         if (!trigger) {
           return { success: false, message: 'No dropdown trigger found', error: 'Missing trigger' };
         }
-        
+
         // Capture URL before the selection so we can detect navigation even if
-        // the DOM label on the dropdown fails to update 
-        // case where the page navigates correctly but the trigger text is stale).
+        // the DOM label on the dropdown fails to update.
         const urlBeforeSelection = page.url();
 
         try {
           // 1. EXECUTE SELECTION
           const selectionResult = await selectFromDropdown(page, trigger, action.option);
-          
+
           // 2. SELF-HEALING VERIFICATION
           // Check if the selection actually "stuck"
           await page.waitForTimeout(1000); // wait for UI update
-          
+
           // Capture URL after selection to detect state changes independent of
           // brittle label text comparisons.
           const urlAfterSelection = page.url();
-          
-          const isNativeSelect = await page.locator(trigger).evaluate(el => el.tagName.toLowerCase() === 'select').catch(() => false);
-          
+
+          const isNativeSelect = await page
+            .locator(trigger)
+            .evaluate((el) => el.tagName.toLowerCase() === 'select')
+            .catch(() => false);
+
           let verificationPassed = false;
-          
+
           if (isNativeSelect) {
-             const val = await page.locator(trigger).inputValue().catch(() => '');
-             // Simplistic check: assumes value somewhat matches option text
-             if (typeof val === 'string' && val.length > 0) {
-               verificationPassed = true;
-             }
+            const val = await page.locator(trigger).inputValue().catch(() => '');
+            // Simplistic check: assumes value somewhat matches option text
+            if (typeof val === 'string' && val.length > 0) {
+              verificationPassed = true;
+            }
           } else {
-             // For custom dropdowns, the trigger text usually updates to show the selection
-             const triggerText = (await page.locator(trigger).textContent().catch(() => '')) || '';
-             if (triggerText.toLowerCase().includes(action.option.toLowerCase())) {
-                 verificationPassed = true;
-             }
+            // For custom dropdowns, the trigger text usually updates to show the selection
+            const triggerText = (await page.locator(trigger).textContent().catch(() => '')) || '';
+            if (triggerText.toLowerCase().includes(action.option.toLowerCase())) {
+              verificationPassed = true;
+            }
           }
 
           // --- STATE-BASED OVERRIDE ---
@@ -1702,66 +1858,73 @@ export class McpTools {
           // prevents the agent from looping when the app navigated correctly
           // but the label is glitchy or delayed.
           if (!verificationPassed && urlBeforeSelection !== urlAfterSelection) {
-             verificationPassed = true;
+            verificationPassed = true;
           }
 
           if (!verificationPassed) {
-             // THROW ERROR to force the Agent to retry (Self-Healing)
-             // This stops it from moving to "click search" blindly when *no*
-             // meaningful state change was detected.
-             throw new Error(`Verification failed: Dropdown text did not update to "${action.option}" after selection.`);
+            // THROW ERROR to force the Agent to retry (Self-Healing)
+            // This stops it from moving to "click search" blindly when *no*
+            // meaningful state change was detected.
+            throw new Error(
+              `Verification failed: Dropdown text did not update to "${action.option}" after selection.`,
+            );
           }
 
           // 3. RECORD HISTORY (Only if verification passed)
           // Ensure we push the REAL captured selector, not just text
           const finalOptionSelector = selectionResult.optionSelector;
-          
+
           // Build proper selectors object from the trigger ElementInfo
-          const triggerSelectors = triggerInfo ? {
-              css: triggerInfo.cssSelector || triggerInfo.selector,
-              xpath: triggerInfo.xpath,
-              id: triggerInfo.id,
-              text: triggerInfo.text
-          } : { css: trigger };
-          
-          this.recordCommand({ 
-            action: 'click', 
+          const triggerSelectors = triggerInfo
+            ? {
+                css: triggerInfo.cssSelector || triggerInfo.selector,
+                xpath: triggerInfo.xpath,
+                id: triggerInfo.id,
+                text: triggerInfo.text,
+              }
+            : { css: trigger };
+
+          this.recordCommand({
+            action: 'click',
             target: trigger,
             selectors: triggerSelectors,
-            description: `Open dropdown "${triggerInfo?.text || trigger}"` 
+            description: `Open dropdown "${triggerInfo?.text || trigger}"`,
           });
-          
-          if (finalOptionSelector) {
-              this.recordCommand({ 
-                  action: 'click', 
-                  target: finalOptionSelector, // REAL SELECTOR
-                  selectors: { css: finalOptionSelector, xpath: selectionResult.optionXpath, text: action.option }, 
-                  description: `Select option "${action.option}"` 
-              });
-          } else {
-              // Fallback only if absolutely necessary
-              this.recordCommand({ 
-                  action: 'type', 
-                  target: trigger,
-                  value: action.option,
-                  description: `Type "${action.option}" into dropdown (fallback)`
-              });
-          }
-          
-          return { 
-              success: true, 
-              message: `Selected and Verified "${action.option}"`,
-              elementInfo: triggerInfo
-          };
 
+          if (finalOptionSelector) {
+            this.recordCommand({
+              action: 'click',
+              target: finalOptionSelector, // REAL SELECTOR
+              selectors: {
+                css: finalOptionSelector,
+                xpath: selectionResult.optionXpath,
+                text: action.option,
+              },
+              description: `Select option "${action.option}"`,
+            });
+          } else {
+            // Fallback only if absolutely necessary
+            this.recordCommand({
+              action: 'type',
+              target: trigger,
+              value: action.option,
+              description: `Type "${action.option}" into dropdown (fallback)`,
+            });
+          }
+
+          return {
+            success: true,
+            message: `Selected and Verified "${action.option}"`,
+            elementInfo: triggerInfo,
+          };
         } catch (err: any) {
-           // This error is caught by runAutonomousAgent, which triggers the retry logic
-           return { 
-             success: false, 
-             message: `Selection failed: ${err.message ?? String(err)}`, 
-             error: err.message ?? String(err), 
-             failedSelector: trigger 
-           };
+          // This error is caught by runAutonomousAgent, which triggers the retry logic
+          return {
+            success: false,
+            message: `Selection failed: ${err.message ?? String(err)}`,
+            error: err.message ?? String(err),
+            failedSelector: trigger,
+          };
         }
       }
 
@@ -1822,6 +1985,134 @@ export class McpTools {
       default:
          return { success: false, message: 'Unknown action' };
     }
+  }
+
+  /**
+   * For goals that explicitly mention menu items or buttons by label (e.g.,
+   * "select the \"Appointment View\" option"), try to choose a click target
+   * directly from the current element list without calling the LLM.
+   *
+   * This is especially useful on sites like CyberMed EHR where the flow is
+   * "Practice" → "Appointment View" and those labels appear verbatim in both
+   * the goal and the DOM.
+   */
+  private findDirectLabelClick(
+    goal: string,
+    elements: {
+      id: string;
+      tag: string;
+      text: string;
+      ariaLabel: string;
+      placeholder: string;
+      role: string;
+      region: string;
+      selector: string;
+      isFailed: boolean;
+    }[],
+    failedElements: Set<string>,
+  ): AgentAction | null {
+    if (!goal.trim()) return null;
+
+    const lowerGoal = goal.toLowerCase();
+
+    // 1) Extract any explicitly quoted labels from the goal, including smart
+    // quotes. These are high-signal targets like "Practice" or
+    // "Appointment View".
+    const labelRegex = /["'“”‘’]([^"'“”‘’]{2,})["'“”‘’]/g;
+    const quotedLabels: { label: string; index: number }[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = labelRegex.exec(goal)) !== null) {
+      const label = m[1].trim();
+      if (label.length >= 2) {
+        quotedLabels.push({ label, index: m.index });
+      }
+    }
+
+    // 2) Special-case: labels that appear in a "select ... \"X\"" phrase are
+    // almost certainly dropdown/menu options (e.g., "select the \"Appointment View\" option").
+    const selectionLabelSet = new Set<string>();
+    for (const q of quotedLabels) {
+      const ctxStart = Math.max(0, q.index - 40);
+      const ctx = goal.slice(ctxStart, q.index).toLowerCase();
+      if (ctx.includes('select')) {
+        selectionLabelSet.add(q.label);
+      }
+    }
+    const selectionLabels = Array.from(selectionLabelSet);
+
+    // Also include a few hard-coded high-value phrases we know appear in
+    // flows (like "Appointment View") in case quoting is missing.
+    const extraLabels = ['Appointment View'];
+
+    const allLabels = [
+      ...quotedLabels.map((q) => q.label),
+      ...extraLabels,
+    ].filter((lbl, idx, arr) =>
+      arr.findIndex((x) => x.toLowerCase() === lbl.toLowerCase()) === idx,
+    );
+
+    if (allLabels.length === 0) return null;
+
+    // Primary preference: labels explicitly tied to a "select" instruction
+    // (e.g., "select the \"Appointment View\" option"). This prevents us from
+    // over-clicking top-level items like "Practice" when the real goal is a
+    // deeper option inside the dropdown.
+    let labelsToUse: string[];
+    if (selectionLabels.length > 0) {
+      labelsToUse = selectionLabels;
+    } else {
+      // Fallback: choose labels that actually appear in the goal text.
+      const labelsInGoal = allLabels.filter((lbl) => lowerGoal.includes(lbl.toLowerCase()));
+      labelsToUse = labelsInGoal.length > 0 ? labelsInGoal : allLabels;
+    }
+
+    // For each candidate label, try to find a single best matching element by
+    // visible text or aria-label.
+    for (const lbl of labelsToUse) {
+      const labelLower = lbl.toLowerCase();
+
+      const matches = elements
+        .map((el, idx) => ({ el, idx }))
+        .filter(({ el }) => {
+          const labelText = `${el.text || ''} ${el.ariaLabel || ''}`.toLowerCase();
+          if (!labelText.includes(labelLower)) return false;
+
+          // Skip obviously failed selectors so we don't re-click bad targets.
+          if (el.selector && failedElements.has(el.selector)) return false;
+
+          return true;
+        });
+
+      if (matches.length === 0) continue;
+
+      // Prefer elements that look like links or buttons in the main/header
+      // region, since menu items are usually links within nav.
+      matches.sort((a, b) => {
+        const score = (x: typeof a) => {
+          let s = 0;
+          const role = (x.el.role || '').toLowerCase();
+          const tag = (x.el.tag || '').toLowerCase();
+          const region = (x.el.region || '').toLowerCase();
+
+          if (role === 'link' || tag === 'a') s += 3;
+          if (role === 'button' || tag === 'button') s += 2;
+          if (region === 'header' || region === 'main') s += 1;
+          return s;
+        };
+        return score(b) - score(a);
+      });
+
+      const best = matches[0];
+      if (!best) continue;
+
+      return {
+        type: 'click',
+        elementId: best.el.id, // e.g., "el_5" – resolved against visible elements later
+        thought: `Directly clicking "${lbl}" because it appears as the specific option to select in the goal.`,
+      };
+    }
+
+    return null;
   }
 
   /**
