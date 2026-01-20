@@ -512,22 +512,14 @@ export class BrowserManager {
       }
     } catch (e) {}
 
-    // 4. AGGRESSIVE CLEAR STRATEGY (Universal Fix)
-    // Standard .fill() often fails on masked inputs (like dates). 
-    // We simulate a human "Select All + Delete" to guarantee a clean slate.
+    // 4. HUMAN CLEAR PROTOCOL (Universal Fix)
+    // Date and masked inputs often ignore programmatic clears (e.g. .fill(''))
+    // and instead append new text. To behave like a real user, we ALWAYS
+    // simulate "Select All" followed by "Backspace" before typing.
     try {
-      await locator.focus(); // Ensure focus
-      
-      // Attempt standard clear first
-      await locator.fill(''); 
-      
-      // Double check: if value persists, use keyboard shortcuts
-      const val = await locator.inputValue().catch(() => '');
-      if (val) {
-          // Universal "Select All + Delete" works on almost all OS/Browsers
-          await locator.press('Control+A'); 
-          await locator.press('Backspace');
-      }
+      await locator.focus(); // Ensure focus on the input
+      await locator.press('Control+A'); // Select all existing content
+      await locator.press('Backspace'); // Clear it via keyboard, like a human
     } catch (err) {
       console.warn(`Non-fatal error during input clearing for "${selector}": ${err}`);
     }

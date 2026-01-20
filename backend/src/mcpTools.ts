@@ -947,7 +947,7 @@ export class McpTools {
       const screenshot = observation.screenshot;
 
       // THINK
-      const nextAction = await this.planNextAgentAction(
+      let nextAction: AgentAction = await this.planNextAgentAction(
         goal,
         elements,
         actionHistory,
@@ -990,73 +990,88 @@ export class McpTools {
       // LOOP BREAKERS: Prevent mindless repetition of the same action
       // ═══════════════════════════════════════════════════════════════════
       if (steps.length > 0) {
-        const prevStep = steps[steps.length - 1];
-        const prevAction = prevStep.action;
+        // Look back for the last *active* (non-passive) step so patterns like
+        // Click -> Wait(JSON error) -> Click are still treated as a loop.
+        const lastActiveStep = [...steps]
+          .slice()
+          .reverse()
+          .find((s) => !this.isPassiveForLoop(s.action));
 
-        // 1) High-level loop breaker
-        if (prevStep.success && this.isIdenticalAction(prevAction, nextAction)) {
-          // INTELLIGENT HINT GENERATION
-          let hint = `Think creatively - what would a human do differently?`;
-          
-          // Specific check: If we clicked an input/div, suggest typing
-          if (prevAction.type === 'click') {
-             hint = `You just CLICKED this element and stayed on the same page. If it is an input field, search box, or date picker, DO NOT click again. Use the "type" action to enter the value directly.`;
-          }
+        if (lastActiveStep) {
+          const prevStep = lastActiveStep;
+          const prevAction = prevStep.action;
 
-          const warningMessage = [
-            `⚠️ LOOP DETECTED: You just performed this exact action in Step ${prevStep.stepNumber}.`,
-            `Previous action: ${this.describeAction(prevAction, true)}`,
-            `It succeeded but did not advance your goal.`,
-            `DO NOT REPEAT IT. Try a different approach:`,
-            hint
-          ].join(' ');
+          // 1) High-level loop breaker: same logical action repeated after a
+          // SUCCESS that did not clearly advance the state.
+          if (prevStep.success && this.isIdenticalAction(prevAction, nextAction)) {
+            // INTELLIGENT HINT GENERATION
+            let hint = 'Think creatively – what would a human do differently?';
 
-          // Re-plan with the warning injected into the history
-          const warningHistory = [...actionHistory, warningMessage];
-          const alternativeAction = await this.planNextAgentAction(
-            goal,
-            elements,
-            warningHistory,
-            failedElements,
-            screenshot,
-          );
-          
-          // ... (rest of the block remains same)
-        } else {
-          // 2) Selector-based loop breaker for failed actions. Even if the
-          //    command description changes (e.g., "Click Go button" vs
-          //    "Click el_28"), if they resolve to the same underlying selector
-          //    (e.g., "#Btn_go_input") and the previous attempt FAILED, we
-          //    should not let the agent hammer the same element again.
+            if (prevAction.type === 'click') {
+              hint =
+                'You just CLICKED this element and stayed on the same page. ' +
+                'If it is an input field, search box, or date picker, DO NOT click again. ' +
+                'Use the "type" action to enter the value directly.';
+            }
 
-          // Resolve the current action's target to a concrete selector string
-          // using the latest observation snapshot.
-          let nextTargetResolved: string | null = null;
-          if ((nextAction as any).selector) {
-            nextTargetResolved = String((nextAction as any).selector);
-          } else if ((nextAction as any).elementId) {
-            const rawId = String((nextAction as any).elementId);
-            const match = rawId.match(/^el_(\d+)$/);
-            if (match) {
-              const idx = parseInt(match[1], 10);
-              if (!Number.isNaN(idx) && idx >= 0 && idx < elements.length) {
-                const el = elements[idx];
-                nextTargetResolved = el?.selector || el?.cssSelector || el?.xpath || null;
+            const warningMessage = [
+              '⚠️ LOOP DETECTED: You just performed this exact action previously.',
+              `Previous action: ${this.describeAction(prevAction, prevStep.success)}`,
+              'It succeeded but did not advance your goal.',
+              'DO NOT REPEAT IT. Try a different approach:',
+              hint,
+            ].join(' ');
+
+            // Instead of making a second blocking LLM call, push this warning
+            // into history and convert the repeated action into a short
+            // "wait". On the next loop iteration the planner will see the
+            // warning in actionHistory and is expected to choose a different
+            // strategy (e.g. click the Go/Search button instead of typing
+            // again).
+            actionHistory.push(warningMessage);
+
+            nextAction = {
+              type: 'wait',
+              durationMs: 1000,
+              thought: warningMessage,
+            };
+          } else {
+            // 2) Selector-based loop breaker for FAILED actions on the same element.
+            // Even if the natural-language description changes, if the action
+            // is the same type and resolves to the same underlying selector,
+            // we treat repeated failures as a loop and mark that selector bad.
+            let nextTargetResolved: string | null = null;
+
+            if ((nextAction as any).selector) {
+              nextTargetResolved = String((nextAction as any).selector);
+            } else if ((nextAction as any).elementId) {
+              const rawId = String((nextAction as any).elementId);
+              const match = rawId.match(/^el_(\d+)$/);
+              if (match) {
+                const idx = parseInt(match[1], 10);
+                if (!Number.isNaN(idx) && idx >= 0 && idx < elements.length) {
+                  const el = elements[idx];
+                  nextTargetResolved =
+                    el?.selector || el?.cssSelector || el?.xpath || null;
+                }
               }
             }
-          }
 
-          if (
-            prevStep.action.type === nextAction.type &&
-            !!prevStep.elementInfo?.selector &&
-            !!nextTargetResolved &&
-            prevStep.elementInfo.selector === nextTargetResolved &&
-            !prevStep.success
-          ) {
-            console.warn('Loop detected on same SELECTOR. Forcing skip and marking as failed.');
-            failedElements.add(nextTargetResolved);
-            // Skip directly to the next observe/plan cycle.
-            continue;
+            if (
+              prevStep.action.type === nextAction.type &&
+              !!prevStep.elementInfo?.selector &&
+              !!nextTargetResolved &&
+              prevStep.elementInfo.selector === nextTargetResolved &&
+              !prevStep.success
+            ) {
+              console.warn(
+                'Loop detected on same SELECTOR with repeated failures. Marking as failed and skipping.',
+              );
+              failedElements.add(nextTargetResolved);
+              // Skip directly to the next observe/plan cycle instead of trying
+              // this same selector again.
+              continue;
+            }
           }
         }
       }
@@ -1277,11 +1292,14 @@ export class McpTools {
       '1. **Inputs & Dates (TYPE FIRST)**: Always prefer TYPING into fields over clicking complex pickers.',
       '   - If a field looks like a date (e.g., "1/19/2026"), use the `type` action to overwrite it directly.',
       '   - Only use date pickers/calendars if the field is strictly "Read Only" or if typing fails.',
-      '2. **Loop Avoidance**: If you just clicked an input/div and nothing happened (state did not change), DO NOT CLICK IT AGAIN.',
+      '2. **Command Interpretation**: When the user says things like "click the box and type 1/19/2026",',
+      '   - Interpret this as a single `type` action into that box (do NOT first click and then type if typing alone is enough).',
+      '   - In general, if a field can be typed into directly, you should emit only a `type` action, not a separate `click`.',
+      '3. **Loop Avoidance**: If you just clicked an input/div and nothing happened (state did not change), DO NOT CLICK IT AGAIN.',
       '   - IMMEDIATELY switch strategies: If you clicked, now try `type`. If you typed, try `click`.',
-      '3. **Dropdowns**: Use "select_option" only for standard menus. For custom UI grids, click the specific item.',
-      '4. **Scraping**: Navigate to the data -> "scrape_data" -> "finish".',
-      '5. **Self-Correction**: If an element has "isFailed: true", pick a different element or use semanticTarget.',
+      '4. **Dropdowns**: Use "select_option" only for standard menus. For custom UI grids, click the specific item.',
+      '5. **Scraping**: Navigate to the data -> "scrape_data" -> "finish".',
+      '6. **Self-Correction**: If an element has "isFailed: true", pick a different element or use semanticTarget.',
       '',
       '### RESPONSE FORMAT (Return ONLY raw JSON) ###',
       'Choose ONE of these actions:',
@@ -1860,6 +1878,15 @@ export class McpTools {
       .sort((a, b) => b.score - a.score);
 
     return candidates.length > 0 ? candidates[0].el : null;
+  }
+
+  /**
+   * Actions that should be ignored for loop detection because they are
+   * "passive" (e.g., JSON-parse-retry waits).
+   */
+  private isPassiveForLoop(action: AgentAction): boolean {
+    // You can extend this later if you introduce other passive steps.
+    return action.type === 'wait';
   }
 
   /**
