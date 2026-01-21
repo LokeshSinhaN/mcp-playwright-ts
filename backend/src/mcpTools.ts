@@ -104,7 +104,7 @@ export class McpTools {
               // Note: dropdownLabel is semantic text, not a real CSS selector
               // The SeleniumGenerator will handle this via text-based XPath fallback
               selectors: { text: dropdownIntent.dropdownLabel },
-              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`,
+              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
             {
               action: 'click',
@@ -112,9 +112,9 @@ export class McpTools {
               // a semantic description if keyboard selection was used.
               target: selectionResult.optionSelector || dropdownIntent.optionLabel,
               selectors: selectionResult.optionSelector
-                ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel }
+                ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel } 
                 : { text: dropdownIntent.optionLabel },
-              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`,
+              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`, 
             },
           ]);
 
@@ -128,9 +128,9 @@ export class McpTools {
             // Use the REAL selector if we have it, otherwise fall back to semantic target
             target: selectionResult.optionSelector || dropdownIntent.optionLabel,
             selectors: selectionResult.optionSelector
-              ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel }
+              ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel } 
               : { text: dropdownIntent.optionLabel },
-            description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`,
+            description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`, 
           });
 
           message = `Selected option "${dropdownIntent.optionLabel}" from the currently open dropdown`;
@@ -989,17 +989,45 @@ async runAutonomousAgent(
     let retryCount = 0;
     let actionSuccess = false;
     let actionMessage = '';
-    let result: { success: boolean; message: string; failedSelector?: string };
+    let result: { success: boolean; message: string; failedSelector?: string; elementInfo?: ElementInfo } | undefined;
 
     while (retryCount <= maxRetries && !actionSuccess) {
+         // Enable buffering so we don't pollute history with failed retries
+         this.agentCommandBuffer = []; 
+         
          result = await this.executeAgentAction(nextAction, elements, retryCount, failedElements);
          actionSuccess = result.success;
          actionMessage = result.message;
 
+         if (actionSuccess) {
+             // COMMIT BUFFERED COMMANDS TO MAIN HISTORY
+             if (this.agentCommandBuffer.length > 0) {
+                 this.sessionHistory.push(...this.agentCommandBuffer);
+             } else {
+                 // Fallback: if no command was recorded (e.g. wait/scroll), synthesize one
+                 // This ensures the Selenium generator always has something to work with
+                 if (nextAction.type !== 'finish') {
+                     this.sessionHistory.push({
+                         action: nextAction.type as any, 
+                         target: nextAction.selector || (nextAction as any).semanticTarget || nextAction.url,
+                         value: (nextAction as any).text,
+                         description: nextAction.thought,
+                         selectors: result.elementInfo ? {
+                             css: result.elementInfo.cssSelector,
+                             xpath: result.elementInfo.xpath,
+                             text: result.elementInfo.text,
+                             id: result.elementInfo.id
+                         } : undefined
+                     });
+                 }
+             }
+         }
+
+         this.agentCommandBuffer = null; // Clear buffer
+
          if (!actionSuccess) {
             retryCount++;
-            if (result.failedSelector) failedElements.add(result.failedSelector);
-            // Verify failure visually
+            if (result?.failedSelector) failedElements.add(result.failedSelector);
             await page.waitForTimeout(1000);
          }
     }
@@ -1046,7 +1074,7 @@ async runAutonomousAgent(
 
   const sessionResult: AgentSessionResult = {
         success: isFinished,
-        summary: `Completed ${steps.length} steps.`,
+        summary: `Completed ${steps.length} steps.`, 
         goal,
         totalSteps: stepNumber,
         steps,
@@ -1162,451 +1190,4 @@ async runAutonomousAgent(
 
     RULES:
     1. RETURN ONLY ONE JSON OBJECT. Do not return a list. Do not add comments.
-    2. USE "type": "click" OR "type": "type".
-    3. IF TYPING: Use "text" for the content.
-    4. IF CLICKING: Use the 'selector' from the list provided.
-    5. CRITICAL: If you just clicked something, WAIT or VERIFY it changed before clicking again.
-
-    EXAMPLE RESPONSE:
-    { "type": "click", "selector": "#login-btn", "thought": "Clicking login" }
-    `;
-
-    try {
-        const result = await this.model.generateContent({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }]
-        });
-        const responseText = result.response.text();
-        return this.parseAgentActionResponse(responseText);
-    } catch (e) {
-        return { type: 'wait', durationMs: 2000, thought: 'AI Error' };
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // FIX 3: EXECUTION GUARD (Prevents "Target Closed" & Hidden Clicks)
-  // ---------------------------------------------------------------------------
-  private async executeAgentAction(
-    action: AgentAction,
-    elements: ElementInfo[],
-    retryCount: number,
-    failedElements: Set<string>
-  ): Promise<{ success: boolean; message: string; failedSelector?: string }> {
-    const page = this.browser.getPage();
-    if (page.isClosed()) throw new Error('Browser page is closed');
-
-    try {
-        if (action.type === 'click') {
-            const selector = action.selector || action.elementId;
-            if (!selector) return { success: false, message: 'No selector' };
-
-            // RESOLVE SELECTOR: If it looks like 'el_5', map it back to real CSS
-            let finalSelector = selector;
-            if (selector.startsWith('el_')) {
-                // (You would need to map this back using the index, for simplicity we assume AI returns raw selector now)
-                // For this Universal Fix, the prompt above asks AI to return 'selector' directly from the JSON.
-            }
-
-            // CHECK VISIBILITY BEFORE CLICKING
-            const loc = page.locator(finalSelector).first();
-            if (!(await loc.isVisible())) {
-                return { success: false, message: `Element ${finalSelector} is not visible.` };
-            }
-
-            await loc.click({ timeout: 5000 });
-            
-            // UNIVERSAL WAIT - CRITICAL FOR ASP.NET
-            await page.waitForTimeout(2000); 
-            
-            return { success: true, message: 'Clicked' };
-        }
-
-        if (action.type === 'type') {
-            const selector = action.selector || action.elementId;
-            if (!selector) return { success: false, message: 'No selector' };
-
-            await page.fill(selector, action.text);
-            await page.keyboard.press('Enter'); // Universal commit
-            await page.waitForTimeout(2000);
-
-            return { success: true, message: 'Typed' };
-        }
-        
-        if (action.type === 'navigate') {
-             await this.navigate(action.url);
-             return { success: true, message: 'Navigated' };
-        }
-
-        if (action.type === 'wait') {
-            await page.waitForTimeout(action.durationMs);
-            return { success: true, message: 'Waited' };
-        }
-
-        return { success: true, message: 'Action completed' };
-
-    } catch (e: any) {
-        return { success: false, message: e.message };
-    }
-  }
-
-  /**
-   * For goals that explicitly mention menu items or buttons by label (e.g.,
-   * "select the \"Appointment View\" option"), try to choose a click target
-   * directly from the current element list without calling the LLM.
-   *
-   * This is especially useful on sites like CyberMed EHR where the flow is
-   * "Practice" → "Appointment View" and those labels appear verbatim in both
-   * the goal and the DOM.
-   */
-  private findDirectLabelClick(
-    goal: string,
-    elements: {
-      id: string;
-      tag: string;
-      text: string;
-      ariaLabel: string;
-      placeholder: string;
-      role: string;
-      region: string;
-      selector: string;
-      isFailed: boolean;
-    }[],
-    failedElements: Set<string>,
-  ): AgentAction | null {
-    if (!goal.trim()) return null;
-
-    const lowerGoal = goal.toLowerCase();
-
-    // 1) Extract any explicitly quoted labels from the goal, including smart
-    // quotes. These are high-signal targets like "Practice" or
-    // "Appointment View".
-    const labelRegex = /["'“”‘’]([^"'“”‘’]{2,})["'“”‘’]/g;
-    const quotedLabels: { label: string; index: number }[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = labelRegex.exec(goal)) !== null) {
-      const label = m[1].trim();
-      if (label.length >= 2) {
-        quotedLabels.push({ label, index: m.index });
-      }
-    }
-
-    // 2) Special-case: labels that appear in a "select ... \"X\"" phrase are
-    // almost certainly dropdown/menu options (e.g., "select the \"Appointment View\" option").
-    const selectionLabelSet = new Set<string>();
-    for (const q of quotedLabels) {
-      const ctxStart = Math.max(0, q.index - 40);
-      const ctx = goal.slice(ctxStart, q.index).toLowerCase();
-      if (ctx.includes('select')) {
-        selectionLabelSet.add(q.label);
-      }
-    }
-    const selectionLabels = Array.from(selectionLabelSet);
-
-    // Also include a few hard-coded high-value phrases we know appear in
-    // flows (like "Appointment View") in case quoting is missing.
-    const extraLabels = ['Appointment View'];
-
-    const allLabels = [
-      ...quotedLabels.map((q) => q.label),
-      ...extraLabels,
-    ].filter((lbl, idx, arr) =>
-      arr.findIndex((x) => x.toLowerCase() === lbl.toLowerCase()) === idx,
-    );
-
-    if (allLabels.length === 0) return null;
-
-    // Primary preference: labels explicitly tied to a "select" instruction
-    // (e.g., "select the \"Appointment View\" option"). This prevents us from
-    // over-clicking top-level items like "Practice" when the real goal is a
-    // deeper option inside the dropdown.
-    let labelsToUse: string[];
-    if (selectionLabels.length > 0) {
-      labelsToUse = selectionLabels;
-    } else {
-      // Fallback: choose labels that actually appear in the goal text.
-      const labelsInGoal = allLabels.filter((lbl) => lowerGoal.includes(lbl.toLowerCase()));
-      labelsToUse = labelsInGoal.length > 0 ? labelsInGoal : allLabels;
-    }
-
-    // For each candidate label, try to find a single best matching element by
-    // visible text or aria-label.
-    for (const lbl of labelsToUse) {
-      const labelLower = lbl.toLowerCase();
-
-      const matches = elements
-        .map((el, idx) => ({ el, idx }))
-        .filter(({ el }) => {
-          const labelText = `${el.text || ''} ${el.ariaLabel || ''}`.toLowerCase();
-          if (!labelText.includes(labelLower)) return false;
-
-          // Skip obviously failed selectors so we don't re-click bad targets.
-          if (el.selector && failedElements.has(el.selector)) return false;
-
-          return true;
-        });
-
-      if (matches.length === 0) continue;
-
-      // Prefer elements that look like links or buttons in the main/header
-      // region, since menu items are usually links within nav.
-      matches.sort((a, b) => {
-        const score = (x: typeof a) => {
-          let s = 0;
-          const role = (x.el.role || '').toLowerCase();
-          const tag = (x.el.tag || '').toLowerCase();
-          const region = (x.el.region || '').toLowerCase();
-
-          if (role === 'link' || tag === 'a') s += 3;
-          if (role === 'button' || tag === 'button') s += 2;
-          if (region === 'header' || region === 'main') s += 1;
-          return s;
-        };
-        return score(b) - score(a);
-      });
-
-      const best = matches[0];
-      if (!best) continue;
-
-      return {
-        type: 'click',
-        elementId: best.el.id, // e.g., "el_5" – resolved against visible elements later
-        thought: `Directly clicking "${lbl}" because it appears as the specific option to select in the goal.`,
-      };
-    }
-
-    return null;
-  }
-  /**
-   * Self-healing: Find an alternative element when the primary one fails.
-   * Uses semantic similarity to find elements with similar text/role.
-   */
-  private async findAlternativeElement(
-    elements: ElementInfo[],
-    targetDescription: string,
-    failedElements: Set<string>
-  ): Promise<ElementInfo | null> {
-    if (!targetDescription) return null;
-
-    const targetLower = targetDescription.toLowerCase();
-    const targetTokens = targetLower.split(/[^a-z0-9]+/).filter(t => t.length >= 3);
-
-    // Score elements by similarity to target
-    const candidates = elements
-      .filter(el => {
-        const selector = el.selector || el.cssSelector || el.xpath;
-        if (!selector) return false;
-        if (failedElements.has(selector)) return false;
-        if (el.visible === false || el.isVisible === false) return false;
-        return true;
-      })
-      .map(el => {
-        const attrs = el.attributes || {};
-        const attrLabelParts = [
-          attrs.id,
-          attrs.name,
-          attrs.value,
-          attrs.placeholder,
-          attrs.title,
-          attrs['aria-label'],
-          attrs['data-testid'],
-        ].filter(Boolean);
-
-        const label = `${
-          [
-            el.text || '',
-            el.ariaLabel || '',
-            el.placeholder || '',
-            el.title || '',
-            el.dataTestId || '',
-            el.context || '',
-            ...attrLabelParts,
-          ].join(' ')
-        }`.toLowerCase();
-
-        const matchCount = targetTokens.filter(tok => label.includes(tok)).length;
-        return { el, score: matchCount };
-      })
-      .filter(({ score }) => score > 0)
-      .sort((a, b) => b.score - a.score);
-
-    return candidates.length > 0 ? candidates[0].el : null;
-  }
-
-  /**
-   * Actions that should be ignored for loop detection because they are
-   * "passive" (e.g., JSON-parse-retry waits).
-   */
-  private isPassiveForLoop(action: AgentAction): boolean {
-    // You can extend this later if you introduce other passive steps.
-    return action.type === 'wait';
-  }
-
-  /**
-   * Check if two agent actions are functionally identical (same type,
-   * targeting the same element). Used by the loop breaker to detect
-   * when the agent is mindlessly repeating itself.
-   */
-  private isIdenticalAction(prev: AgentAction, next: AgentAction): boolean {
-    // Different action types = not identical
-    if (prev.type !== next.type) return false;
-
-    // Helper to get the best ID/Selector available
-    const getTarget = (a: any) => a.selector || a.elementId || a.semanticTarget;
-
-    const prevTarget = getTarget(prev);
-    const nextTarget = getTarget(next);
-
-    // For actions that target elements, check if they target the same element
-    switch (prev.type) {
-      case 'click':
-      case 'type':
-      case 'select_option': {
-        // If both have targets, compare them
-        if (prevTarget && nextTarget) {
-          // 1. Strict Equality
-          if (prevTarget === nextTarget) return true;
-
-          // 2. Semantic Similarity (ignore case/quotes/special chars)
-          if (typeof prevTarget === 'string' && typeof nextTarget === 'string') {
-            const clean = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-            if (clean(prevTarget) === clean(nextTarget)) return true;
-          }
-        }
-        return false;
-      }
-
-      case 'navigate': {
-        return (prev as any).url === (next as any).url;
-      }
-
-      case 'scroll': {
-        return (prev as any).direction === (next as any).direction;
-      }
-
-      case 'scrape_data': {
-        // Scraping is terminal, but if somehow repeated, treat as identical
-        return true;
-      }
-
-      case 'wait':
-      case 'finish':
-        // These are considered unique each time
-        return false;
-
-      default:
-        return false;
-    }
-  }
-
-  /**
-   * Detect whether a meaningful state change occurred after an action.
-   */
-  private async detectStateChange(
-  urlBefore: string,
-  urlAfter: string,
-  action: AgentAction
-): Promise<boolean> {
-  // 1. URL Changed? -> YES
-  if (urlBefore !== urlAfter) return true;
-
-  // 2. We Typed? -> VERIFY LOCALLY -> YES
-  if (action.type === 'type' && action.selector) {
-      try {
-          const page = this.browser.getPage();
-          const val = await page.inputValue(action.selector);
-          // If the input contains our text, we made progress.
-          if (val && action.text && val.includes(action.text)) return true;
-      } catch {}
-      // Even if verification fails, assume typing worked to avoid infinite retry loops on inputs
-      return true; 
-  }
-
-  // 3. We Clicked? -> PESSIMISTIC -> NO
-  // If URL didn't change, we assume NO change to force the AI to look at the screenshot again.
-  if (action.type === 'click') return false;
-
-  return true;
-}
-
-  /**
-   * Generate a human-readable description of an action for history tracking.
-   */
-  private describeAction(action: AgentAction, success: boolean): string {
-    const status = success ? '✓' : '✗';
-    switch (action.type) {
-      case 'navigate':
-        return `${status} Navigated to ${action.url}`;
-      case 'click':
-        return `${status} Clicked ${action.semanticTarget || action.elementId || 'element'}`;
-      case 'type':
-        return `${status} Typed "${action.text}" into ${action.semanticTarget || action.elementId || 'input'}`;
-      case 'scroll':
-        return `${status} Scrolled ${action.direction}`;
-      case 'wait':
-        return `${status} Waited ${action.durationMs}ms`;
-      case 'finish':
-        return `${status} Finished: ${action.summary}`;
-      default:
-        // This will handle the new action types.
-        const unhandledAction: any = action;
-        if (unhandledAction.type === 'select_option') {
-            return `${status} Selected option ${unhandledAction.option}`;
-        }
-        if (unhandledAction.type === 'scrape_data') {
-            return `${status} Scraped data`;
-        }
-        return `${status} Unknown action`;
-    }
-  }
-
-  /**
-   * Generate a summary of the agent session.
-   */
-  private generateSessionSummary(steps: AgentStepResult[], goal: string): string {
-    const successCount = steps.filter(s => s.success).length;
-    const failCount = steps.filter(s => !s.success).length;
-    const totalRetries = steps.reduce((sum, s) => sum + s.retryCount, 0);
-
-    const actions = steps
-      .filter(s => s.action.type !== 'finish')
-      .map(s => {
-        switch (s.action.type) {
-          case 'navigate': return `navigated to ${s.action.url}`;
-          case 'click': return `clicked ${s.action.semanticTarget || s.action.elementId || 'element'}`;
-          case 'type': return `typed text`;
-          case 'scroll': return `scrolled ${s.action.direction}`;
-          case 'wait': return `waited`;
-          case 'select_option': return `selected option`;
-          case 'scrape_data': return `scraped data`;
-          default: return 'performed action';
-        }
-      });
-
-    let summary = `Attempted to: ${goal}. `;
-    summary += `Completed ${successCount} of ${steps.length} steps. `;
-    if (failCount > 0) {
-      summary += `${failCount} steps failed. `;
-    }
-    if (totalRetries > 0) {
-      summary += `Self-healed with ${totalRetries} retry attempts. `;
-    }
-    if (actions.length > 0 && actions.length <= 5) {
-      summary += `Actions: ${actions.join(', ')}.`;
-    }
-
-    return summary;
-  }
-
-  /**
-   * Get the current session history (useful for external access).
-   */
-  getSessionHistory(): ExecutionCommand[] {
-    return [...this.sessionHistory];
-  }
-
-  /**
-   * Clear the session history.
-   */
-  clearSessionHistory(): void {
-    this.sessionHistory = [];
-  }
-}
+    2. USE
