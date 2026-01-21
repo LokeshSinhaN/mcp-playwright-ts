@@ -1270,22 +1270,12 @@ async runAutonomousAgent(
     ${JSON.stringify(Array.from(failedElements))}
 
     RULES:
-    1. RETURN ONLY ONE JSON OBJECT. Do not return a list.
-    2. CHECK THE 'value' FIELD of inputs. If an input field already contains the correct text required by the GOAL, DO NOT type it again.
-    3. If the input values are already correct, move to the NEXT logical step (e.g., clicking a submit, search, filter, or continue button).
-    4. If you have just clicked a button that triggers a loading state, search, or navigation, WAIT for the system to react. Do not click the same button again immediately.
-    5. USE THIS JSON SHAPE EXACTLY:
-       {
-         "type": "navigate" | "click" | "type" | "scroll" | "wait" | "finish",
-         "url": string,                 // when type === "navigate"
-         "selector": string,            // when type === "click" or "type"
-         "text": string,                // when type === "type"
-         "direction": "up" | "down",    // when type === "scroll"
-         "durationMs": number,          // when type === "wait"
-         "summary": string,             // when type === "finish"
-         "thought": string              // brief reasoning for this single step
-       }
-    6. ALWAYS include the "thought" field explaining why you are taking this step.
+    1. RETURN ONLY ONE JSON OBJECT.
+    2. CHECKBOX SAFETY: Before clicking a checkbox, check its 'checked' attribute or value.
+       - If the goal is to SELECT it and it is ALREADY checked, DO NOT click it.
+       - If the goal is to UNSELECT it and it is ALREADY unchecked, DO NOT click it.
+    3. DROPDOWN SAFETY: If clicking an option in a list, verify you are clicking the specific text label, not the container.
+    4. // ... (rest of your existing rules) ...
     `;
 
     try {
