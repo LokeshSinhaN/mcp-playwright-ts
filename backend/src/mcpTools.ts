@@ -1126,17 +1126,18 @@ async runAutonomousAgent(
   }
 
   // ---------------------------------------------------------------------------
-  // FIX 1: ROBUST JSON PARSER (Handles Markdown, Multiple Objects, & Chatter)
+  // FINAL FIX: DEFENSIVE PARSER (Guaranteed to return a valid AgentAction)
   // ---------------------------------------------------------------------------
   private parseAgentActionResponse(raw: string): AgentAction {
-    // 1. Basic cleanup
+    // 1. Basic cleanup of markdown and whitespace
     let clean = raw.replace(/```json\s*|\s*```/gi, '').trim();
     
-    // We start with a base object
+    // 2. Initialize a safe default object
     let finalObj: any = {};
     let foundAny = false;
 
-    // STRATEGY 1: Scan for ALL JSON objects and intelligently merge them.
+    // 3. Scan for ALL JSON objects (chunks) in the response and merge them.
+    // This handles cases where Gemini splits thought and action into separate blocks.
     let currentIndex = 0;
     while (true) {
         const result = this.extractBalancedJson(clean, currentIndex);
@@ -1145,21 +1146,19 @@ async runAutonomousAgent(
         try {
             const parsed = JSON.parse(result.json);
             
-            // CRITICAL FIX: If the new object has a 'type' or 'action', 
-            // it effectively starts a new command. We should keep the 'thought' 
-            // but reset action-specific fields to avoid mixing conflicting params.
+            // If the chunk contains a new action type, it overrides previous ones.
+            // We preserve the 'thought' to ensure we don't lose reasoning.
             if (parsed.type || parsed.action) {
-                 // Keep reasoning, but wipe old execution params
                  const preservedThought = parsed.thought || parsed.reasoning || finalObj.thought || finalObj.reasoning;
+                 // Reset action params to avoid mixing (e.g. don't keep 'text' if switching to 'click')
                  finalObj = { 
                      thought: preservedThought, 
-                     ...parsed // This applies the new action and its specific params
+                     ...parsed 
                  };
             } else {
-                // If it's just a chunk (like {"thought": "..."}), just merge it in
+                // It's a partial chunk (like just thoughts), merge it in.
                 finalObj = { ...finalObj, ...parsed };
             }
-            
             foundAny = true;
         } catch (e) {
             // Ignore malformed chunks
@@ -1167,9 +1166,10 @@ async runAutonomousAgent(
         currentIndex = result.endEndex;
     }
 
-    // STRATEGY 2: Fallback for unquoted keys (if no valid JSON found above)
+    // 4. Fallback: If strict JSON parsing failed, try to recover unquoted keys
     if (!foundAny) {
         try {
+             // Regex to quote unquoted keys: { type: click } -> { "type": "click" }
              const repaired = clean.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
              const match = repaired.match(/\{[\s\S]*\}/);
              if (match) {
@@ -1179,32 +1179,22 @@ async runAutonomousAgent(
         } catch {}
     }
 
-    if (!foundAny) {
-        return {
-            type: 'wait',
-            durationMs: 2000,
-            thought: 'Failed to parse AI response (Invalid JSON). Waiting to retry.',
-        };
-    }
-
-    // Normalize keys
+    // 5. Normalization
     const thought = finalObj.thought || finalObj.reasoning || 'No reasoning provided';
-    const type = finalObj.type || finalObj.action; 
+    const rawType = finalObj.type || finalObj.action; 
 
-    // Safety Check: Missing Type
-    if (!type) {
-         if (finalObj.plan?.type) return this.parseAgentActionResponse(JSON.stringify(finalObj.plan));
-         if (finalObj.response?.type) return this.parseAgentActionResponse(JSON.stringify(finalObj.response));
-
+    // 6. ULTIMATE SAFETY CHECK: If no type was found, force a WAIT action.
+    // This prevents "Unknown agent action type: undefined" errors.
+    if (!rawType) {
          return { 
             type: 'wait', 
-            durationMs: 1000, 
-            thought: `AI response valid but missing "type" field. Got keys: ${Object.keys(finalObj).join(', ')}` 
+            durationMs: 2000, 
+            thought: `AI response was valid but missing "type". Raw keys: ${Object.keys(finalObj).join(', ')}` 
         };
     }
 
-    // Map to AgentAction types
-    switch (type) {
+    // 7. Map to AgentAction types
+    switch (rawType.toLowerCase()) {
         case 'click':
         case 'click_element':
             return { type: 'click', selector: finalObj.selector || finalObj.elementId, thought };
@@ -1216,12 +1206,19 @@ async runAutonomousAgent(
         case 'goto':
             return { type: 'navigate', url: finalObj.url, thought };
         case 'wait':
-            return { type: 'wait', durationMs: finalObj.durationMs || 2000, thought };
+        case 'delay':
+            return { type: 'wait', durationMs: finalObj.durationMs || 1000, thought };
         case 'finish':
         case 'done':
+        case 'complete':
             return { type: 'finish', thought, summary: finalObj.summary || 'Task completed' };
+        case 'scroll':
+            return { type: 'scroll', direction: finalObj.direction || 'down', thought };
+        case 'select_option':
+             return { type: 'select_option', selector: finalObj.selector, option: finalObj.option, thought };
         default:
-            return { type: 'wait', durationMs: 1000, thought: `Unknown action "${type}". Retrying.` };
+            // Graceful fallback for hallucinations
+            return { type: 'wait', durationMs: 1000, thought: `Unknown action type "${rawType}". Waiting to retry.` };
     }
   }
 

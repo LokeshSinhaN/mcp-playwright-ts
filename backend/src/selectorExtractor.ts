@@ -109,7 +109,9 @@ export class SelectorExtractor {
       const typeAttr = getAttr('type');
       const placeholder = getAttr('placeholder');
       const ariaLabel = getAttr('aria-label');
-      const valueAttr = getAttr('value'); // <--- ADD THIS
+            // Read the LIVE property 'value' first (what the user typed),
+      // falling back to the attribute (initial value) if needed.
+      const valueAttr = (el as any).value !== undefined ? String((el as any).value) : getAttr('value');
       const titleAttr = getAttr('title');
       const dataTestId = getAttr('data-testid');
       const href = getAttr('href');
