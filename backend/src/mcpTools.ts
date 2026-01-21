@@ -1009,7 +1009,7 @@ async runAutonomousAgent(
                  if (nextAction.type !== 'finish') {
                      this.sessionHistory.push({
                          action: nextAction.type as any, 
-                         target: nextAction.selector || (nextAction as any).semanticTarget || nextAction.url,
+                         target: (nextAction as any).selector || (nextAction as any).semanticTarget || (nextAction as any).url,
                          value: (nextAction as any).text,
                          description: nextAction.thought,
                          selectors: result.elementInfo ? {
@@ -1185,9 +1185,256 @@ async runAutonomousAgent(
     HISTORY:
     ${actionHistory.slice(-5).join('\n')}
 
-    VISIBLE ELEMENTS:
+    VISIBLE ELEMENTS (truncated to 300):
     ${JSON.stringify(elementList)}
+
+    FAILED ELEMENT IDS (avoid reusing selectors that already failed):
+    ${JSON.stringify(Array.from(failedElements))}
 
     RULES:
     1. RETURN ONLY ONE JSON OBJECT. Do not return a list. Do not add comments.
-    2. USE
+    2. USE THIS JSON SHAPE EXACTLY:
+       {
+         "type": "navigate" | "click" | "type" | "scroll" | "wait" | "finish",
+         "url": string,                 // when type === "navigate"
+         "selector": string,            // when type === "click" or "type"
+         "text": string,                // when type === "type"
+         "direction": "up" | "down",  // when type === "scroll"
+         "durationMs": number,          // when type === "wait"
+         "summary": string,             // when type === "finish"
+         "thought": string              // brief reasoning for this single step
+       }
+    3. ALWAYS include the "thought" field.
+    4. If the goal already appears achieved, return a "finish" action with a clear summary.
+    5. If you are uncertain what to do next, return a short "wait" action instead of guessing.
+    `;
+
+    try {
+      const llmResult = await this.withTimeout(
+        this.model.generateContent({
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: prompt }],
+            },
+          ],
+        } as any),
+        45000,
+        'Agent planner',
+      );
+
+      const rawText = (llmResult as any).response?.text?.() ?? '';
+      return this.parseAgentActionResponse(rawText);
+    } catch (err) {
+      console.warn('planNextAgentAction LLM failure, falling back to wait:', err);
+      return {
+        type: 'wait',
+        durationMs: 1000,
+        thought: 'LLM planner failed; waiting briefly before retrying.',
+      };
+    }
+  }
+
+  /**
+   * Execute a single AgentAction and return a compact result for the
+   * autonomous agent loop. This never throws for normal interaction
+   * issues; instead it encodes failures in the returned object so the
+   * caller can apply self-healing and retries.
+   */
+  private async executeAgentAction(
+    action: AgentAction,
+    elements: ElementInfo[],
+    attempt: number,
+    failedElements: Set<string>,
+  ): Promise<{ success: boolean; message: string; failedSelector?: string; elementInfo?: ElementInfo }> {
+    try {
+      switch (action.type) {
+        case 'navigate': {
+          if (!action.url) {
+            return { success: false, message: 'No URL provided for navigate action.' };
+          }
+          const result = await this.navigate(action.url);
+          return { success: result.success, message: result.message };
+        }
+
+        case 'click':
+        case 'select_option': {
+          const selectorFromAction = action.selector;
+          const semanticTarget = (action as any).semanticTarget as string | undefined;
+          let selectorToUse: string | undefined = selectorFromAction;
+
+          // If we only have an elementId (e.g., "el_3"), map it back to the
+          // visibleElements list we showed the model in planNextAgentAction.
+          if (!selectorToUse && action.elementId) {
+            const visibleElements = elements.filter(
+              (el) =>
+                el.visible &&
+                el.tagName !== 'script' &&
+                el.tagName !== 'style' &&
+                el.tagName !== 'link' &&
+                !(el.tagName === 'input' && el.attributes?.type === 'hidden'),
+            );
+            const match = action.elementId.match(/^el_(\d+)$/);
+            if (match) {
+              const idx = Number.parseInt(match[1], 10);
+              const el = visibleElements[idx];
+              if (el) {
+                selectorToUse = el.selector || el.cssSelector || el.xpath;
+              }
+            }
+          }
+
+          if (!selectorToUse && semanticTarget) {
+            // Fall back to semantic click using the high-level target.
+            const result = await this.click(semanticTarget);
+            const elementInfo = result.selectors?.[0];
+            return {
+              success: result.success,
+              message: result.message,
+              elementInfo,
+            };
+          }
+
+          if (!selectorToUse) {
+            return { success: false, message: 'No selector provided for click action.' };
+          }
+
+          const result = await this.clickExact(selectorToUse, semanticTarget || selectorToUse);
+          const elementInfo = result.selectors?.[0];
+          return {
+            success: result.success,
+            message: result.message,
+            failedSelector: result.success ? undefined : selectorToUse,
+            elementInfo,
+          };
+        }
+
+        case 'type': {
+          const text = action.text ?? '';
+          if (!text) {
+            return { success: false, message: 'No text provided for type action.' };
+          }
+
+          let selectorToUse = action.selector;
+          const semanticTarget = (action as any).semanticTarget as string | undefined;
+
+          if (!selectorToUse && action.elementId) {
+            const visibleElements = elements.filter(
+              (el) =>
+                el.visible &&
+                el.tagName !== 'script' &&
+                el.tagName !== 'style' &&
+                el.tagName !== 'link' &&
+                !(el.tagName === 'input' && el.attributes?.type === 'hidden'),
+            );
+            const match = action.elementId.match(/^el_(\d+)$/);
+            if (match) {
+              const idx = Number.parseInt(match[1], 10);
+              const el = visibleElements[idx];
+              if (el) {
+                selectorToUse = el.selector || el.cssSelector || el.xpath;
+              }
+            }
+          }
+
+          if (!selectorToUse && semanticTarget) {
+            selectorToUse = semanticTarget;
+          }
+
+          if (!selectorToUse) {
+            return { success: false, message: 'No selector provided for type action.' };
+          }
+
+          const result = await this.type(selectorToUse, text);
+          const elementInfo = result.selectors?.[0];
+          return {
+            success: result.success,
+            message: result.message,
+            failedSelector: result.success ? undefined : selectorToUse,
+            elementInfo,
+          };
+        }
+
+        case 'scroll': {
+          const page = this.browser.getPage();
+          const distance = action.direction === 'up' ? -500 : 500;
+          await page.mouse.wheel(0, distance);
+          return {
+            success: true,
+            message: `Scrolled ${action.direction}.`,
+          };
+        }
+
+        case 'wait': {
+          const page = this.browser.getPage();
+          const ms = action.durationMs ?? 1000;
+          await page.waitForTimeout(ms);
+          return {
+            success: true,
+            message: `Waited ${ms}ms.`,
+          };
+        }
+
+        case 'scrape_data': {
+          // For now, treat this as a no-op that always succeeds and relies on
+          // the caller to use observe()/extractSelectors() explicitly when
+          // scraping is needed.
+          return {
+            success: true,
+            message: `Scrape instruction noted: ${action.instruction}`,
+          };
+        }
+
+        case 'finish': {
+          return {
+            success: true,
+            message: action.summary,
+          };
+        }
+
+        default: {
+          return {
+            success: false,
+            message: `Unknown agent action type: ${(action as any).type}`,
+          };
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        success: false,
+        message: `Action execution error: ${msg}`,
+      };
+    }
+  }
+
+  /**
+   * Human-readable description of an AgentAction for logging and
+   * high-level summaries.
+   */
+  private describeAction(action: AgentAction, success: boolean): string {
+    const status = success ? '✓' : '✗';
+
+    switch (action.type) {
+      case 'navigate':
+        return `${status} navigate to ${action.url}`;
+      case 'click':
+      case 'select_option':
+        return `${status} click ${action.selector || action.elementId || (action as any).semanticTarget || 'element'}`;
+      case 'type':
+        return `${status} type "${action.text}" into ${
+          action.selector || action.elementId || (action as any).semanticTarget || 'field'
+        }`;
+      case 'scroll':
+        return `${status} scroll ${action.direction}`;
+      case 'wait':
+        return `${status} wait ${action.durationMs}ms`;
+      case 'scrape_data':
+        return `${status} scrape data: ${action.instruction}`;
+      case 'finish':
+        return `${status} finish: ${action.summary}`;
+      default:
+        return `${status} unknown action`;
+    }
+  }
+}
