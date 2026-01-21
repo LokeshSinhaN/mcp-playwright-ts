@@ -1089,8 +1089,8 @@ async runAutonomousAgent(
    * Helper: reliably extract the first valid balanced JSON object from a string,
    * handling nested braces correcty (which regex fails at).
    */
-  private extractBalancedJson(text: string): string | null {
-    const start = text.indexOf('{');
+  private extractBalancedJson(text: string, startIndex: number = 0): { json: string, endEndex: number } | null {
+    const start = text.indexOf('{', startIndex);
     if (start === -1) return null;
 
     let balance = 0;
@@ -1116,7 +1116,10 @@ async runAutonomousAgent(
       }
 
       if (balance === 0) {
-        return text.substring(start, i + 1);
+        return { 
+            json: text.substring(start, i + 1),
+            endEndex: i + 1,
+        };
       }
     }
     return null;
@@ -1128,57 +1131,75 @@ async runAutonomousAgent(
   private parseAgentActionResponse(raw: string): AgentAction {
     // 1. Basic cleanup
     let clean = raw.replace(/```json\s*|\s*```/gi, '').trim();
+    
+    // We start with a base object
+    let finalObj: any = {};
+    let foundAny = false;
 
-    let parsed: any = null;
+    // STRATEGY 1: Scan for ALL JSON objects and intelligently merge them.
+    let currentIndex = 0;
+    while (true) {
+        const result = this.extractBalancedJson(clean, currentIndex);
+        if (!result) break;
 
-    // STRATEGY 1: Direct Parse (Best for clean responses)
-    try {
-        parsed = JSON.parse(clean);
-    } catch {
-        // STRATEGY 2: Balanced Brace Extraction (Fixes the "Undefined" error)
-        // This handles nested objects like { "type": "click", "selectors": {...} }
-        const extracted = this.extractBalancedJson(clean);
-        if (extracted) {
-            try {
-                parsed = JSON.parse(extracted);
-            } catch (e) {
-                console.warn('JSON parse failed on extracted snippet:', extracted);
+        try {
+            const parsed = JSON.parse(result.json);
+            
+            // CRITICAL FIX: If the new object has a 'type' or 'action', 
+            // it effectively starts a new command. We should keep the 'thought' 
+            // but reset action-specific fields to avoid mixing conflicting params.
+            if (parsed.type || parsed.action) {
+                 // Keep reasoning, but wipe old execution params
+                 const preservedThought = parsed.thought || parsed.reasoning || finalObj.thought || finalObj.reasoning;
+                 finalObj = { 
+                     thought: preservedThought, 
+                     ...parsed // This applies the new action and its specific params
+                 };
+            } else {
+                // If it's just a chunk (like {"thought": "..."}), just merge it in
+                finalObj = { ...finalObj, ...parsed };
             }
+            
+            foundAny = true;
+        } catch (e) {
+            // Ignore malformed chunks
         }
+        currentIndex = result.endEndex;
     }
 
-    // STRATEGY 3: Fallback for unquoted keys (Common LLM error)
-    if (!parsed) {
+    // STRATEGY 2: Fallback for unquoted keys (if no valid JSON found above)
+    if (!foundAny) {
         try {
-             // Regex to quote unquoted keys: { type: "click" } -> { "type": "click" }
              const repaired = clean.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
-             parsed = JSON.parse(repaired);
+             const match = repaired.match(/\{[\s\S]*\}/);
+             if (match) {
+                 finalObj = JSON.parse(match[0]);
+                 foundAny = true;
+             }
         } catch {}
     }
 
-    if (!parsed) {
+    if (!foundAny) {
         return {
             type: 'wait',
             durationMs: 2000,
-            thought: 'Failed to parse AI response. Waiting to retry planning.',
+            thought: 'Failed to parse AI response (Invalid JSON). Waiting to retry.',
         };
     }
 
     // Normalize keys
-    const thought = parsed.thought || parsed.reasoning || 'No reasoning provided';
-    const type = parsed.type || parsed.action; 
+    const thought = finalObj.thought || finalObj.reasoning || 'No reasoning provided';
+    const type = finalObj.type || finalObj.action; 
 
-    // Safety Check: If we parsed an object but it has no "type", it's likely a nested chunk 
-    // or a "thought-only" response.
+    // Safety Check: Missing Type
     if (!type) {
-         // Check if the model wrapped the action in a "plan" or "response" key
-         if (parsed.plan?.type) return this.parseAgentActionResponse(JSON.stringify(parsed.plan));
-         if (parsed.response?.type) return this.parseAgentActionResponse(JSON.stringify(parsed.response));
+         if (finalObj.plan?.type) return this.parseAgentActionResponse(JSON.stringify(finalObj.plan));
+         if (finalObj.response?.type) return this.parseAgentActionResponse(JSON.stringify(finalObj.response));
 
          return { 
             type: 'wait', 
             durationMs: 1000, 
-            thought: `AI response valid but missing "type". Got keys: ${Object.keys(parsed).join(', ')}` 
+            thought: `AI response valid but missing "type" field. Got keys: ${Object.keys(finalObj).join(', ')}` 
         };
     }
 
@@ -1186,23 +1207,23 @@ async runAutonomousAgent(
     switch (type) {
         case 'click':
         case 'click_element':
-            return { type: 'click', selector: parsed.selector || parsed.elementId, thought };
+            return { type: 'click', selector: finalObj.selector || finalObj.elementId, thought };
         case 'type':
         case 'fill': 
         case 'input': 
-            return { type: 'type', selector: parsed.selector || parsed.elementId, text: parsed.text || parsed.value || '', thought };
+            return { type: 'type', selector: finalObj.selector || finalObj.elementId, text: finalObj.text || finalObj.value || '', thought };
         case 'navigate':
         case 'goto':
-            return { type: 'navigate', url: parsed.url, thought };
+            return { type: 'navigate', url: finalObj.url, thought };
         case 'wait':
-            return { type: 'wait', durationMs: parsed.durationMs || 2000, thought };
+            return { type: 'wait', durationMs: finalObj.durationMs || 2000, thought };
         case 'finish':
         case 'done':
-            return { type: 'finish', thought, summary: parsed.summary || 'Task completed' };
+            return { type: 'finish', thought, summary: finalObj.summary || 'Task completed' };
         default:
             return { type: 'wait', durationMs: 1000, thought: `Unknown action "${type}". Retrying.` };
     }
-}
+  }
 
   // ---------------------------------------------------------------------------
   // FIX 2: INTELLIGENT PLANNER (Forces Single-Step & Visibility)
