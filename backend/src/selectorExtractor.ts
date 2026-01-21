@@ -79,12 +79,8 @@ export class SelectorExtractor {
     return this.extractFromHandle(handle);
   }
 
+  //
   async extractFromHandle(handle: ElementHandle): Promise<ElementInfo> {
-    // Before extracting metadata, ensure we are pointing at the most
-    // appropriate interactive ancestor for this element. This prevents us
-    // from trying to click on passive children such as <span> or text nodes
-    // when the actual event listener is attached on an enclosing <button>,
-    // <a>, or other semantic control.
     const interactiveHandle = await this.resolveInteractiveHandle(handle);
 
     const base = await interactiveHandle.evaluate((el: any) => {
@@ -109,7 +105,7 @@ export class SelectorExtractor {
       const typeAttr = getAttr('type');
       const placeholder = getAttr('placeholder');
       const ariaLabel = getAttr('aria-label');
-            // Read the LIVE property 'value' first (what the user typed),
+      // Read the LIVE property 'value' first (what the user typed),
       // falling back to the attribute (initial value) if needed.
       const valueAttr = (el as any).value !== undefined ? String((el as any).value) : getAttr('value');
       const titleAttr = getAttr('title');
@@ -120,9 +116,6 @@ export class SelectorExtractor {
         (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
 
       // --- Structural region detection ---
-      // Prefer semantic landmarks when available and fall back to viewport
-      // position only when necessary. This enables better disambiguation of
-      // duplicate controls (e.g., header vs footer buttons).
       const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
       let region: 'header' | 'main' | 'footer' = 'main';
 
@@ -141,8 +134,6 @@ export class SelectorExtractor {
       } else if (closestSafe('main')) {
         region = 'main';
       } else {
-        // Fallback: approximate using vertical position when landmarks are not
-        // present.
         if (rect.top < viewportHeight * 0.25) region = 'header';
         else if (rect.top > viewportHeight * 0.75) region = 'footer';
         else region = 'main';
@@ -151,34 +142,16 @@ export class SelectorExtractor {
       // --- Smart Context computation ---
       const getText = (node: any | null): string => {
         if (!node) return '';
-        const txt = (node.textContent || '').trim();
-        return txt;
+        return (node.textContent || '').trim();
       };
 
       const isSectionHeader = (node: any | null): boolean => {
         if (!node || node.nodeType !== 1) return false;
         const t = (node.tagName || '').toLowerCase();
         if (/^h[1-6]$/.test(t)) return true;
-
-        // Use safe attribute access to avoid SVGAnimatedString / non-string className issues.
-        const roleAttr =
-          typeof (node as any).getAttribute === 'function'
-            ? (node as any).getAttribute('role') || ''
-            : '';
+        const roleAttr = typeof (node as any).getAttribute === 'function' ? (node as any).getAttribute('role') || '' : '';
         if (roleAttr && roleAttr.toLowerCase() === 'heading') return true;
-
-        const rawId = (node as any).id ?? '';
-        const id = (typeof rawId === 'string' ? rawId : String(rawId)).toLowerCase();
-        const classStr =
-          typeof (node as any).getAttribute === 'function'
-            ? (node as any).getAttribute('class') || ''
-            : typeof (node as any).className === 'string'
-            ? (node as any).className
-            : '';
-        const className = classStr.toLowerCase();
-        const combined = `${id} ${className}`;
-        const keywords = ['title', 'header', 'name', 'card-label', 'profile'];
-        return keywords.some((k) => combined.includes(k));
+        return false;
       };
 
       const findSectionHeaderContext = (start: any): string => {
@@ -187,10 +160,7 @@ export class SelectorExtractor {
         while (current && depth < 7) {
           let sib = current.previousElementSibling;
           while (sib) {
-            if (isSectionHeader(sib)) {
-              const txt = getText(sib);
-              if (txt) return txt;
-            }
+            if (isSectionHeader(sib)) return getText(sib);
             sib = sib.previousElementSibling;
           }
           current = current.parentElement;
@@ -200,46 +170,26 @@ export class SelectorExtractor {
       };
 
       let context: string | undefined;
-
-      // Strategy 1: immediate visual context for inputs (labels next to fields).
       if (roleHint === 'input') {
         const directLabel = getText(el.previousElementSibling);
-        let gridLabel = '';
-        if (!directLabel && el.parentElement) {
-          gridLabel = getText(el.parentElement.previousElementSibling);
-        }
+        const gridLabel = !directLabel && el.parentElement ? getText(el.parentElement.previousElementSibling) : '';
         const combined = [directLabel, gridLabel].filter(Boolean).join(' | ');
-        if (combined) {
-          context = combined;
-        }
+        if (combined) context = combined;
       }
 
-      // Strategy 2: DOM-walk for section headers for all interactive elements.
       if (!context && (roleHint === 'button' || roleHint === 'link' || roleHint === 'other' || roleHint === 'input')) {
         const header = findSectionHeaderContext(el);
-        if (header) {
-          context = header;
-        }
+        if (header) context = header;
       }
 
-      // Smart text extraction: prefer accessible helper text such as .sr-only or
-      // .visually-hidden children when present (often used for icon buttons).
       let srOnlyText = '';
       if (typeof el.querySelectorAll === 'function') {
         const hiddenNodes = el.querySelectorAll('.sr-only, .visually-hidden');
-        srOnlyText = Array.from(hiddenNodes)
-          .map((n: any) => (n.textContent || '').trim())
-          .filter(Boolean)
-          .join(' ')
-          .trim();
+        srOnlyText = Array.from(hiddenNodes).map((n: any) => (n.textContent || '').trim()).filter(Boolean).join(' ').trim();
       }
 
       const rawText = (el.textContent || '').trim();
-
-      // INTELLIGENT FALLBACK: If text content is empty, check the 'value' attribute.
-      // This is critical for <input type="submit" value="Go">
       const effectiveText = rawText || (tagName === 'input' ? valueAttr : '') || '';
-
       const mainText = (srOnlyText || effectiveText) || undefined;
 
       return {
@@ -265,6 +215,20 @@ export class SelectorExtractor {
     const cssSelector = await this.generateCss(interactiveHandle);
     const xpath = await this.generateXpath(interactiveHandle);
 
+    // --- FIX START: FORCE VALUE INTO ATTRIBUTES ---
+    const rawAttrs = Object.fromEntries(base.attrs);
+    
+    // Explicitly add 'value' if it's an input/textarea so the LLM sees it clearly.
+    // We prefer the property (what user typed) over the attribute (initial HTML).
+    if (base.tagName === 'input' || base.tagName === 'textarea') {
+         // We retrieve the value we read inside the evaluate block (base.text usually captures it, 
+         // but let's be explicit in attributes for the LLM).
+         // Note: In the evaluate block above, we didn't export 'valueAttr' directly in the return object 
+         // except via text. Let's rely on the fact that for inputs, text === valueAttr.
+         rawAttrs['value'] = base.text || '';
+    }
+    // --- FIX END ---
+
     return {
       tagName: base.tagName,
       id: base.id,
@@ -286,7 +250,7 @@ export class SelectorExtractor {
       boundingBox: base.boundingBox,
       rect: base.boundingBox,
       context: base.context,
-      attributes: Object.fromEntries(base.attrs)
+      attributes: rawAttrs // Updated attributes
     };
   }
 

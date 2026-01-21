@@ -1128,16 +1128,16 @@ async runAutonomousAgent(
   // ---------------------------------------------------------------------------
   // FINAL FIX: DEFENSIVE PARSER (Guaranteed to return a valid AgentAction)
   // ---------------------------------------------------------------------------
+  //
   private parseAgentActionResponse(raw: string): AgentAction {
-    // 1. Basic cleanup of markdown and whitespace
+    // 1. Basic cleanup
     let clean = raw.replace(/```json\s*|\s*```/gi, '').trim();
     
-    // 2. Initialize a safe default object
+    // 2. Initialize
     let finalObj: any = {};
     let foundAny = false;
 
-    // 3. Scan for ALL JSON objects (chunks) in the response and merge them.
-    // This handles cases where Gemini splits thought and action into separate blocks.
+    // 3. Scan for ALL JSON objects (chunks) and merge them.
     let currentIndex = 0;
     while (true) {
         const result = this.extractBalancedJson(clean, currentIndex);
@@ -1147,29 +1147,23 @@ async runAutonomousAgent(
             const parsed = JSON.parse(result.json);
             
             // If the chunk contains a new action type, it overrides previous ones.
-            // We preserve the 'thought' to ensure we don't lose reasoning.
             if (parsed.type || parsed.action) {
                  const preservedThought = parsed.thought || parsed.reasoning || finalObj.thought || finalObj.reasoning;
-                 // Reset action params to avoid mixing (e.g. don't keep 'text' if switching to 'click')
                  finalObj = { 
                      thought: preservedThought, 
                      ...parsed 
                  };
             } else {
-                // It's a partial chunk (like just thoughts), merge it in.
                 finalObj = { ...finalObj, ...parsed };
             }
             foundAny = true;
-        } catch (e) {
-            // Ignore malformed chunks
-        }
+        } catch (e) { }
         currentIndex = result.endEndex;
     }
 
-    // 4. Fallback: If strict JSON parsing failed, try to recover unquoted keys
+    // 4. Fallback for unquoted keys
     if (!foundAny) {
         try {
-             // Regex to quote unquoted keys: { type: click } -> { "type": "click" }
              const repaired = clean.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
              const match = repaired.match(/\{[\s\S]*\}/);
              if (match) {
@@ -1179,22 +1173,29 @@ async runAutonomousAgent(
         } catch {}
     }
 
-    // 5. Normalization
+    // 5. Normalization & Type Safety
     const thought = finalObj.thought || finalObj.reasoning || 'No reasoning provided';
-    const rawType = finalObj.type || finalObj.action; 
+    let rawType = finalObj.type || finalObj.action; 
 
-    // 6. ULTIMATE SAFETY CHECK: If no type was found, force a WAIT action.
-    // This prevents "Unknown agent action type: undefined" errors.
+    // Handle "undefined" string literals or bad types universally
+    if (typeof rawType === 'string') {
+        rawType = rawType.toLowerCase().trim();
+        if (['undefined', 'null', 'none', 'unknown'].includes(rawType)) {
+            rawType = 'wait'; // Default to safe wait
+        }
+    }
+
+    // 6. Safety Check
     if (!rawType) {
          return { 
             type: 'wait', 
             durationMs: 2000, 
-            thought: `AI response was valid but missing "type". Raw keys: ${Object.keys(finalObj).join(', ')}` 
+            thought: `AI response valid but missing "type". Keys: ${Object.keys(finalObj).join(', ')}` 
         };
     }
 
-    // 7. Map to AgentAction types
-    switch (rawType.toLowerCase()) {
+    // 7. Universal Map to AgentAction types
+    switch (rawType) {
         case 'click':
         case 'click_element':
             return { type: 'click', selector: finalObj.selector || finalObj.elementId, thought };
@@ -1217,7 +1218,7 @@ async runAutonomousAgent(
         case 'select_option':
              return { type: 'select_option', selector: finalObj.selector, option: finalObj.option, thought };
         default:
-            // Graceful fallback for hallucinations
+            // Safe fallback for any hallucinated action type
             return { type: 'wait', durationMs: 1000, thought: `Unknown action type "${rawType}". Waiting to retry.` };
     }
   }
@@ -1225,6 +1226,7 @@ async runAutonomousAgent(
   // ---------------------------------------------------------------------------
   // FIX 2: INTELLIGENT PLANNER (Forces Single-Step & Visibility)
   // ---------------------------------------------------------------------------
+  //
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
@@ -1234,23 +1236,26 @@ async runAutonomousAgent(
   ): Promise<AgentAction> {
     if (!this.model) return { type: 'finish', thought: 'No AI', summary: 'No AI' };
 
-    // FILTER HIDDEN ELEMENTS: Never show hidden inputs like __VIEWSTATE to the AI
+    // FILTER HIDDEN ELEMENTS
     const visibleElements = elements.filter(el => 
         el.visible && 
         el.tagName !== 'script' && 
         el.tagName !== 'style' && 
         el.tagName !== 'link' &&
-        !(el.tagName === 'input' && el.attributes?.type === 'hidden') // CRITICAL for ASP.NET
+        !(el.tagName === 'input' && el.attributes?.type === 'hidden')
     );
 
     const elementList = visibleElements.slice(0, 300).map((el, idx) => ({
         id: `el_${idx}`,
         tag: el.tagName,
+        // Show text OR value clearly so the AI knows if a field is filled
         text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
+        value: el.attributes?.['value'] || '', 
         label: el.ariaLabel || el.placeholder || '',
         selector: el.selector || el.cssSelector
     }));
 
+    // --- UNIVERSAL PROMPT (NO HARDCODED VALUES) ---
     const prompt = `
     SYSTEM: You are an autonomous browser agent.
     GOAL: ${goal}
@@ -1261,25 +1266,26 @@ async runAutonomousAgent(
     VISIBLE ELEMENTS (truncated to 300):
     ${JSON.stringify(elementList)}
 
-    FAILED ELEMENT IDS (avoid reusing selectors that already failed):
+    FAILED ELEMENT IDS:
     ${JSON.stringify(Array.from(failedElements))}
 
     RULES:
-    1. RETURN ONLY ONE JSON OBJECT. Do not return a list. Do not add comments.
-    2. USE THIS JSON SHAPE EXACTLY:
+    1. RETURN ONLY ONE JSON OBJECT. Do not return a list.
+    2. CHECK THE 'value' FIELD of inputs. If an input field already contains the correct text required by the GOAL, DO NOT type it again.
+    3. If the input values are already correct, move to the NEXT logical step (e.g., clicking a submit, search, filter, or continue button).
+    4. If you have just clicked a button that triggers a loading state, search, or navigation, WAIT for the system to react. Do not click the same button again immediately.
+    5. USE THIS JSON SHAPE EXACTLY:
        {
          "type": "navigate" | "click" | "type" | "scroll" | "wait" | "finish",
          "url": string,                 // when type === "navigate"
          "selector": string,            // when type === "click" or "type"
          "text": string,                // when type === "type"
-         "direction": "up" | "down",  // when type === "scroll"
+         "direction": "up" | "down",    // when type === "scroll"
          "durationMs": number,          // when type === "wait"
          "summary": string,             // when type === "finish"
          "thought": string              // brief reasoning for this single step
        }
-    3. ALWAYS include the "thought" field.
-    4. If the goal already appears achieved, return a "finish" action with a clear summary.
-    5. If you are uncertain what to do next, return a short "wait" action instead of guessing.
+    6. ALWAYS include the "thought" field explaining why you are taking this step.
     `;
 
     try {
