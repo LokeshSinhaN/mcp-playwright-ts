@@ -1085,47 +1085,102 @@ async runAutonomousAgent(
     return sessionResult;
 }
 
+  /**
+   * Helper: reliably extract the first valid balanced JSON object from a string,
+   * handling nested braces correcty (which regex fails at).
+   */
+  private extractBalancedJson(text: string): string | null {
+    const start = text.indexOf('{');
+    if (start === -1) return null;
+
+    let balance = 0;
+    let inQuote = false;
+    let escape = false;
+
+    for (let i = start; i < text.length; i++) {
+      const char = text[i];
+
+      // Handle strings to ignore braces inside them
+      if (char === '\\' && !escape) {
+        escape = true;
+        continue;
+      }
+      if (char === '"' && !escape) {
+        inQuote = !inQuote;
+      }
+      escape = false;
+
+      if (!inQuote) {
+        if (char === '{') balance++;
+        else if (char === '}') balance--;
+      }
+
+      if (balance === 0) {
+        return text.substring(start, i + 1);
+      }
+    }
+    return null;
+  }
+
   // ---------------------------------------------------------------------------
   // FIX 1: ROBUST JSON PARSER (Handles Markdown, Multiple Objects, & Chatter)
   // ---------------------------------------------------------------------------
   private parseAgentActionResponse(raw: string): AgentAction {
-    // 1. clean markdown code blocks
+    // 1. Basic cleanup
     let clean = raw.replace(/```json\s*|\s*```/gi, '').trim();
-    
-    // 2. Extract the FIRST valid JSON object using a regex that matches balanced braces
-    // This ignores extra text before/after the JSON.
-    const jsonMatch = clean.match(/(\{[\s\S]*\})/);
-    if (jsonMatch) {
-        clean = jsonMatch[0];
-    }
 
-    let parsed: any;
+    let parsed: any = null;
+
+    // STRATEGY 1: Direct Parse (Best for clean responses)
     try {
-        // Try parsing. If the LLM sent multiple objects (e.g. {}{}), this will fail.
-        // We catch that and try to slice just the first one.
         parsed = JSON.parse(clean);
-    } catch (e) {
-        try {
-            // Fallback: finding the first closing brace
-            const firstEnd = clean.indexOf('}');
-            if (firstEnd > -1) {
-                parsed = JSON.parse(clean.substring(0, firstEnd + 1));
-            } else {
-                throw e; 
+    } catch {
+        // STRATEGY 2: Balanced Brace Extraction (Fixes the "Undefined" error)
+        // This handles nested objects like { "type": "click", "selectors": {...} }
+        const extracted = this.extractBalancedJson(clean);
+        if (extracted) {
+            try {
+                parsed = JSON.parse(extracted);
+            } catch (e) {
+                console.warn('JSON parse failed on extracted snippet:', extracted);
             }
-        } catch (err) {
-            console.warn('JSON Parse Failed. Raw:', raw);
-            return {
-                type: 'wait',
-                durationMs: 2000,
-                thought: 'Failed to parse AI response. Waiting to retry planning.',
-            };
         }
     }
 
-    // Normalize keys (handle "thought" vs "reasoning", etc)
+    // STRATEGY 3: Fallback for unquoted keys (Common LLM error)
+    if (!parsed) {
+        try {
+             // Regex to quote unquoted keys: { type: "click" } -> { "type": "click" }
+             const repaired = clean.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
+             parsed = JSON.parse(repaired);
+        } catch {}
+    }
+
+    if (!parsed) {
+        return {
+            type: 'wait',
+            durationMs: 2000,
+            thought: 'Failed to parse AI response. Waiting to retry planning.',
+        };
+    }
+
+    // Normalize keys
     const thought = parsed.thought || parsed.reasoning || 'No reasoning provided';
-    const type = parsed.type || parsed.action; // Robustness for 'action' vs 'type'
+    const type = parsed.type || parsed.action; 
+
+    // Safety Check: If we parsed an object but it has no "type", it's likely a nested chunk 
+    // or a "thought-only" response.
+    if (!type) {
+         // Check if the model wrapped the action in a "plan" or "response" key
+         if (parsed.plan?.type) return this.parseAgentActionResponse(JSON.stringify(parsed.plan));
+         if (parsed.response?.type) return this.parseAgentActionResponse(JSON.stringify(parsed.response));
+
+         return { 
+            type: 'wait', 
+            durationMs: 1000, 
+            thought: `AI response valid but missing "type". Got keys: ${Object.keys(parsed).join(', ')}` 
+        };
+    }
 
     // Map to AgentAction types
     switch (type) {
@@ -1133,8 +1188,8 @@ async runAutonomousAgent(
         case 'click_element':
             return { type: 'click', selector: parsed.selector || parsed.elementId, thought };
         case 'type':
-        case 'fill': // Handle synonym
-        case 'input': // Handle synonym
+        case 'fill': 
+        case 'input': 
             return { type: 'type', selector: parsed.selector || parsed.elementId, text: parsed.text || parsed.value || '', thought };
         case 'navigate':
         case 'goto':
@@ -1147,7 +1202,7 @@ async runAutonomousAgent(
         default:
             return { type: 'wait', durationMs: 1000, thought: `Unknown action "${type}". Retrying.` };
     }
-  }
+}
 
   // ---------------------------------------------------------------------------
   // FIX 2: INTELLIGENT PLANNER (Forces Single-Step & Visibility)
