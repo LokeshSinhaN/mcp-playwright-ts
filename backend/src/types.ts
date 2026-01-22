@@ -109,7 +109,7 @@ export type AgentAction =
   | { type: 'type'; elementId?: string; selector?: string; semanticTarget?: string; text: string; thought: string }
   | { type: 'select_option'; elementId?: string; selector?: string; semanticTarget?: string; option: string; thought: string } // NEW
   | { type: 'scrape_data'; instruction: string; thought: string } // NEW
-  | { type: 'scroll'; direction: 'up' | 'down'; thought: string }
+  | { type: 'scroll'; direction: 'up' | 'down'; elementId?: string; thought: string }
   | { type: 'wait'; durationMs: number; thought: string }
   | { type: 'finish'; thought: string; summary: string };
 

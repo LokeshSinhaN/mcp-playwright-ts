@@ -1124,15 +1124,15 @@ async runAutonomousAgent(
     }
     return null;
   }
+//
 
   // ---------------------------------------------------------------------------
-  // FIX: ROBUST JSON PARSER (Handles trailing commas & bad quotes)
+  // FIX: ROBUST JSON PARSER (Correctly separates IDs from Selectors)
   // ---------------------------------------------------------------------------
   private parseAgentActionResponse(raw: string): AgentAction {
     // 1. Basic cleanup
     let clean = raw.replace(/```json\s*|\s*```/gi, '').trim();
-    
-    // FIX: Remove trailing commas before closing braces (Common LLM error)
+    // Remove trailing commas
     clean = clean.replace(/,\s*([\]}])/g, '$1');
 
     let finalObj: any = {};
@@ -1191,15 +1191,27 @@ async runAutonomousAgent(
         };
     }
 
-    // Map types
+    // 5. Map types - CRITICAL FIX HERE
+    // Do NOT merge elementId into selector. Keep them distinct.
     switch (rawType) {
         case 'click':
         case 'click_element':
-            return { type: 'click', selector: finalObj.selector || finalObj.elementId, thought };
+            return { 
+                type: 'click', 
+                selector: finalObj.selector,   // Only if CSS provided
+                elementId: finalObj.elementId, // Keep separate!
+                thought 
+            };
         case 'type':
         case 'fill': 
         case 'input': 
-            return { type: 'type', selector: finalObj.selector || finalObj.elementId, text: finalObj.text || finalObj.value || '', thought };
+            return { 
+                type: 'type', 
+                selector: finalObj.selector,   // Only if CSS provided
+                elementId: finalObj.elementId, // Keep separate!
+                text: finalObj.text || finalObj.value || '', 
+                thought 
+            };
         case 'navigate':
         case 'goto':
             return { type: 'navigate', url: finalObj.url, thought };
@@ -1211,16 +1223,27 @@ async runAutonomousAgent(
         case 'complete':
             return { type: 'finish', thought, summary: finalObj.summary || 'Task completed' };
         case 'scroll':
-            return { type: 'scroll', direction: finalObj.direction || 'down', thought };
+            return { 
+                type: 'scroll', 
+                direction: finalObj.direction || 'down', 
+                elementId: finalObj.elementId, // Pass ID for container scrolling
+                thought 
+            };
         case 'select_option':
-             return { type: 'select_option', selector: finalObj.selector, option: finalObj.option, thought };
+             return { 
+                 type: 'select_option', 
+                 selector: finalObj.selector, 
+                 elementId: finalObj.elementId,
+                 option: finalObj.option, 
+                 thought 
+            };
         default:
             return { type: 'wait', durationMs: 1000, thought: `Unknown action type "${rawType}". Waiting to retry.` };
     }
   }
 
   // ---------------------------------------------------------------------------
-  // FIX: INTELLIGENT PLANNER PROMPT (Prevents "Wrong Item" clicks)
+  // FIX: INTELLIGENT PLANNER PROMPT (Prevents "Wrong Item" clicks & Loops)
   // ---------------------------------------------------------------------------
   private async planNextAgentAction(
     goal: string,
@@ -1259,12 +1282,13 @@ async runAutonomousAgent(
     ${JSON.stringify(Array.from(failedElements))}
 
     RULES:
-    1. **SCROLLING IS CRITICAL:** - If you need an option (e.g. "Medicare") and it is NOT in the visible list, do NOT try to click a random element.
+    1. **FORWARD PROGRESS ONLY:** - If you have just clicked a "Go", "Search", or "Filter" button, the filtering phase is DONE.
+       - **NEVER** go back to the dropdowns to uncheck/check items after clicking "Go".
+       - Your ONLY valid next step is to process the results (e.g. "Export", "Select All").
+
+    2. **SCROLLING IS CRITICAL:** - If you need an option (e.g. "Medicare") and it is NOT in the visible list, do NOT try to click a random element.
        - Look for an element with "scrollable": true (likely a <div> or <ul>).
        - SCROLL that specific element: { "type": "scroll", "elementId": "el_XX", "direction": "down" }.
-
-    2. **VERIFY BEFORE CLICKING:** - If clicking a list item, verify the 'text' or 'label' matches your goal.
-       - Do NOT click blank lines or neighbors just because they are close.
 
     3. **CHECKBOX SAFETY:** - IF GOAL is "Uncheck X" AND X is ALREADY unchecked (based on value/attribute) -> DO NOT CLICK.
        - IF GOAL is "Check X" AND X is ALREADY checked -> DO NOT CLICK.
