@@ -686,8 +686,8 @@ export function createServer(port: number, chromePath?: string) {
             });
 
             const config: AgentConfig = {
-              maxSteps: agentConfig?.maxSteps ?? 20,
-              maxRetriesPerAction: 1,
+              maxSteps: agentConfig?.maxSteps ?? 30, // Increased for complex multi-step tasks
+              maxRetriesPerAction: 2, // Allow more retries for reliability
               generateSelenium: agentConfig?.generateSelenium ?? true,
               broadcast,
             };
@@ -742,8 +742,8 @@ export function createServer(port: number, chromePath?: string) {
 
           // Build agent config with real-time broadcasting
           const config: AgentConfig = {
-            maxSteps: agentConfig?.maxSteps ?? 20,
-            maxRetriesPerAction: 1,
+            maxSteps: agentConfig?.maxSteps ?? 30, // Increased for complex multi-step tasks
+            maxRetriesPerAction: 2, // Allow more retries for reliability
             generateSelenium: agentConfig?.generateSelenium ?? true,
             broadcast,
           };

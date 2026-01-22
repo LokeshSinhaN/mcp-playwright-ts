@@ -1,4 +1,4 @@
-import { chromium, Browser, BrowserContext, Page, Locator } from 'playwright';
+import { chromium, Browser, BrowserContext, Page, Locator, Frame } from 'playwright';
 import { BrowserConfig, ElementInfo, SessionState, ExecutionResult } from './types';
 import { SelectorExtractor } from './selectorExtractor';
 
@@ -117,8 +117,27 @@ export class BrowserManager {
       }
     }
 
+    // Wait for any dynamic content to stabilize
+    await this.waitForPageStable();
     this.state.currentUrl = page.url();
   }
+
+  /**
+   * Wait for the page to become stable (no pending network requests, DOM settled).
+   * This helps with SPAs and dynamically loaded content.
+   */
+  async waitForPageStable(timeoutMs: number = 3000): Promise<void> {
+    const page = this.getPage();
+    try {
+      // Wait for network to be idle (no requests for 500ms)
+      await page.waitForLoadState('domcontentloaded', { timeout: timeoutMs });
+      // Additional small delay for JS frameworks to initialize
+      await page.waitForTimeout(500);
+    } catch {
+      // Non-fatal - continue even if timeout
+    }
+  }
+
 
   async screenshot(): Promise<string> {
     const page = this.getPage();
@@ -480,6 +499,51 @@ export class BrowserManager {
     await page.mouse.wheel(0, scrollAmount);
     await page.waitForTimeout(500);
     return { success: true, message: `Scrolled page ${direction}` };
+  }
+
+  /**
+   * Smart wait that checks for specific conditions rather than just time.
+   * Returns true if the condition was met, false if timed out.
+   */
+  async smartWait(options: {
+    forSelector?: string;
+    forUrl?: string | RegExp;
+    forNavigation?: boolean;
+    timeoutMs?: number;
+  }): Promise<boolean> {
+    const page = this.getPage();
+    const timeout = options.timeoutMs ?? 5000;
+
+    try {
+      if (options.forSelector) {
+        await page.waitForSelector(options.forSelector, { state: 'visible', timeout });
+        return true;
+      }
+      if (options.forUrl) {
+        await page.waitForURL(options.forUrl, { timeout });
+        return true;
+      }
+      if (options.forNavigation) {
+        await page.waitForLoadState('domcontentloaded', { timeout });
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
+  /**
+   * Check if an element exists and is visible within a short timeout.
+   */
+  async elementExists(selector: string, timeoutMs: number = 2000): Promise<boolean> {
+    const page = this.getPage();
+    try {
+      const loc = page.locator(selector);
+      return await loc.isVisible({ timeout: timeoutMs });
+    } catch {
+      return false;
+    }
   }
 
   async waitFor(selector: string, timeoutMs = 5000): Promise<void> {

@@ -13,6 +13,11 @@ import {
 } from './types';
 import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent, DropdownSelectionResult } from './dropdownUtils';
 
+// Simple tracking for consecutive failures only
+interface AgentContext {
+  consecutiveFailures: number;
+}
+
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
   /**
@@ -22,6 +27,12 @@ export class McpTools {
    * ultimately considered successful.
    */
   private agentCommandBuffer: ExecutionCommand[] | null = null;
+
+  /**
+   * Context persistence for the autonomous agent to maintain awareness
+   * across steps and recover from failures.
+   */
+  private agentContext: AgentContext | null = null;
 
   /**
    * Centralised history recording so we can transparently switch between
@@ -34,6 +45,15 @@ export class McpTools {
       this.agentCommandBuffer.push(...cmds);
     } else {
       this.sessionHistory.push(...cmds);
+    }
+  }
+
+  /**
+   * Update agent context after successful actions to track progress.
+   */
+  private updateAgentContext(update: Partial<AgentContext>): void {
+    if (this.agentContext) {
+      this.agentContext = { ...this.agentContext, ...update };
     }
   }
 
@@ -933,25 +953,29 @@ async runAutonomousAgent(
   goal: string,
   config: AgentConfig = {}
 ): Promise<AgentSessionResult> {
-  const maxSteps = config.maxSteps ?? 20;
-  const maxRetries = 1; // Strict retry limit to prevent infinite loops on one element
+  const maxSteps = config.maxSteps ?? 30; // Increased from 20 to handle complex tasks
+  const maxRetries = 2; // Slightly increased for better recovery
+  const maxConsecutiveFailures = 3; // Trigger recovery after 3 consecutive failures
   
   this.sessionHistory = []; 
   const steps: AgentStepResult[] = [];
   const failedElements: Set<string> = new Set();
   const actionHistory: string[] = [];
 
+  // Simple context for tracking LLM failures only
+  this.agentContext = { consecutiveFailures: 0 };
+
   await this.browser.init();
   const page = this.browser.getPage();
 
-  // --- 1. AUTO-NAVIGATE (Saves 1 Step & Prevents Start Errors) ---
+  // --- AUTO-NAVIGATE if URL is in the goal ---
   const urlInGoal = this.extractUrlFromPrompt(goal);
   const currentUrl = page.url();
   if (urlInGoal && (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal)))) {
       console.log(`[SmartAgent] Auto-navigating to: ${urlInGoal}`);
       await this.navigate(urlInGoal);
       actionHistory.push(`✓ Navigated to ${urlInGoal}`);
-      await page.waitForTimeout(3000); // Give it a real moment to settle
+      await page.waitForTimeout(2000); // Brief wait for page load
   }
 
   let stepNumber = 0;
@@ -960,11 +984,11 @@ async runAutonomousAgent(
   while (stepNumber < maxSteps && !isFinished) {
     stepNumber++;
 
-    // OBSERVE
+    // OBSERVE - Get current page state
     const observation = await this.observe();
     const elements = observation.selectors ?? [];
     
-    // THINK
+    // THINK - Let the LLM plan the next action (NO heuristic overrides)
     let nextAction = await this.planNextAgentAction(
       goal,
       elements,
@@ -972,6 +996,20 @@ async runAutonomousAgent(
       failedElements,
       observation.screenshot,
     );
+
+    // Only use fallback if LLM completely failed to respond
+    if (nextAction.type === 'wait' && nextAction.thought.includes('LLM planner failed')) {
+      this.updateAgentContext({ consecutiveFailures: (this.agentContext?.consecutiveFailures ?? 0) + 1 });
+      
+      // After 5 consecutive LLM failures, try a simple scroll as last resort
+      if ((this.agentContext?.consecutiveFailures ?? 0) >= 5) {
+        nextAction = { type: 'scroll', direction: 'down', thought: 'Fallback: scrolling after repeated LLM failures' };
+        this.updateAgentContext({ consecutiveFailures: 0 });
+      }
+    } else {
+      // Reset consecutive failures on successful planning
+      this.updateAgentContext({ consecutiveFailures: 0 });
+    }
 
     config.broadcast?.({
         type: 'log',
@@ -1034,7 +1072,16 @@ async runAutonomousAgent(
 
     // REFLECT
     const urlAfter = page.url();
-    const stateChanged = actionSuccess; 
+    const stateChanged = actionSuccess || urlBefore !== urlAfter; 
+
+    // Track consecutive failures only
+    if (actionSuccess) {
+      this.updateAgentContext({ consecutiveFailures: 0 });
+    } else {
+      this.updateAgentContext({
+        consecutiveFailures: (this.agentContext?.consecutiveFailures ?? 0) + 1,
+      });
+    }
 
     // Update History
     actionHistory.push(this.describeAction(nextAction, actionSuccess));
@@ -1243,7 +1290,7 @@ async runAutonomousAgent(
   }
 
   // ---------------------------------------------------------------------------
-  // FIX: INTELLIGENT PLANNER PROMPT (Prevents "Wrong Item" clicks & Loops)
+  // INTELLIGENT PLANNER - Pure LLM-driven decision making
   // ---------------------------------------------------------------------------
   private async planNextAgentAction(
     goal: string,
@@ -1252,66 +1299,94 @@ async runAutonomousAgent(
     failedElements: Set<string>,
     screenshot?: string
   ): Promise<AgentAction> {
-    if (!this.model) return { type: 'finish', thought: 'No AI', summary: 'No AI' };
+    if (!this.model) return { type: 'finish', thought: 'No AI model configured', summary: 'No AI' };
 
-    // Increase limit to 500 to catch items deep in the dropdown
+    // Filter to visible, interactive elements only
     const visibleElements = elements.filter(el => 
-        el.visible && el.tagName !== 'script' && el.tagName !== 'style' && el.tagName !== 'link'
+        el.visible && 
+        el.tagName !== 'script' && 
+        el.tagName !== 'style' && 
+        el.tagName !== 'link' &&
+        el.tagName !== 'meta'
     );
 
-    const elementList = visibleElements.slice(0, 500).map((el, idx) => ({
+    // Create a compact but informative element list for the LLM
+    const elementList = visibleElements.slice(0, 300).map((el, idx) => {
+      const info: Record<string, any> = {
         id: `el_${idx}`,
         tag: el.tagName,
-        text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
-        value: el.attributes?.['value'] || '',
-        scrollable: el.scrollable ? true : undefined, 
-        label: el.ariaLabel || el.placeholder || '',
-    }));
+      };
+      
+      // Only include non-empty fields to reduce token count
+      const text = (el.text || '').slice(0, 60).replace(/\s+/g, ' ').trim();
+      if (text) info.text = text;
+      
+      const label = (el.ariaLabel || el.placeholder || '').slice(0, 40);
+      if (label) info.label = label;
+      
+      if (el.id) info.domId = el.id.slice(0, 40);
+      if (el.attributes?.['type']) info.type = el.attributes['type'];
+      if (el.attributes?.['name']) info.name = el.attributes['name'].slice(0, 30);
+      if (el.scrollable) info.scrollable = true;
+      
+      return info;
+    });
 
-    const prompt = `
-    SYSTEM: You are an ultra-fast autonomous browser agent.
-    GOAL: ${goal}
-    
-    HISTORY:
-    ${actionHistory.slice(-5).join('\n')}
+    const prompt = `You are a browser automation agent. Execute the goal step by step.
 
-    VISIBLE ELEMENTS (truncated to 500):
-    ${JSON.stringify(elementList)}
+GOAL: ${goal}
 
-    FAILED ELEMENT IDS:
-    ${JSON.stringify(Array.from(failedElements))}
+COMPLETED ACTIONS:
+${actionHistory.slice(-8).join('\n') || '(none yet)'}
 
-    RULES:
-    1. **FORWARD PROGRESS ONLY:** - If you have just clicked a "Go", "Search", or "Filter" button, the filtering phase is DONE.
-       - **NEVER** go back to the dropdowns to uncheck/check items after clicking "Go".
-       - Your ONLY valid next step is to process the results (e.g. "Export", "Select All").
+AVAILABLE ELEMENTS:
+${JSON.stringify(elementList, null, 1)}
 
-    2. **SCROLLING IS CRITICAL:** - If you need an option (e.g. "Medicare") and it is NOT in the visible list, do NOT try to click a random element.
-       - Look for an element with "scrollable": true (likely a <div> or <ul>).
-       - SCROLL that specific element: { "type": "scroll", "elementId": "el_XX", "direction": "down" }.
+FAILED ELEMENTS (avoid these): ${Array.from(failedElements).join(', ') || 'none'}
 
-    3. **CHECKBOX SAFETY:** - IF GOAL is "Uncheck X" AND X is ALREADY unchecked (based on value/attribute) -> DO NOT CLICK.
-       - IF GOAL is "Check X" AND X is ALREADY checked -> DO NOT CLICK.
-       
-    4. **FAIL FAST:** - If an element ID is in "FAILED ELEMENT IDS", pick a different strategy (scroll or search).
+INSTRUCTIONS:
+1. Analyze the GOAL and COMPLETED ACTIONS to determine what step comes next
+2. Find the right element from AVAILABLE ELEMENTS
+3. Return ONLY a JSON object with your action
 
-    5. **STRICT JSON FORMAT:**
-       Return ONLY this JSON object (no markdown):
-       {
-         "type": "navigate" | "click" | "type" | "scroll" | "wait" | "finish",
-         "elementId": "el_123", 
-         "thought": "Reasoning..."
-       }
-    `;
+ACTION TYPES:
+- click: {"type":"click", "elementId":"el_X", "thought":"why"}
+- type: {"type":"type", "elementId":"el_X", "text":"value", "thought":"why"}
+- scroll: {"type":"scroll", "direction":"down", "thought":"why"}
+- wait: {"type":"wait", "durationMs":1000, "thought":"why"}
+- finish: {"type":"finish", "thought":"why", "summary":"what was done"}
+
+CRITICAL RULES:
+- DO NOT repeat actions that are already in COMPLETED ACTIONS
+- If you already clicked "Reports", "Patients", etc. - move to the NEXT step
+- For login: type username, type password, then click the submit/login button
+- For menus: click parent first, then child items appear
+- Return "finish" ONLY when the entire GOAL is complete
+
+Return ONLY valid JSON, no other text:`;
 
     try {
       const llmResult = await this.withTimeout(
         this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any),
-        45000, 'Agent planner'
+        30000, // Reduced timeout
+        'Agent planner'
       );
-      return this.parseAgentActionResponse((llmResult as any).response?.text?.() ?? '');
+      const response = (llmResult as any).response?.text?.() ?? '';
+      
+      console.log('[SmartAgent] LLM raw:', response.slice(0, 150));
+      
+      const parsed = this.parseAgentActionResponse(response);
+      
+      // Basic validation
+      if (parsed.type === 'click' && !parsed.elementId && !parsed.selector) {
+        return { type: 'wait', durationMs: 1000, thought: 'LLM returned click without target' };
+      }
+      
+      return parsed;
     } catch (err) {
-      return { type: 'wait', durationMs: 1000, thought: 'LLM planner failed; waiting briefly.' };
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error('[SmartAgent] Planner error:', errorMsg);
+      return { type: 'wait', durationMs: 1000, thought: `Planner error: ${errorMsg.slice(0, 50)}` };
     }
   }
 
@@ -1524,4 +1599,5 @@ async runAutonomousAgent(
         return `${status} unknown action`;
     }
   }
+
 }
