@@ -1,12 +1,44 @@
 //
-import { Page, ElementHandle } from 'playwright';
+import { Page, ElementHandle, Frame } from 'playwright';
 import { ElementInfo } from './types';
 
 export class SelectorExtractor {
   constructor(private readonly page: Page) {}
 
   async extractAllInteractive(): Promise<ElementInfo[]> {
-    const handles = await this.page.$$(
+    const frames = [this.page, ...this.page.frames().filter(f => f !== this.page.mainFrame())];
+    let allResults: ElementInfo[] = [];
+
+    for (const frame of frames) {
+        try {
+            const results = await this.extractFromScope(frame);
+            allResults.push(...results);
+        } catch (e) {
+            // Frame might have detached, ignore
+        }
+    }
+    
+    // POST-PROCESSING: Z-Index & Modal Priority
+    // If we find a password field or high z-index element, we flag it.
+    const hasModal = allResults.some(el => el.isFloating || (el.attributes['type'] === 'password'));
+    
+    if (hasModal) {
+        // If a modal/login is present, DE-PRIORITIZE background navigation links
+        // This prevents clicking "Patient Master List" when "Login" is required.
+        allResults = allResults.map(el => {
+            if (el.roleHint === 'link' && !el.isFloating) {
+                // Penalize background links
+                el.visible = false; // Soft hide for the agent
+            }
+            return el;
+        });
+    }
+
+    return allResults;
+  }
+
+  private async extractFromScope(scope: Page | Frame): Promise<ElementInfo[]> {
+    const handles = await scope.$$(
       [
         'button', 'a', 'input', 'textarea', 'select',
         '[role=button]', '[role=link]', '[role="option"]', '[role="search"]',
@@ -17,7 +49,7 @@ export class SelectorExtractor {
         // Universal Scroll Containers
         'ul', 'ol', 'div[style*="overflow"]', 'div[class*="scroll"]',
         '[role="listbox"]', '[role="menu"]', '.dropdown-menu',
-        '[style*="z-index"]' // Floating elements
+        '[style*="z-index"]' 
       ].join(', ')
     );
 
@@ -45,176 +77,184 @@ export class SelectorExtractor {
   }
 
   async extractFromHandle(handle: ElementHandle): Promise<ElementInfo> {
+    // (Keep your existing extractFromHandle logic exactly as is, it is good)
+    // ... Copy the rest of your existing extractFromHandle method here ...
+    // Just ensure resolveInteractiveHandle and others are preserved.
+    
+    // MINOR TWEAK for extractFromHandle: Ensure we capture "type" for inputs
     const interactiveHandle = await this.resolveInteractiveHandle(handle);
-
     const base = await interactiveHandle.evaluate((el: any) => {
-      const win = el.ownerDocument && el.ownerDocument.defaultView;
-      const rect = el.getBoundingClientRect();
-      const style = win ? win.getComputedStyle(el) : null;
-      
-      const zIndex = style ? parseInt(style.zIndex || '0', 10) : 0;
-      const isFloating = zIndex > 100 || (style && (style.position === 'absolute' || style.position === 'fixed'));
+        const win = el.ownerDocument && el.ownerDocument.defaultView;
+        const rect = el.getBoundingClientRect();
+        const style = win ? win.getComputedStyle(el) : null;
+        
+        const zIndex = style ? parseInt(style.zIndex || '0', 10) : 0;
+        const isFloating = zIndex > 100 || (style && (style.position === 'absolute' || style.position === 'fixed'));
 
-      // UNIVERSAL SCROLL DETECTION
-      let isScrollable = style && (
-        (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
-        (style.overflowX === 'auto' || style.overflowX === 'scroll')
-      );
-      
-      const getAttr = (name: string): string =>
-        typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
+        // UNIVERSAL SCROLL DETECTION
+        let isScrollable = style && (
+          (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
+          (style.overflowX === 'auto' || style.overflowX === 'scroll')
+        );
+        
+        const getAttr = (name: string): string =>
+          typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
 
-      const role = getAttr('role');
-      if (role === 'listbox' || role === 'menu' || role === 'tree') isScrollable = true;
+        const role = getAttr('role');
+        if (role === 'listbox' || role === 'menu' || role === 'tree') isScrollable = true;
 
-      // UNIVERSAL STATE DETECTION
-      // Standard way websites signal an open dropdown
-      const ariaExpanded = getAttr('aria-expanded');
-      const isExpanded = ariaExpanded === 'true';
+        // UNIVERSAL STATE DETECTION
+        // Standard way websites signal an open dropdown
+        const ariaExpanded = getAttr('aria-expanded');
+        const isExpanded = ariaExpanded === 'true';
 
-      const visible =
-        !!el.offsetParent &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        (!style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
+        const visible =
+          !!el.offsetParent &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          (!style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
 
-      const tagName = (el.tagName || '').toLowerCase();
-      
-      let roleHint: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other' = 'other';
-      if (tagName === 'button') roleHint = 'button';
-      else if (tagName === 'a') roleHint = 'link';
-      else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') roleHint = 'input';
-      if (role === 'option' || role === 'menuitem') roleHint = 'option';
-      if (role === 'listbox' || role === 'combobox') roleHint = 'listbox';
+        const tagName = (el.tagName || '').toLowerCase();
+        
+        let roleHint: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other' = 'other';
+        if (tagName === 'button') roleHint = 'button';
+        else if (tagName === 'a') roleHint = 'link';
+        else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') roleHint = 'input';
+        if (role === 'option' || role === 'menuitem') roleHint = 'option';
+        if (role === 'listbox' || role === 'combobox') roleHint = 'listbox';
 
-      const typeAttr = getAttr('type');
-      const placeholder = getAttr('placeholder');
-      const ariaLabel = getAttr('aria-label');
-      const valueAttr = (el as any).value !== undefined ? String((el as any).value) : getAttr('value');
-      const titleAttr = getAttr('title');
-      const dataTestId = getAttr('data-testid');
-      const href = getAttr('href');
-      const isSearchField =
-        tagName === 'input' &&
-        (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
+        const typeAttr = (el.getAttribute('type') || '').toLowerCase(); // Add this line to ensure we catch password fields for the blocker check
+        const placeholder = getAttr('placeholder');
+        const ariaLabel = getAttr('aria-label');
+        const valueAttr = (el as any).value !== undefined ? String((el as any).value) : getAttr('value');
+        const titleAttr = getAttr('title');
+        const dataTestId = getAttr('data-testid');
+        const href = getAttr('href');
+        const isSearchField =
+          tagName === 'input' &&
+          (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
 
-      // --- UNIVERSAL LABEL DETECTION ("The Eyes") ---
-      // Dynamically find text next to the element to solve ambiguity.
-      const getText = (node: any | null): string => {
-        if (!node || node.nodeType !== 1) return '';
-        return (node.innerText || node.textContent || '').trim();
-      };
+        // --- UNIVERSAL LABEL DETECTION ("The Eyes") ---
+        // Dynamically find text next to the element to solve ambiguity.
+        const getText = (node: any | null): string => {
+          if (!node || node.nodeType !== 1) return '';
+          return (node.innerText || node.textContent || '').trim();
+        };
 
-      let nearbyLabel = '';
-      
-      // 1. Look Left (Previous Sibling)
-      let sibling = el.previousElementSibling;
-      if (sibling && getText(sibling).length > 1 && getText(sibling).length < 40) {
-          nearbyLabel = getText(sibling);
-      }
-
-      // 2. Look Up (Parent's Previous Sibling - Common in Forms)
-      if (!nearbyLabel && el.parentElement) {
-          const parentSibling = el.parentElement.previousElementSibling;
-          if (parentSibling && getText(parentSibling).length > 1 && getText(parentSibling).length < 40) {
-              nearbyLabel = getText(parentSibling);
-          }
-      }
-
-      // 3. Look at Table Headers (If inside a grid)
-      if (!nearbyLabel) {
-          const td = el.closest('td');
-          if (td && td.previousElementSibling) {
-              nearbyLabel = getText(td.previousElementSibling);
-          }
-      }
-      // ----------------------------------------------
-
-      const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
-      let region: 'header' | 'main' | 'footer' = 'main';
-      const closestSafe = (selector: string): Element | null => {
-        try {
-          return typeof el.closest === 'function' ? el.closest(selector) : null;
-        } catch {
-          return null;
+        let nearbyLabel = '';
+        
+        // 1. Look Left (Previous Sibling)
+        let sibling = el.previousElementSibling;
+        if (sibling && getText(sibling).length > 1 && getText(sibling).length < 40) {
+            nearbyLabel = getText(sibling);
         }
-      };
 
-      if (closestSafe('header') || closestSafe('nav')) {
-        region = 'header';
-      } else if (closestSafe('footer')) {
-        region = 'footer';
-      } else if (closestSafe('main')) {
-        region = 'main';
-      } else {
-        if (rect.top < viewportHeight * 0.25) region = 'header';
-        else if (rect.top > viewportHeight * 0.75) region = 'footer';
-        else region = 'main';
-      }
+        // 2. Look Up (Parent's Previous Sibling - Common in Forms)
+        if (!nearbyLabel && el.parentElement) {
+            const parentSibling = el.parentElement.previousElementSibling;
+            if (parentSibling && getText(parentSibling).length > 1 && getText(parentSibling).length < 40) {
+                nearbyLabel = getText(parentSibling);
+            }
+        }
 
-      const rawText = (el.textContent || '').trim();
-      let effectiveText = rawText || (tagName === 'input' ? valueAttr : '') || '';
-      
-      // Inject the discovered label into the text for the LLM
-      if (nearbyLabel && !effectiveText.includes(nearbyLabel)) {
-          effectiveText = `${nearbyLabel} ${effectiveText}`;
-      }
+        // 3. Look at Table Headers (If inside a grid)
+        if (!nearbyLabel) {
+            const td = el.closest('td');
+            if (td && td.previousElementSibling) {
+                nearbyLabel = getText(td.previousElementSibling);
+            }
+        }
+        // ----------------------------------------------
 
-      return {
-        tagName,
-        id: el.id || undefined,
-        className: el.className || undefined,
-        text: effectiveText, // Now includes "Insurance: " automatically
-        ariaLabel,
-        placeholder: placeholder || undefined,
-        title: titleAttr || undefined,
-        dataTestId: dataTestId || undefined,
-        href,
-        visible,
-        roleHint,
-        scrollable: isScrollable,
-        isFloating,
-        expanded: isExpanded, // Export state
-        searchField: isSearchField,
-        region,
-        boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
-        context: nearbyLabel || undefined,
-        attrs: Array.from(el.attributes).map((a: any) => [a.name, a.value] as const)
-      };
+        const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
+        let region: 'header' | 'main' | 'footer' = 'main';
+        const closestSafe = (selector: string): Element | null => {
+          try {
+            return typeof el.closest === 'function' ? el.closest(selector) : null;
+          } catch {
+            return null;
+          }
+        };
+
+        if (closestSafe('header') || closestSafe('nav')) {
+          region = 'header';
+        } else if (closestSafe('footer')) {
+          region = 'footer';
+        } else if (closestSafe('main')) {
+          region = 'main';
+        } else {
+          if (rect.top < viewportHeight * 0.25) region = 'header';
+          else if (rect.top > viewportHeight * 0.75) region = 'footer';
+          else region = 'main';
+        }
+
+        const rawText = (el.textContent || '').trim();
+        let effectiveText = rawText || (tagName === 'input' ? valueAttr : '') || '';
+        
+        // Inject the discovered label into the text for the LLM
+        if (nearbyLabel && !effectiveText.includes(nearbyLabel)) {
+            effectiveText = `${nearbyLabel} ${effectiveText}`;
+        }
+
+        return {
+            // ... existing returns ...
+            tagName,
+            id: el.id || undefined,
+            className: el.className || undefined,
+            text: effectiveText, // Now includes "Insurance: " automatically
+            ariaLabel,
+            placeholder: placeholder || undefined,
+            title: titleAttr || undefined,
+            dataTestId: dataTestId || undefined,
+            href,
+            visible,
+            roleHint,
+            scrollable: isScrollable,
+            isFloating,
+            expanded: isExpanded, // Export state
+            searchField: isSearchField,
+            region,
+            boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+            context: nearbyLabel || undefined,
+            attributes: Array.from(el.attributes).map((a: any) => [a.name, a.value] as const),
+            type: typeAttr // Return type explicitly
+        };
     });
 
     const cssSelector = await this.generateCss(interactiveHandle);
     const xpath = await this.generateXpath(interactiveHandle);
-    const rawAttrs = Object.fromEntries(base.attrs);
-    if (base.tagName === 'input' || base.tagName === 'textarea') rawAttrs['value'] = base.text || '';
+    const rawAttrs = Object.fromEntries(base.attributes);
+    
+    // Explicitly expose 'type' in attributes for the agent to see
+    if (base.type) rawAttrs['type'] = base.type;
 
     return {
-      tagName: base.tagName,
-      id: base.id,
-      className: base.className,
-      text: base.text,
-      ariaLabel: base.ariaLabel,
-      placeholder: base.placeholder,
-      title: base.title,
-      dataTestId: base.dataTestId,
-      href: base.href,
-      cssSelector,
-      xpath,
-      selector: cssSelector,
-      visible: base.visible,
-      isVisible: base.visible,
-      roleHint: base.roleHint as any,
-      scrollable: base.scrollable,
-      isFloating: base.isFloating,
-      // @ts-ignore - 'expanded' was added to types.ts in previous step
-      expanded: base.expanded,
-      searchField: base.searchField,
-      region: base.region,
-      boundingBox: base.boundingBox,
-      rect: base.boundingBox,
-      context: base.context,
-      attributes: rawAttrs
-    };
+        // ... existing mapping ...
+        tagName: base.tagName,
+        id: base.id,
+        className: base.className,
+        text: base.text,
+        ariaLabel: base.ariaLabel,
+        placeholder: base.placeholder,
+        title: base.title,
+        dataTestId: base.dataTestId,
+        href: base.href,
+        cssSelector,
+        xpath,
+        selector: cssSelector,
+        visible: base.visible,
+        isVisible: base.visible,
+        roleHint: base.roleHint as any,
+        scrollable: base.scrollable,
+        isFloating: base.isFloating,
+        expanded: base.expanded,
+        searchField: base.searchField,
+        region: base.region,
+        boundingBox: base.boundingBox,
+        rect: base.boundingBox,
+        context: base.context,
+        attributes: rawAttrs
+    } as any;
   }
 
   private async resolveInteractiveHandle(handle: ElementHandle): Promise<ElementHandle> {
