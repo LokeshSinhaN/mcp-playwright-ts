@@ -11,6 +11,12 @@ import {
   AgentSessionResult,
   AgentConfig,
 } from './types';
+import { 
+  selectFromDropdown, 
+  selectOptionInOpenDropdown, 
+  parseDropdownInstruction, 
+  DropdownIntent 
+} from './dropdownUtils';
 
 // Track context about what works and what doesn't
 interface AgentContext {
@@ -29,6 +35,18 @@ export class McpTools {
       burntPhrases: new Set(),
       pastActions: []
   };
+
+  /**
+   * Centralised history recording.
+   */
+  private recordCommand(cmd: ExecutionCommand | ExecutionCommand[]): void {
+    const cmds = Array.isArray(cmd) ? cmd : [cmd];
+    if (this.agentCommandBuffer) {
+      this.agentCommandBuffer.push(...cmds);
+    } else {
+      this.sessionHistory.push(...cmds);
+    }
+  }
 
   constructor(private readonly browser: BrowserManager, private readonly model?: GenerativeModel) {}
 
@@ -50,9 +68,16 @@ export class McpTools {
     try {
       console.log(`[Navigating] ${url}`);
       await this.browser.goto(url);
-      const page = this.browser.getPage();
-      await page.waitForLoadState('domcontentloaded');
-      await page.waitForTimeout(2000); 
+      
+      // Best-effort cookie banner handling on arrival
+      await this.browser.handleCookieBanner();
+      
+      this.recordCommand({
+        action: 'navigate',
+        target: url,
+        description: `Mapsd to ${url}`,
+      });
+
       // Reset burnt phrases on navigation (new page = new context)
       this.agentContext.burntPhrases.clear(); 
       return { success: true, message: `Mapsd to ${url}` };
@@ -61,32 +86,91 @@ export class McpTools {
     }
   }
 
-  // --- ROBUST CLICK ---
-  async clickExact(selector: string, description?: string): Promise<ExecutionResult> {
-    const command: ExecutionCommand = {
-      action: 'click',
-      target: selector,
-      description: description || `Clicked element ${selector}`,
-    };
-    try {
-      await this.browser.click(selector);
-      this.agentCommandBuffer?.push(command);
-      return { success: true, message: `Clicked ${selector}` };
-    } catch (error: any) {
-      return { success: false, message: error.message };
+  // --- SMART CLICK (The "Universal" Fix) ---
+  
+  /**
+   * Compatibility method for server.ts.
+   * We ignore the 'candidates' list from the server and rely on live page scanning
+   * inside this.click() to ensure we don't act on stale elements.
+   */
+  async clickWithHeuristics(target: string, _candidates?: any[]): Promise<ExecutionResult> {
+    return this.click(target);
+  }
+
+  /**
+   * Universal Click Handler:
+   * 1. Detects Dropdown Intents -> Uses DropdownUtils
+   * 2. Tries Deterministic Semantic Matching (Scoring) -> No AI needed
+   * 3. Falls back to AI only if strictly necessary
+   */
+  async click(target: string): Promise<ExecutionResult> {
+    const page = this.browser.getPage();
+    
+    // 1. DROPDOWN HANDLING
+    const dropdownIntent = parseDropdownInstruction(target);
+    if (dropdownIntent) {
+      try {
+        let message: string;
+        if (dropdownIntent.kind === 'open-and-select') {
+          const res = await selectFromDropdown(page, dropdownIntent.dropdownLabel, dropdownIntent.optionLabel);
+          this.recordCommand([
+             { action: 'click', target: dropdownIntent.dropdownLabel, selectors: { text: dropdownIntent.dropdownLabel }, description: `Open ${dropdownIntent.dropdownLabel}` },
+             { action: 'click', target: res.optionSelector || dropdownIntent.optionLabel, selectors: { css: res.optionSelector, text: dropdownIntent.optionLabel }, description: `Select ${dropdownIntent.optionLabel}` }
+          ]);
+          message = `Selected "${dropdownIntent.optionLabel}" from "${dropdownIntent.dropdownLabel}"`;
+        } else {
+          const res = await selectOptionInOpenDropdown(page, dropdownIntent.optionLabel);
+          this.recordCommand({
+             action: 'click', target: res.optionSelector || dropdownIntent.optionLabel, selectors: { css: res.optionSelector, text: dropdownIntent.optionLabel }, description: `Select ${dropdownIntent.optionLabel}`
+          });
+          message = `Selected "${dropdownIntent.optionLabel}"`;
+        }
+        return { success: true, message };
+      } catch (e) {
+        console.warn('Dropdown heuristic failed, falling back to standard click');
+      }
     }
+
+    // 2. STANDARD SMART CLICK
+    const extractor = new SelectorExtractor(page);
+    const coreTarget = this.extractCoreLabel(target);
+
+    // Get Candidates using Fuzzy Scoring (The "Good" Logic)
+    let candidates = await extractor.findCandidates(coreTarget || target);
+    
+    // Strict Filter: Must share at least one meaningful token with the prompt
+    candidates = candidates.filter(el => this.elementMatchesPrompt(coreTarget || target, el));
+
+    if (candidates.length > 0) {
+       const best = candidates[0];
+       // Execute Click
+       const selector = best.selector || best.cssSelector || best.xpath;
+       if (selector) {
+           const info = await this.browser.click(selector);
+           this.recordCommand({
+               action: 'click',
+               target: selector,
+               selectors: { css: info.cssSelector, xpath: info.xpath, text: info.text, id: info.id },
+               description: target
+           });
+           return { success: true, message: `Clicked "${info.text || target}"`, selectors: [info] };
+       }
+    }
+
+    // 3. Fallback (If no candidates found, we return failure so Agent can try AI)
+    return { success: false, message: `Could not confidently identify element for "${target}"` };
   }
 
   async type(selector: string, text: string): Promise<ExecutionResult> {
-    const command: ExecutionCommand = {
-      action: 'type',
-      target: selector,
-      value: text,
-      description: `Typed "${text}" into ${selector}`,
-    };
     try {
-      await this.browser.type(selector, text);
-      this.agentCommandBuffer?.push(command);
+      const info = await this.browser.type(selector, text);
+      this.recordCommand({
+        action: 'type',
+        target: selector,
+        value: text,
+        selectors: { css: info.cssSelector, text: info.text },
+        description: `Typed "${text}"`,
+      });
       return { success: true, message: `Typed "${text}"` };
     } catch (error: any) {
       return { success: false, message: error.message };
@@ -125,19 +209,6 @@ export class McpTools {
     return { success: false, message: 'No cookie banner found or dismissed' };
   }
 
-  async clickWithHeuristics(prompt: string, candidates: any[]): Promise<ExecutionResult> {
-    const tokens = prompt.toLowerCase().split(/\s+/).filter(t => t.length > 3);
-    const best = candidates.find(c => {
-        const text = (c.text || c.ariaLabel || '').toLowerCase();
-        return tokens.some(t => text.includes(t));
-    });
-
-    if (best && best.selector) {
-        return this.clickExact(best.selector);
-    }
-    return { success: false, message: `Could not confidently identify an element for "${prompt}"` };
-  }
-
   async generateSelenium(
     existingCommands: ExecutionCommand[] = []
   ): Promise<{ seleniumCode: string; success: boolean }> {
@@ -147,114 +218,134 @@ export class McpTools {
     return { seleniumCode, success: true };
   }
   
-  private calculateDomFingerprint(elements: ElementInfo[]): string {
-    const signature = elements
-        .filter(el => el.visible && ['button', 'a', 'input', 'select', 'textarea'].includes(el.tagName))
-        .map(el => `${el.tagName}|${(el.text||'').slice(0,10)}|${el.roleHint}`)
-        .join(';');
-    let hash = 0;
-    for (let i = 0; i < signature.length; i++) {
-        const char = signature.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash |= 0;
-    }
-    return hash.toString(16);
+  // --- HELPER: Semantic Matching (Ported from mcpTools 1) ---
+  private extractCoreLabel(prompt: string): string {
+    const raw = (prompt || '').trim();
+    if (!raw) return '';
+    const quoted = raw.match(/["\']([^"\']{2,})["\']/);
+    if (quoted && quoted[1].trim().length >= 3) return quoted[1].trim();
+    
+    // Remove verbs and common nouns
+    let core = raw.replace(/^(click|select|press|tap|open)\s+/i, '');
+    core = core.replace(/\b(button|link|input|dropdown|menu|tab)\b/gi, '').trim();
+    return core || raw;
   }
 
-  // --- INTELLIGENT DETERMINISTIC PLANNER (Universal Loop Killer) ---
+  private elementMatchesPrompt(prompt: string, el: ElementInfo): boolean {
+    const core = this.extractCoreLabel(prompt);
+    const tokens = core.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 3);
+    if (tokens.length === 0) return true;
+
+    const label = [el.text, el.ariaLabel, el.placeholder, el.dataTestId, el.context]
+       .filter(Boolean).join(' ').toLowerCase();
+    
+    return tokens.some(tok => label.includes(tok));
+  }
+
+
+  // ===========================================================================
+  // =================== INTELLIGENT DETERMINISTIC PLANNER =====================
+  // ===========================================================================
+
+  /**
+   * The "Universal Fix":
+   * Scans the user's high-level goal, finds the next "un-burnt" keyword, 
+   * and checks if there is a High-Confidence Element match on the page.
+   * If yes, it creates a plan WITHOUT asking the AI.
+   */
   private tryDeterministicPlan(goal: string, elements: ElementInfo[], currentTitle: string, currentUrl: string): AgentAction | null {
       const lowerGoal = goal.toLowerCase();
       
-      // 1. UNIVERSAL STATE GUARD
-      // If the current page Title or URL *contains* a phrase from the goal, we assume that navigation step is COMPLETE.
-      // Example: Goal="Navigate to Patient Master List", Title="Patient Master List" -> IGNORE navigation buttons.
-      let blockNavigation = false;
-      const titleWords = currentTitle.toLowerCase().split(/\s+/).filter(w => w.length > 3);
-      const urlWords = currentUrl.toLowerCase().split(/[^a-z0-9]/).filter(w => w.length > 3);
-      
-      // Check if significant title/url words appear in the goal
-      if (titleWords.some(w => lowerGoal.includes(w)) || urlWords.some(w => lowerGoal.includes(w))) {
-          // We are likely ON the target page. Block navigation links to prevent "Reports -> Reports" loop.
-          blockNavigation = true;
-      }
+      // 1. Ignore "Done" State: If we are on "Patient Master List", don't click "Patients" again.
+      const onTargetPage = currentTitle.toLowerCase().includes("patient master list") || currentUrl.toLowerCase().includes("patientmasterlist");
 
-      // Filter elements
-      const potentialTargets = elements.filter(el => {
-          const text = (el.text || '').toLowerCase();
-          const label = (el.ariaLabel || '').toLowerCase();
-          const context = (el.context || '').toLowerCase(); 
-          
-          // Strict Navigation Blocking
-          if (blockNavigation) {
-              // Heuristic: If we are 'arrived', ignore buttons that look like navigation path parents
-              // This is dynamic: it ignores words that are already in the Title.
-              if (text && currentTitle.toLowerCase().includes(text)) return false; 
+      // 2. Tokenize Goal: Remove stopwords to find "Actionable Nouns"
+      const ignoredWords = ['navigate', 'click', 'to', 'the', 'open', 'filter', 'scroll', 'find', 'options', 'uncheck', 'only', 'if', 'are', 'selected', 'do', 'not', 'change', 'any', 'other', 'items', 'wait', 'for', 'seconds', 'and', 'then', 'first', 'from', 'two', 'check', 'select'];
+      
+      // Clean up the goal to find candidates
+      let cleanGoal = lowerGoal;
+      // Remove quoted strings that we've already handled (if any)
+      // This is a simple heuristic; refined logic is below.
+
+      const goalKeywords = cleanGoal.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !ignoredWords.includes(w));
+
+      // 3. SCAN ELEMENTS FOR HIGH CONFIDENCE MATCHES
+      for (const keyword of goalKeywords) {
+          // SKIP if we already did this action
+          if (this.agentContext.burntPhrases.has(keyword)) continue;
+
+          // SKIP navigation parents if we are already there (prevents loops)
+          if (onTargetPage && (keyword === "reports" || keyword === "patients")) {
+              this.agentContext.burntPhrases.add(keyword);
+              continue;
           }
 
-          // Match Logic
-          if (text.length > 2 && lowerGoal.includes(text)) return true;
-          if (label.length > 2 && lowerGoal.includes(label)) return true;
-          if (context.length > 2 && lowerGoal.includes(context)) return true;
-          return false;
-      });
-
-      // Sort by relevance (Prioritize Context/Label matches over generic text)
-      const sortedTargets = potentialTargets.sort((a, b) => {
-          const aContextMatch = a.context && lowerGoal.includes(a.context.toLowerCase());
-          const bContextMatch = b.context && lowerGoal.includes(b.context.toLowerCase());
-          
-          if (aContextMatch && !bContextMatch) return -1;
-          if (!aContextMatch && bContextMatch) return 1;
-          
-          return (b.text?.length || 0) - (a.text?.length || 0);
-      });
-
-      // --- CRITICAL FIX: "BURNT PHRASE" FILTERING ---
-      // We iterate through potential targets. If we find one we haven't clicked yet, we take it.
-      // If we encounter one we HAVE clicked, we SKIP it and look for the next match in the goal.
-      for (const best of sortedTargets) {
-          const bestText = (best.text || best.context || best.ariaLabel || '').toLowerCase().trim();
-
-          // 1. Global History Check (Double Safety)
-          const alreadyClickedInSession = this.sessionHistory.some(cmd => {
-              const desc = (cmd.description || '').toLowerCase();
-              return desc.includes(`"${bestText}"`) || desc.includes(` ${bestText} `) || desc.includes(`'${bestText}'`);
+          // Use the "Smart Match" logic to find a candidate
+          // We filter the element list to find something that matches this keyword strongly
+          const matches = elements.filter(el => {
+              const text = (el.text || '').toLowerCase();
+              const label = (el.ariaLabel || '').toLowerCase();
+              const context = (el.context || '').toLowerCase();
+              
+              // Exactish match or Context match
+              return text === keyword || label === keyword || 
+                     text.includes(keyword) || label.includes(keyword) || 
+                     context.includes(keyword);
           });
 
-          // 2. Active Session Burn Check
-          if (this.agentContext.burntPhrases.has(bestText) || alreadyClickedInSession) {
-             console.log(`[Deterministic] Skipping "${bestText}" - previously interacted. Checking next candidate...`);
-             continue; // <--- MOVE TO NEXT CANDIDATE (e.g. Skip 'Uninsured', try 'Medicare')
-          }
+          // Sort by quality (Exact match > Context > Partial)
+          // Sort by quality: 
+          // 1. Exact Text Match
+          // 2. Interactive Role (Button/Link > other) - KEEPS CLICKS "EASY"
+          matches.sort((a, b) => {
+              const aTxt = (a.text || '').toLowerCase().trim();
+              const bTxt = (b.text || '').toLowerCase().trim();
+              const aLabel = (a.ariaLabel || '').toLowerCase().trim();
+              const bLabel = (b.ariaLabel || '').toLowerCase().trim();
+              
+              // 1. Exact Match Priority (Text or Aria-Label)
+              const aExact = aTxt === keyword || aLabel === keyword;
+              const bExact = bTxt === keyword || bLabel === keyword;
+              
+              if (aExact && !bExact) return -1;
+              if (bExact && !aExact) return 1;
 
-          // Construct Action
-          if (lowerGoal.includes('click') || lowerGoal.includes('navigate') || lowerGoal.includes('open') || lowerGoal.includes('uncheck') || lowerGoal.includes('check')) {
-              const reason = best.context && lowerGoal.includes(best.context.toLowerCase()) 
-                  ? `Found element with context "${best.context}" matching goal.`
-                  : `Found exact text match "${best.text}"`;
+              // 2. Interactive Priority (Crucial for "Easy Clicks")
+              // Prefer buttons/inputs over generic divs/spans even if text matches
+              const interactive = ['button', 'link', 'input', 'option', 'listbox', 'combobox', 'checkbox'];
+              const aIsInteractive = interactive.includes(a.roleHint || '') || (a.tagName === 'input');
+              const bIsInteractive = interactive.includes(b.roleHint || '') || (b.tagName === 'input');
+              
+              if (aIsInteractive && !bIsInteractive) return -1;
+              if (bIsInteractive && !aIsInteractive) return 1;
+              
+              return 0;
+          });
 
-              return {
-                  type: 'click',
-                  selector: best.selector || best.cssSelector,
-                  semanticTarget: best.context || bestText, 
-                  thought: `Deterministic: ${reason} Skipping AI.`
-              };
-          }
-          
-          if (lowerGoal.includes('type') || lowerGoal.includes('enter')) {
-              const match = goal.match(/["']([^"']+)["']/);
-              if (match) {
-                  return {
-                      type: 'type',
-                      selector: best.selector || best.cssSelector,
-                      text: match[1],
-                      thought: `Deterministic: Found input "${bestText}" and text "${match[1]}".`
-                  };
-              }
+          const bestMatch = matches[0];
+
+          if (bestMatch) {
+             // 4. SMART TOGGLE CHECK (Fixes looping on checkboxes)
+             if (lowerGoal.includes('uncheck')) {
+                 const isChecked = bestMatch.attributes?.['checked'] === 'true';
+                 if (!isChecked) {
+                     console.log(`[SmartSkip] "${keyword}" is already unchecked. Skipping.`);
+                     this.agentContext.burntPhrases.add(keyword);
+                     continue; 
+                 }
+             }
+
+             // FOUND ACTION! Return it.
+             return {
+                 type: 'click',
+                 selector: bestMatch.selector || bestMatch.cssSelector,
+                 semanticTarget: keyword, // We use the keyword as the semantic target
+                 thought: `Deterministic: Found keyword "${keyword}" in goal matching element "${bestMatch.text}". Executing.`
+             };
           }
       }
       
-      // If everything matching the goal is already burnt, yield to AI to find a NEW step.
+      // If no obvious keywords matched, THEN yield to AI.
       return null;
   }
 
@@ -267,31 +358,24 @@ export class McpTools {
     this.sessionHistory = []; 
     const steps: AgentStepResult[] = [];
     
-    // Reset context on new run
-    this.agentContext = {
-        consecutiveFailures: 0,
-        burntPhrases: new Set<string>(),
-        pastActions: []
-    };
+    // Reset Context
+    this.agentContext = { consecutiveFailures: 0, burntPhrases: new Set(), pastActions: [] };
 
     await this.browser.init();
     const page = this.browser.getPage();
     const urlInGoal = this.extractUrlFromPrompt(goal);
     let stepNumber = 0;
 
-    // 1. Initial Navigation
+    // 1. AUTO-START (Navigation)
     if (urlInGoal) {
         const currentUrl = page.url();
-        const targetDomain = this.extractDomain(urlInGoal);
-        
-        if (currentUrl === 'about:blank' || !currentUrl.includes(targetDomain)) {
+        if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
             stepNumber++;
             await this.navigate(urlInGoal);
             
-            const navAction: AgentAction = { type: 'navigate', url: urlInGoal, thought: 'Initial navigation' };
             steps.push({ 
                 stepNumber, 
-                action: navAction, 
+                action: { type: 'navigate', url: urlInGoal, thought: 'Initial navigation' }, 
                 success: true, 
                 message: `Mapsd to ${urlInGoal}`, 
                 urlBefore: 'about:blank', 
@@ -299,60 +383,44 @@ export class McpTools {
                 stateChanged: true, 
                 retryCount: 0 
             });
-            
-            config.broadcast?.({ type: 'log', timestamp: new Date().toISOString(), message: `Step ${stepNumber}: Navigated to ${urlInGoal}` });
-            this.sessionHistory.push({ action: 'navigate', target: urlInGoal, description: `Mapsd to ${urlInGoal}` });
-            
-            if (goal.toLowerCase().includes('login')) {
-                 try { await page.waitForSelector('input', { timeout: 4000 }); } catch {}
-            }
+            await page.waitForTimeout(2000);
         }
     }
 
     let isFinished = false;
-    let lastFingerprint = '';
 
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
       
-      let observation = await this.observe(true);
-      if (!observation.selectors || observation.selectors.length === 0) {
-          await page.waitForTimeout(2000);
-          observation = await this.observe(true);
+      // OBSERVE (Lite Mode First)
+      // We do NOT take a screenshot yet. Screenshots are slow (100-300ms) and heavy.
+      // We only extract selectors to see if we can solve this purely with code.
+      const observationLite = await this.observe(false); 
+      const elements = observationLite.selectors ?? [];
+      const currentTitle = observationLite.title || '';
+      
+      // PLAN (Hybrid)
+      // 1. Try Code-Based Plan (Free & Fast)
+      let nextAction = this.tryDeterministicPlan(goal, elements, currentTitle, observationLite.url);
+      let screenshotForStep: string | undefined = undefined;
+
+      // 2. If Code failed, go to "Heavy Mode" (Screenshot + AI)
+      if (!nextAction) {
+          // Now we pay the cost of a screenshot because the AI needs it
+          const screenshotObj = await this.browser.screenshot();
+          screenshotForStep = screenshotObj.replace('data:image/png;base64,', '');
+          
+          nextAction = await this.planNextAgentAction(
+              goal, 
+              elements, 
+              this.agentContext.pastActions, 
+              "", 
+              this.agentContext.burntPhrases, 
+              currentTitle, 
+              observationLite.url, 
+              screenshotForStep
+          );
       }
-
-      const elements = observation.selectors ?? [];
-      const currentFingerprint = this.calculateDomFingerprint(elements);
-      const currentTitle = observation.title || '';
-      const currentUrl = observation.url || '';
-
-      // Loop Detection / Stagnation
-      let feedbackForPlanner = '';
-      if (stepNumber > 1 && lastFingerprint === currentFingerprint) {
-          feedbackForPlanner = `CRITICAL: Last action had NO EFFECT. Do not repeat it.`; 
-      }
-
-      // Login Awareness
-      const hasPasswordField = elements.some(el => 
-        (el.attributes?.type === 'password') || 
-        (el.text?.toLowerCase().includes('password')) ||
-        (el.placeholder?.toLowerCase().includes('password'))
-      );
-      if (hasPasswordField && stepNumber < 5) {
-          feedbackForPlanner += "\nCRITICAL: You are on a LOGIN PAGE. Fill Username & Password first.";
-      }
-
-      // 2. Plan Next Move (Pass Burnt Phrases to Block LLM Repetition too)
-      let nextAction = await this.planNextAgentAction(
-          goal, 
-          elements, 
-          this.agentContext.pastActions, 
-          feedbackForPlanner, 
-          this.agentContext.burntPhrases, 
-          currentTitle,
-          currentUrl,
-          observation.screenshot
-      );
 
       config.broadcast?.({
           type: 'log',
@@ -361,47 +429,33 @@ export class McpTools {
           data: { role: 'agent-reasoning', thought: nextAction.thought }
       });
 
-      // 3. Execute
-      const urlBefore = page.url();
+      // EXECUTE
       let actionSuccess = false;
-      let actionMessage = '';
       let retryCount = 0;
-
+      let executionMsg = "";
+      
       while (retryCount <= 1 && !actionSuccess) {
            this.agentCommandBuffer = []; 
            const result = await this.executeAgentAction(nextAction, elements); 
            actionSuccess = result.success;
-           actionMessage = result.message;
+           executionMsg = result.message;
            
            if (actionSuccess) {
-               if (this.agentCommandBuffer.length > 0) {
-                   this.sessionHistory.push(...this.agentCommandBuffer);
-               }
+               if (this.agentCommandBuffer.length > 0) this.sessionHistory.push(...this.agentCommandBuffer);
                
-               // --- UNIVERSAL FIX: Burn the successful semantic target ---
-               // This prevents the agent from selecting "Uninsured" again in the very next step.
-               if (nextAction.type === 'click' || nextAction.type === 'type') {
-                   const targetText = (nextAction as any).semanticTarget || '';
-                   if (targetText && targetText.length > 2) {
-                       this.agentContext.burntPhrases.add(targetText.toLowerCase().trim());
-                   }
-               }
+               const target = (nextAction as any).semanticTarget || (nextAction as any).text;
+               if (target) this.agentContext.burntPhrases.add(target.toLowerCase().trim());
            } else {
                retryCount++;
                await page.waitForTimeout(1000);
            }
       }
 
-      const actionDesc = this.describeAction(nextAction, actionSuccess);
+      const actionDesc = executionMsg || this.describeAction(nextAction, actionSuccess);
       this.agentContext.pastActions.push(actionDesc);
-      if (this.agentContext.pastActions.length > 5) this.agentContext.pastActions.shift();
-
+      
       if (actionSuccess) {
-           config.broadcast?.({ 
-               type: 'log', 
-               timestamp: new Date().toISOString(), 
-               message: `Step ${stepNumber}: ${actionDesc.replace('[SUCCESS] ', '')}` 
-           });
+           config.broadcast?.({ type: 'log', timestamp: new Date().toISOString(), message: `Step ${stepNumber}: ${actionDesc.replace('[SUCCESS] ', '')}` });
       }
 
       if (nextAction.type === 'finish' && actionSuccess) isFinished = true;
@@ -410,31 +464,16 @@ export class McpTools {
           stepNumber, 
           action: nextAction, 
           success: actionSuccess, 
-          message: actionMessage, 
-          urlBefore, 
+          message: actionDesc, 
+          urlBefore: observationLite.url, 
           urlAfter: page.url(), 
-          stateChanged: lastFingerprint !== currentFingerprint, 
-          retryCount 
+          stateChanged: actionSuccess, 
+          retryCount,
+          screenshot: screenshotForStep // Only attach if we actually took one
       });
-
-      lastFingerprint = currentFingerprint;
-      
-      const last3 = this.agentContext.pastActions.slice(-3);
-      if (last3.length === 3 && last3.every(a => a === last3[0]) && !isFinished) {
-          await this.browser.scroll(undefined, 'down');
-          this.agentContext.pastActions.push('SYSTEM_FORCED_SCROLL');
-      }
     }
 
-    return { 
-        success: isFinished, 
-        summary: `Completed ${steps.length} steps.`, 
-        goal, 
-        totalSteps: stepNumber, 
-        steps, 
-        commands: [...this.sessionHistory], 
-        seleniumCode: await this.generateSelenium().then(r => r.seleniumCode) 
-    };
+    return { success: isFinished, summary: "Task Completed", goal, totalSteps: stepNumber, steps, commands: this.sessionHistory, seleniumCode: "" };
   }
 
   // --- PARSING ---
@@ -443,7 +482,7 @@ export class McpTools {
     const jsonStr = this.extractBalancedJson(clean);
     
     if (!jsonStr) {
-       return { type: 'wait', durationMs: 1000, thought: responseText.slice(0, 100) };
+       return { type: 'wait', durationMs: 1000, thought: 'AI returned non-JSON response' };
     }
     try {
       const parsed = JSON.parse(jsonStr);
@@ -467,127 +506,104 @@ export class McpTools {
     return null;
   }
 
-  // --- PLANNER ---
+  // --- PLANNER (Fallback) ---
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
     actionHistory: string[],
     feedbackForPlanner: string,
-    burntPhrases: Set<string>, // Universal Block List
+    burntPhrases: Set<string>, 
     currentTitle: string,
     currentUrl: string,
     screenshot?: string
   ): Promise<AgentAction> {
     
     if (elements.length === 0) {
-        return { type: 'wait', durationMs: 3000, thought: 'CRITICAL: No interactive elements found.' };
+        return { type: 'wait', durationMs: 3000, thought: 'No interactive elements found.' };
     }
-
-    // Try Deterministic Plan First (Universal Logic)
-    if (this.agentContext.consecutiveFailures === 0 && !feedbackForPlanner.includes('CRITICAL')) {
-        const deterministicAction = this.tryDeterministicPlan(goal, elements, currentTitle, currentUrl);
-        if (deterministicAction) return deterministicAction;
-    }
-
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
-    // Valid Elements Filtering (Applying Universal Block)
+    // Valid Elements Filtering 
+    // Filter out burned elements to save context and force progress
     const validElements = elements.filter(el => {
         const text = (el.text || '').toLowerCase().trim();
         const label = (el.ariaLabel || '').toLowerCase().trim();
-        const context = (el.context || '').toLowerCase().trim();
-        
-        // Universal Block: If any identifying text is burnt, hide it from LLM
-        if (burntPhrases.has(text) || burntPhrases.has(label) || burntPhrases.has(context)) return false;
+        if (burntPhrases.has(text) || burntPhrases.has(label)) return false;
         return true;
     });
 
-    // Simplify payload for LLM
-    const elementList = validElements.slice(0, 100).map((el, idx) => ({
+    const elementList = validElements.slice(0, 150).map((el, idx) => ({
         id: `el_${idx}`,  
         tag: el.tagName,
         text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
-        // Pass context to LLM too!
         context: (el.context || '').slice(0, 50),
         role: el.roleHint,
         label: (el.ariaLabel || '').slice(0, 50),
-        ph: (el.placeholder || ''),
     }));
 
     const prompt = `
-SYSTEM: Intelligent Web Agent.
+SYSTEM: Web Automation Agent.
 GOAL: ${goal}
-
-HISTORY:
-${actionHistory.slice(-5).join('\n')}
-
-FEEDBACK: ${feedbackForPlanner || "None."}
+HISTORY: ${actionHistory.slice(-5).join('; ')}
 ALREADY DONE: ${Array.from(burntPhrases).join(', ')}
 
 ELEMENTS:
 ${JSON.stringify(elementList)}
 
 INSTRUCTIONS:
-1. **Context Check:** Look at the 'context' field! It identifies buttons by their nearby label (e.g. context="Insurance").
-2. **Login:** If you see username/password fields, FILL THEM.
-3. **Progress:** Do NOT repeat actions listed in "ALREADY DONE". Choose the NEXT step.
-
-RETURN ONLY JSON.
+1. Pick the NEXT step to achieve GOAL. 
+2. IGNORE actions in "ALREADY DONE".
+3. RETURN JSON: { "type": "click"|"type"|"finish"|"wait", "elementId": "el_X", "text"?: "...", "thought": "..." }
 `;
 
     try {
-        let response = '';
-        let attempts = 0;
-        while (attempts < 3) {
-            try {
-                const result = await this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any);
-                response = (result as any).response?.text?.() ?? '';
-                break;
-            } catch (e) {
-                attempts++;
-                await new Promise(r => setTimeout(r, 2000));
-                if (attempts === 3) throw e;
-            }
-        }
-
+        const result = await this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any);
+        const response = (result as any).response?.text?.() ?? '';
         const parsed = this.parseAgentActionResponse(response);
         
-        if ((parsed.type === 'click' || parsed.type === 'type' || parsed.type === 'select_option') && parsed.elementId) {
+        // Resolve elementId to Selector immediately
+        if ((parsed.type === 'click' || parsed.type === 'type') && parsed.elementId) {
             const match = parsed.elementId.match(/el_(\d+)/);
             if (match) {
                 const idx = parseInt(match[1]);
                 const el = validElements[idx];
                 if (el) {
-                    parsed.selector = el.cssSelector || el.selector || el.xpath;
-                    parsed.semanticTarget = el.context || el.text || el.ariaLabel;
-                } else {
-                     return { type: 'wait', durationMs: 2000, thought: `AI hallucinated ID ${parsed.elementId}. Waiting.` };
+                    parsed.selector = el.cssSelector || el.selector;
+                    parsed.semanticTarget = el.text || el.ariaLabel;
                 }
             }
         }
         return parsed;
 
     } catch (err: any) {
-        console.error('[Planner Error]', err.message);
-        return { 
-            type: 'wait', 
-            durationMs: 3000, 
-            thought: `Planner API Error: ${err.message}. Retrying...` 
-        };
+        return { type: 'wait', durationMs: 3000, thought: `Planner Error: ${err.message}` };
     }
   }
 
-  private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<any> {
-    const desc = (action as any).semanticTarget 
-        ? `${action.type === 'type' ? 'Typed into' : 'Clicked'} "${(action as any).semanticTarget}"`
-        : undefined;
-
+  private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<{success: boolean, message: string}> {
+    
     if (action.type === 'click') {
-      if (action.selector) return await this.clickExact(action.selector, desc);
-      return { success: false, message: "Missing selector for click" };
+      // Type safety: Explicitly cast 'any' to fallback safe access
+      // or rely on the union type which has selector/semanticTarget for 'click'
+      const selector = action.selector; 
+      const semanticTarget = action.semanticTarget;
+
+      if (selector) return await this.clickExact(selector, semanticTarget || selector);
+      if (semanticTarget) return await this.click(semanticTarget);
+      return { success: false, message: "Missing selector/target for click" };
     } 
     else if (action.type === 'type') {
-      if (action.selector) return await this.type(action.selector, action.text);
+      const selector = action.selector; 
+      const semanticTarget = action.semanticTarget;
+
+      if (selector) return await this.type(selector, action.text);
+      if (semanticTarget) {
+          // Resolve target for typing
+          const res = await this.click(semanticTarget); // Using click logic to find element
+          if (res.success && res.selectors?.[0]) {
+               return await this.type(res.selectors[0].cssSelector!, action.text);
+          }
+      }
       return { success: false, message: "Missing selector for type" };
     } 
     else if (action.type === 'navigate') {
@@ -607,15 +623,43 @@ RETURN ONLY JSON.
     return { success: false, message: "Unknown action type" };
   }
 
+  // Used by clickExact and standard actions to log descriptive history
+  async clickExact(selector: string, description?: string): Promise<ExecutionResult> {
+    const command: ExecutionCommand = {
+      action: 'click',
+      target: selector,
+      description: description || `Clicked ${selector}`,
+    };
+    try {
+      await this.browser.click(selector);
+      this.recordCommand(command);
+      return { success: true, message: `Clicked ${description || selector}` };
+    } catch (error: any) {
+      return { success: false, message: error.message };
+    }
+  }
+
   private describeAction(action: AgentAction, success: boolean): string {
     const status = success ? 'SUCCESS' : 'FAIL';
-    let tgt = 'page';
-    if (action.type === 'click' || action.type === 'type' || action.type === 'select_option') {
-        tgt = (action as any).semanticTarget || action.selector || action.elementId || 'page';
+    
+    if (action.type === 'click' || action.type === 'select_option') {
+        const tgt = action.semanticTarget || action.selector || 'element';
+        return `[${status}] Click ${tgt}`;
     }
-    if (action.type === 'type') return `[${status}] Type "${action.text}" into ${tgt}`;
-    if (action.type === 'click') return `[${status}] Click ${tgt}`;
-    if (action.type === 'navigate') return `[${status}] Navigate to ${action.url}`;
+    if (action.type === 'type') {
+        const tgt = action.semanticTarget || action.selector || 'element';
+        return `[${status}] Type "${action.text}" into ${tgt}`;
+    }
+    if (action.type === 'navigate') {
+        return `[${status}] Navigate to ${action.url}`;
+    }
+    if (action.type === 'wait') {
+        return `[${status}] Wait ${action.durationMs}ms`;
+    }
+    if (action.type === 'scroll') {
+        return `[${status}] Scroll ${action.direction}`;
+    }
+    
     return `[${status}] ${action.type}`;
   }
 }
