@@ -552,6 +552,14 @@ export class McpTools {
     ineffectivePhrases: Set<string>,
     screenshot?: string
   ): Promise<AgentAction> {
+    
+    // FIX 1: Debug Log - See exactly what the AI sees
+    console.log(`[Planner] Planning with ${elements.length} elements.`);
+    if (elements.length === 0) {
+        // CRITICAL: Fail fast if no elements
+        return { type: 'wait', durationMs: 3000, thought: 'CRITICAL: No interactive elements found. The page might be loading or blocked. I will wait.' };
+    }
+
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
     const validElements = elements.filter(el => {
@@ -622,8 +630,17 @@ RETURN ONLY JSON matching these shapes:
             }
         }
         return parsed;
-    } catch (err) {
-        return { type: 'wait', durationMs: 2000, thought: 'Planner failed' };
+    } catch (err: any) {
+        // FIX 2: EXPOSE THE ERROR
+        const errorMessage = err.message || String(err);
+        console.error('[Planner Error]', errorMessage);
+        
+        // Return a wait action but INCLUDE the error in the thought so it shows in the UI
+        return { 
+            type: 'wait', 
+            durationMs: 3000, 
+            thought: `Planner crashed: ${errorMessage.substring(0, 100)}. Retrying...` 
+        };
     }
   }
 

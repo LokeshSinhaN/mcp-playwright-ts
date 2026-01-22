@@ -102,23 +102,20 @@ export class BrowserManager {
     const page = this.getPage();
 
     try {
-      // Use a more forgiving load state and explicit timeout. Some sites
-      // (including large, analytics-heavy ones) never truly reach
-      // "networkidle" but are still fully interactive much earlier.
-      await page.goto(url, { waitUntil: 'load', timeout: this.defaultTimeout });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.defaultTimeout });
+      
+      // FIX: Explicitly wait for visual stability
+      // This gives the "Fade In" modal time to reach opacity: 1
+      await page.waitForTimeout(2000); 
+      
+      // Try to wait for any input field (heuristic for login pages)
+      try {
+          await page.waitForSelector('input, button', { timeout: 3000, state: 'visible' });
+      } catch {}
+      
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/Timeout/i.test(msg)) {
-        // Treat navigation timeouts as soft failures: keep whatever URL
-        // the page reached so the rest of the flow can continue.
-        console.warn('goto timeout, proceeding with current page:', msg);
-      } else {
-        throw err;
-      }
+      console.warn('goto timeout/error, proceeding:', err);
     }
-
-    // Wait for any dynamic content to stabilize
-    await this.waitForPageStable();
     this.state.currentUrl = page.url();
   }
 
