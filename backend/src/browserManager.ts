@@ -142,21 +142,23 @@ export class BrowserManager {
   async screenshot(): Promise<string> {
     const page = this.getPage();
     try {
-        if (page.isClosed()) return ''; // Handle closed page gracefully
+        if (page.isClosed()) return ''; 
 
-        // Reduced timeout to fail fast without hanging the agent
+        // FIX: Use a slightly longer timeout and catch specific errors
         const buf = await page.screenshot({ 
             fullPage: false, 
-            timeout: 1500,
-            animations: 'disabled' 
+            timeout: 2000, // Increased slightly
+            animations: 'disabled',
+            caret: 'hide'
         });
         const dataUrl = `data:image/png;base64,${buf.toString('base64')}`;
         this.state.lastScreenshot = dataUrl;
         return dataUrl;
     } catch (err) {
-        // Return the last known good screenshot instead of crashing
-        // or a blank placeholder if none exists
-        return this.state.lastScreenshot || 'data:image/png;base64,';
+        console.warn(`Screenshot failed: ${err}`);
+        // Return the last good screenshot if available, otherwise a placeholder
+        // This prevents the UI from going "blank" if one frame fails.
+        return this.state.lastScreenshot || 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
     }
 }
 
@@ -350,38 +352,9 @@ export class BrowserManager {
     const baseLocator = await this.smartLocate(selector, this.defaultTimeout);
     const locator = baseLocator.first();
 
-    // 1. ROBUST SCROLLING & STABILITY CHECK (Prevents "Wrong Neighbor" Click)
-    try {
-      // Try fast scroll first
-      await locator.scrollIntoViewIfNeeded({ timeout: 1500 });
-      
-      // FIX: Wait for scroll to COMPLETELY stop (Debounce)
-      
-      await page.evaluate(() => new Promise((resolve) => {
-          let lastPos = -1;
-          const check = () => {
-            const current = window.scrollY + document.documentElement.scrollTop; // Checks both window and containers
-            if (current === lastPos) resolve(true);
-            else {
-              lastPos = current;
-              requestAnimationFrame(check);
-            }
-          };
-          requestAnimationFrame(check);
-      }));
-    } catch {
-      // Fallback: JS Scroll
-      await locator.evaluate((el: any) => el.scrollIntoView({ block: 'center', inline: 'nearest' }));
-      await page.waitForTimeout(500); 
-    }
+    await locator.scrollIntoViewIfNeeded().catch(() => {});
 
-    // 2. Visual Highlight
-    try {
-      await locator.evaluate((el: any) => { (el as HTMLElement).style.outline = '3px solid red'; });
-      await page.waitForTimeout(200);
-    } catch {}
-
-    // 3. Extract Info
+    // Extract Info before the click, as a click can navigate away.
     let info: ElementInfo | undefined;
     try {
       const handle = await locator.elementHandle();
@@ -391,21 +364,31 @@ export class BrowserManager {
       }
     } catch {}
 
-    // 4. Click with Force Strategy (Fixes "Element not clickable")
+    // INTELLIGENT CLICK STRATEGY
+    // 1. Hover first (triggers flyout menus in ASP.NET/jQuery)
     try {
-      await locator.click({ timeout: 3000 });
-    } catch (err) {
-      console.warn(`Standard click failed, escalating to FORCE click...`);
-      try {
-        // Force click bypasses overlap checks
-        await locator.click({ timeout: 3000, force: true });
-      } catch (forceErr) {
-        // JS Click is the ultimate fallback
-        await locator.evaluate((el: any) => el.click());
-      }
+        await locator.hover({ timeout: 1000, force: true });
+        await page.waitForTimeout(300); // Give JS time to animate
+    } catch {}
+
+    // 2. Attempt Standard Click
+    try {
+        await locator.click({ timeout: 2000 });
+    } catch (e) {
+        // 3. Fallback: JS Dispatch (often bypasses overlays)
+        console.log("Standard click failed, attempting JS dispatch");
+        await locator.dispatchEvent('click');
     }
 
-    return info || { tagName: 'unknown', attributes: {}, cssSelector: selector };
+    // 4. Wait for potential navigation or re-render
+    // This prevents the agent from scraping the "old" page instantly
+    try {
+        await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => {});
+        // Also wait for network idle if it's an AJAX app
+        await page.waitForLoadState('networkidle', { timeout: 1000 }).catch(() => {});
+    } catch {}
+
+    return info || { tagName: 'clicked', attributes: {}, cssSelector: selector };
   }
 
   async type(selector: string, text: string): Promise<ElementInfo> {

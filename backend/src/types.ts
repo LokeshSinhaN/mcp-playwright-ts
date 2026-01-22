@@ -44,6 +44,7 @@ export interface ElementInfo {
   // to disambiguate otherwise similar elements (e.g., identical buttons in
   // different cards).
   context?: string;
+  expanded?: boolean;
   attributes: Record<string, string | undefined>;
 }
 
@@ -182,4 +183,13 @@ export interface AgentConfig {
   onThought?: (thought: string, action: AgentAction) => void;
   /** Direct access to the WebSocket broadcast function for real-time logging. */
   broadcast?: (msg: WebSocketMessage) => void;
+}
+
+// Add this to your AgentAction type to track outcomes
+export interface ActionOutcome {
+    action: AgentAction;
+    success: boolean;
+    stateFingerprintBefore: string;
+    stateFingerprintAfter: string;
+    timestamp: number;
 }

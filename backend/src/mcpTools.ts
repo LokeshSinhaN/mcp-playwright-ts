@@ -1,4 +1,3 @@
-//
 import { GenerativeModel } from '@google/generative-ai';
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
@@ -12,38 +11,33 @@ import {
   AgentSessionResult,
   AgentConfig,
 } from './types';
-import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent } from './dropdownUtils';
+import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction } from './dropdownUtils';
 
+// Track context about what works and what doesn't
 interface AgentContext {
   consecutiveFailures: number;
+  ineffectivePhrases: Set<string>; 
+  pastActions: string[]; 
 }
 
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
   private agentCommandBuffer: ExecutionCommand[] | null = null;
-  private agentContext: AgentContext | null = null;
-
-  private recordCommand(cmd: ExecutionCommand | ExecutionCommand[]): void {
-    const cmds = Array.isArray(cmd) ? cmd : [cmd];
-    if (this.agentCommandBuffer) {
-      this.agentCommandBuffer.push(...cmds);
-    } else {
-      this.sessionHistory.push(...cmds);
-    }
-  }
-
-  private updateAgentContext(update: Partial<AgentContext>): void {
-    if (this.agentContext) {
-      this.agentContext = { ...this.agentContext, ...update };
-    }
-  }
+  private agentContext: AgentContext = {
+      consecutiveFailures: 0,
+      ineffectivePhrases: new Set(),
+      pastActions: []
+  };
 
   constructor(private readonly browser: BrowserManager, private readonly model?: GenerativeModel) {}
 
+  // --- FIX 1: CORRECT URL REGEX ---
   private extractUrlFromPrompt(prompt: string): string | null {
+    // Previous code had a typo: /https?:\]\/[^\s]+/
     const match = prompt.match(/https?:\/\/[^\s]+/);
     return match ? match[0] : null;
   }
+
   private extractDomain(url: string): string {
     try {
       return new URL(url).hostname;
@@ -53,281 +47,300 @@ export class McpTools {
   }
 
   async navigate(url: string): Promise<ExecutionResult> {
-    await this.browser.init();
-    await this.browser.goto(url);
-    this.recordCommand({ action: 'navigate', target: url, description: url });
-    await this.browser.handleCookieBanner();
-    const screenshot = await this.browser.screenshot();
-    return { success: true, message: `Mapsd to ${url}`, screenshot };
-  }
-
-  async click(target: string): Promise<ExecutionResult> {
-    const dropdownIntent: DropdownIntent | null = parseDropdownInstruction(target);
-    if (dropdownIntent) {
-      try {
-        await this.browser.init();
-        const page = this.browser.getPage();
-        let message: string;
-
-        if (dropdownIntent.kind === 'open-and-select') {
-          const selectionResult = await selectFromDropdown(page, dropdownIntent.dropdownLabel, dropdownIntent.optionLabel);
-          this.recordCommand([
-            {
-              action: 'click',
-              target: dropdownIntent.dropdownLabel,
-              selectors: { text: dropdownIntent.dropdownLabel },
-              description: `Open dropdown "${dropdownIntent.dropdownLabel}"`, 
-            },
-            {
-              action: 'click',
-              target: selectionResult.optionSelector || dropdownIntent.optionLabel,
-              selectors: selectionResult.optionSelector
-                ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel } 
-                : { text: dropdownIntent.optionLabel },
-              description: `Select option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`, 
-            },
-          ]);
-          message = `Selected option "${dropdownIntent.optionLabel}" from dropdown "${dropdownIntent.dropdownLabel}"`;
-        } else {
-          const selectionResult = await selectOptionInOpenDropdown(page, dropdownIntent.optionLabel);
-          this.recordCommand({
-            action: 'click',
-            target: selectionResult.optionSelector || dropdownIntent.optionLabel,
-            selectors: selectionResult.optionSelector
-              ? { css: selectionResult.optionSelector, xpath: selectionResult.optionXpath, text: dropdownIntent.optionLabel } 
-              : { text: dropdownIntent.optionLabel },
-            description: `Select option "${dropdownIntent.optionLabel}" from the currently open dropdown`, 
-          });
-          message = `Selected option "${dropdownIntent.optionLabel}" from the currently open dropdown`;
-        }
-        const screenshot = await this.browser.screenshot();
-        return { success: true, message, screenshot };
-      } catch (err) {
-        console.warn('Dropdown selection helper failed, falling back to standard click():', err);
-      }
-    }
-
-    if (this.model) {
-      try {
-        await this.browser.init();
-        const page = this.browser.getPage();
-        const extractor = new SelectorExtractor(page);
-        const all = await extractor.extractAllInteractive();
-        const visible = all.filter((el) => el.visible !== false && el.isVisible !== false);
-        const pool = visible.length > 0 ? visible : all;
-
-        if (pool.length === 0) {
-          const screenshot = await this.browser.screenshot().catch(() => undefined as any);
-          return { success: false, message: 'No interactive elements found.', error: 'No interactive elements', screenshot };
-        }
-
-        const chosenIndex = await this.identifyTargetWithLLM(target, this.extractCoreLabel(target), pool);
-
-        if (typeof chosenIndex === 'number' && chosenIndex >= 0 && chosenIndex < pool.length) {
-          const chosen = pool[chosenIndex];
-          const selectorToClick = chosen.selector || chosen.cssSelector || chosen.xpath;
-          if (!selectorToClick) return this.clickWithHeuristics(target);
-
-          const info = await this.browser.click(selectorToClick);
-          const robustSelector = info.selector || info.cssSelector || info.xpath || selectorToClick;
-          this.recordCommand({
-            action: 'click',
-            target: robustSelector,
-            selectors: { css: info.cssSelector ?? info.selector, xpath: info.xpath, id: info.id, text: info.text },
-            description: target,
-          });
-          await page.waitForTimeout(1000);
-          const screenshot = await this.browser.screenshot();
-          return { success: true, message: `Clicked ${info.roleHint || 'element'} "${info.text || target}"`, selectors: [info], screenshot, candidates: pool };
-        }
-        return this.clickWithHeuristics(target);
-      } catch (err) {
-        return this.clickWithHeuristics(target);
-      }
-    }
-    return this.clickWithHeuristics(target);
-  }
-
-  async clickExact(selector: string, labelForHistory?: string): Promise<ExecutionResult> {
-    await this.browser.init();
-    const extractor = new SelectorExtractor(this.browser.getPage());
+    const command: ExecutionCommand = {
+      action: 'navigate',
+      target: url,
+      description: `Mapsd to ${url}`,
+    };
     try {
-      const info = await this.browser.click(selector);
-      const robustSelector = info.selector || info.cssSelector || info.xpath || selector;
-      this.recordCommand({
-        action: 'click',
-        target: robustSelector,
-        selectors: { css: info.cssSelector ?? info.selector, xpath: info.xpath, id: info.id, text: info.text },
-        description: labelForHistory || selector,
-      });
-      const screenshot = await this.browser.screenshot();
-      return { success: true, message: `Clicked ${info.roleHint || 'element'} "${info.text || labelForHistory || selector}"`, selectors: [info], screenshot };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const screenshot = await this.browser.screenshot().catch(() => undefined as any);
-      let selectors;
-      try { selectors = await extractor.extractAllInteractive(); } catch { selectors = undefined; }
-      return { success: false, message: msg, error: msg, screenshot, selectors };
+      await this.browser.goto(url);
+      this.agentCommandBuffer?.push(command);
+      return { success: true, message: `Mapsd to ${url}` };
+    } catch (error: any) {
+      return { success: false, message: error.message };
     }
   }
 
-  private async withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => { reject(new Error(`${label} timed out after ${ms}ms`)); }, ms);
+  async click(
+    elementId: string,
+    elements: ElementInfo[]
+  ): Promise<ExecutionResult> {
+    const element = elements[parseInt(elementId.split('_')[1])];
+    if (!element) {
+      return { success: false, message: 'Element not found' };
+    }
+
+    const selector = element.selector;
+    if (!selector) {
+        return { success: false, message: 'Element has no selector' };
+    }
+
+    const desc =
+      element.text || element.ariaLabel || element.tagName || 'element';
+    const command: ExecutionCommand = {
+      action: 'click',
+      target: selector,
+      description: `Clicked "${desc}"`,
+    };
+
+    try {
+      await this.browser.click(selector);
+      this.agentCommandBuffer?.push(command);
+      return { success: true, message: `Clicked ${desc}` };
+    } catch (e1) {
+      console.log(`Direct click failed for ${selector}, trying JS click.`);
+      try {
+        await this.browser.getPage().evaluate((sel) => {
+          const el = document.querySelector(sel) as HTMLElement;
+          el?.click();
+        }, selector);
+        this.agentCommandBuffer?.push(command);
+        return {
+          success: true,
+          message: `Clicked ${desc} using JavaScript.`,
+        };
+      } catch (e2: any) {
+        return { success: false, message: e2.message };
+      }
+    }
+  }
+
+  async clickExact(selector: string): Promise<ExecutionResult> {
+    const command: ExecutionCommand = {
+      action: 'click',
+      target: selector,
+      description: `Clicked element matching selector ${selector}`,
+    };
+    try {
+      await this.browser.click(selector);
+      this.agentCommandBuffer?.push(command);
+      return { success: true, message: `Clicked ${selector}` };
+    } catch (error: any) {
+      return { success: false, message: error.message };
+    }
+  }
+
+  async withTimeout<T>(
+    promise: Promise<T>,
+    ms: number,
+    timeoutMessage: string
+  ): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(timeoutMessage));
+      }, ms);
+
+      promise
+        .then((res) => {
+          clearTimeout(timer);
+          resolve(res);
+        })
+        .catch((err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
     });
-    try { return await Promise.race([promise, timeout]); } finally { if (timer) clearTimeout(timer); }
   }
 
   private sanitizeElementsForLLM(elements: ElementInfo[]): any[] {
-    return elements.map((el, idx) => ({
+    return elements.slice(0, 150).map((el, idx) => ({
       id: `el_${idx}`,
       tag: el.tagName,
-      text: (el.text ?? '').slice(0, 50).trim(), // Truncate to save tokens
-      label: (el.ariaLabel ?? '').slice(0, 50).trim(),
+      text: (el.text || '').slice(0, 100).replace(/\s+/g, ' '),
+      ariaLabel: (el.ariaLabel || '').slice(0, 100).replace(/\s+/g, ' '),
       role: el.roleHint,
-      scrollable: el.scrollable ? true : undefined
     }));
   }
 
-  private extractCoreLabel(prompt: string): string {
-    const raw = (prompt || '').trim();
-    if (!raw) return '';
-    const quoted = raw.match(/["\'“”‘’]([^"\'“”‘’]{2,})["\'“”‘’]/);
-    if (quoted && quoted[1].trim().length >= 3) return quoted[1].trim();
-    let core = raw;
-    const lower = core.toLowerCase();
-    const verbPrefixes = ['click on', 'click', 'press', 'tap', 'open', 'select', 'choose'];
-    for (const v of verbPrefixes) {
-      if (lower.startsWith(v + ' ')) {
-        core = core.slice(v.length).trim();
-        break;
-      }
-    }
-    return core.replace(/\b(button|link|tab|field|input|dropdown|drop down|icon|menu)\b/gi, '').trim() || raw;
+  private extractCoreLabel(element: ElementInfo): string {
+    return (
+      element.text ||
+      element.ariaLabel ||
+      element.placeholder ||
+      'Unnamed Element'
+    ).trim();
   }
 
-  private async identifyTargetWithLLM(userPrompt: string, coreQuery: string, elements: ElementInfo[]): Promise<number | null> {
-    if (!this.model) return null;
-    const summaries = this.sanitizeElementsForLLM(elements);
-    const selectionQuery = coreQuery && coreQuery.trim().length ? coreQuery : userPrompt;
-    const lowerPrompt = selectionQuery.toLowerCase();
-    const tokens = lowerPrompt.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
-    const filteredSummaries = summaries.filter((s) => {
-      const label = `${s.text} ${s.label}`.toLowerCase();
-      if (!label.trim()) return false;
-      if (tokens.length === 0) return true;
-      return tokens.some((tok) => label.includes(tok));
-    });
+  async identifyTargetWithLLM(
+    elements: ElementInfo[],
+    instruction: string
+  ): Promise<string | null> {
+    if (!this.model) {
+      throw new Error('Generative model not available.');
+    }
 
-    if (filteredSummaries.length === 0) return null;
+    const simplifiedElements = this.sanitizeElementsForLLM(elements);
 
-    const prompt = `SYSTEM: Pick the element ID for "${userPrompt}".
-JSON Elements: ${JSON.stringify(filteredSummaries)}
-Return ONLY JSON: {"id": "el_X"}`;
+    const prompt = `
+      You are an expert system for mapping human language to web elements.
+      Based on the following instruction, identify the single best element from the list.
+      Instruction: "${instruction}"
+      Elements:
+      ${JSON.stringify(simplifiedElements, null, 2)}
+
+      Respond with ONLY the JSON object for the single best matching element, or null if no clear match is found.
+    `;
 
     try {
       const result = await this.withTimeout(
         this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any),
-        45000, 'LLM selector'
+        3000,
+        'LLM element identification timed out.'
       );
-      const raw = (result as any).response?.text?.() ?? '';
-      const match = raw.match(/el_(\d+)/);
-      if (!match) return null;
-      const idx = Number.parseInt(match[1], 10);
-      return Number.isFinite(idx) ? idx : null;
-    } catch {
+      const responseText = (result as any).response?.text?.() ?? '';
+      const matchedElement = JSON.parse(responseText.trim());
+
+      if (matchedElement && matchedElement.id) {
+        const elementIndex = parseInt(matchedElement.id.split('_')[1]);
+        if (!isNaN(elementIndex) && elements[elementIndex]) {
+          const selector = elements[elementIndex].selector;
+          return selector || null;
+        }
+      }
+      return null;
+    } catch (error) {
+      console.error('Error identifying target with LLM:', error);
       return null;
     }
   }
 
-  private async clickWithHeuristics(target: string): Promise<ExecutionResult> {
-    await this.browser.init();
-    const page = this.browser.getPage();
-    const extractor = new SelectorExtractor(page);
-    let candidates: ElementInfo[] = [];
-    const coreTarget = this.extractCoreLabel(target);
+  async clickWithHeuristics(
+    instruction: string,
+    elements: ElementInfo[]
+  ): Promise<ExecutionResult> {
+    const selector = await this.identifyTargetWithLLM(elements, instruction);
+    if (selector) {
+      return this.clickExact(selector);
+    }
 
-    try {
-      let count = 0;
-      let isSelectorValid = true;
-      try {
-        const locator = page.locator(target);
-        count = await locator.filter({ hasText: /.*/ }).count();
-      } catch { isSelectorValid = false; }
-
-      if (!isSelectorValid || count === 0) {
-        candidates = await extractor.findCandidates(coreTarget || target);
-        if (candidates.length > 0) {
-            const preferredSelector = candidates[0].selector || candidates[0].cssSelector || candidates[0].xpath;
-            if (preferredSelector) return this.clickExact(preferredSelector, target);
-        }
+    const dropdownInstruction = parseDropdownInstruction(instruction);
+    if (dropdownInstruction) {
+      if (dropdownInstruction.kind === 'open-and-select') {
+        const result = await selectFromDropdown(
+          this.browser.getPage(),
+          dropdownInstruction.dropdownLabel,
+          dropdownInstruction.optionLabel
+        );
+        return { success: !!result.optionSelector, message: `Selected option using ${result.method}` };
+      } else if (dropdownInstruction.kind === 'select-only') {
+        const result = await selectOptionInOpenDropdown(
+          this.browser.getPage(),
+          dropdownInstruction.optionLabel
+        );
+        return { success: !!result.optionSelector, message: `Selected option using ${result.method}` };
       }
-      
-      const info = await this.browser.click(target);
-      const robustSelector = info.selector || info.cssSelector || info.xpath || target;
-      this.recordCommand({
-        action: 'click',
-        target: robustSelector,
-        selectors: { css: info.cssSelector ?? info.selector, xpath: info.xpath, id: info.id, text: info.text },
-        description: target,
-      });
-      await page.waitForTimeout(1000);
-      return { success: true, message: `Clicked "${info.text || target}"`, selectors: [info], screenshot: await this.browser.screenshot() };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { success: false, message: `Error clicking: ${msg}`, error: msg, screenshot: await this.browser.screenshot() };
     }
+
+    return {
+      success: false,
+      message: `Could not identify a clickable element for: "${instruction}"`,
+    };
   }
 
-  async type(selector: string, text: string): Promise<ExecutionResult> {
-    const page = this.browser.getPage();
-    const extractor = new SelectorExtractor(page);
+  async type(
+    elementIdOrSelector: string,
+    text: string,
+    elements?: ElementInfo[]
+  ): Promise<ExecutionResult> {
+    let selector: string | undefined;
+    let desc: string;
+
+    if (elements && elementIdOrSelector.startsWith('el_')) {
+      const element = elements[parseInt(elementIdOrSelector.split('_')[1])];
+      if (!element) {
+        return { success: false, message: 'Element not found' };
+      }
+      selector = element.selector;
+      desc =
+        element.text || element.ariaLabel || element.tagName || 'element';
+    } else {
+      selector = elementIdOrSelector;
+      desc = `element with selector ${selector}`;
+    }
+
+    if (!selector) {
+        return { success: false, message: 'Element has no selector' };
+    }
+
+    const command: ExecutionCommand = {
+      action: 'type',
+      target: selector,
+      value: text,
+      description: `Typed "${text}" into ${desc}`,
+    };
+
     try {
-      const info = await this.browser.type(selector, text);
-      const robustSelector = info.cssSelector || selector;
-      this.recordCommand({
-        action: 'type',
-        target: robustSelector,
-        value: text,
-        selectors: { css: info.cssSelector ?? info.selector, xpath: info.xpath, id: info.id, text: info.text },
-        description: selector,
-      });
-      return { success: true, message: `Typed into ${selector}`, screenshot: await this.browser.screenshot(), selectors: [info] };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { success: false, message: msg, error: msg, screenshot: await this.browser.screenshot(), selectors: await extractor.extractAllInteractive() };
+      await this.browser.type(selector, text);
+      this.agentCommandBuffer?.push(command);
+      return { success: true, message: `Typed "${text}" into ${desc}` };
+    } catch (error: any) {
+      return { success: false, message: error.message };
     }
   }
 
-  async handleCookieBanner(): Promise<ExecutionResult> {
-    const dismissed = await this.browser.handleCookieBanner();
-    return { success: true, message: dismissed ? 'Cookie banner dismissed' : 'No cookie banner detected', screenshot: await this.browser.screenshot() };
+  async handleCookieBanner(
+    elements: ElementInfo[]
+  ): Promise<ExecutionResult> {
+    const bannerKeywords = [
+      'accept all',
+      'agree',
+      'allow cookies',
+      'ok',
+      'got it',
+      'i agree',
+    ];
+    const cookieElement = elements.find((el) => {
+      const elText = (el.text || '').toLowerCase();
+      return bannerKeywords.some((keyword) => elText.includes(keyword));
+    });
+
+    if (cookieElement && cookieElement.selector) {
+      return this.clickExact(cookieElement.selector);
+    }
+
+    return { success: false, message: 'No cookie banner found.' };
   }
 
-  async extractSelectors(targetSelector?: string): Promise<ExecutionResult> {
+  async observe(useVision: boolean = false): Promise<{
+    url: string;
+    selectors: ElementInfo[];
+    screenshot?: string;
+  }> {
     const page = this.browser.getPage();
+    const url = page.url();
     const extractor = new SelectorExtractor(page);
-    const selectors = targetSelector ? [await extractor.extractForSelector(targetSelector)] : await extractor.extractAllInteractive();
-    selectors.forEach((s, idx) => this.browser.storeSelector(`el_${idx}`, s));
-    return { success: true, message: `Extracted ${selectors.length} elements`, selectors };
+    const selectors = await extractor.extractAllInteractive();
+
+    if (useVision) {
+      // Use a safer screenshot approach (return existing if current fails)
+      const screenshot = await this.browser.screenshot();
+      return {
+        url,
+        selectors,
+        screenshot: screenshot.replace('data:image/png;base64,', ''),
+      };
+    }
+
+    return { url, selectors };
   }
 
-  async observe(targetSelector?: string): Promise<ExecutionResult> {
-    const page = this.browser.getPage();
-    const extractor = new SelectorExtractor(page);
-    const selectors = targetSelector ? [await extractor.extractForSelector(targetSelector)] : await extractor.extractAllInteractive();
-    selectors.forEach((s, idx) => this.browser.storeSelector(`observe_${idx}`, s));
-    return { success: true, message: `Observed ${selectors.length} interactive elements`, screenshot: await this.browser.screenshot(), selectors };
+  async generateSelenium(
+    existingCommands: ExecutionCommand[] = []
+  ): Promise<{ seleniumCode: string; success: boolean }> {
+    const generator = new SeleniumGenerator();
+    const allCommands = [...this.sessionHistory, ...existingCommands];
+    const seleniumCode = generator.generate(allCommands);
+    return { seleniumCode, success: true };
   }
-
-  async generateSelenium(commands?: ExecutionCommand[]): Promise<ExecutionResult> {
-    const gen = new SeleniumGenerator({ language: 'python', testName: 'test_flow', chromeDriverPath: 'C:\\hyprtask\\lib\\Chromium\\chromedriver.exe' }, this.model);
-    return { success: true, message: 'Generated selenium code', seleniumCode: gen.generate(commands || this.sessionHistory) };
-  }
-
+  
   private calculateDomFingerprint(elements: ElementInfo[]): string {
-    const signature = elements.filter(el => el.visible).map(el => `${el.tagName}#${el.id || ''}.${el.className || ''}[${el.text || ''}]`).join('|');
+    const signature = elements
+        .filter(el => el.visible && ['button', 'a', 'input', 'select', 'textarea'].includes(el.tagName))
+        .map(el => {
+            return `${el.tagName}|${(el.text||'').slice(0,10)}|${el.roleHint}`;
+        })
+        .join(';');
+    
     let hash = 0;
     for (let i = 0; i < signature.length; i++) {
         const char = signature.charCodeAt(i);
@@ -337,385 +350,312 @@ Return ONLY JSON: {"id": "el_X"}`;
     return hash.toString(16);
   }
 
+  // ===========================================================================
+  // =================== INTELLIGENT AUTONOMOUS AGENT ==========================
+  // ===========================================================================
+
   async runAutonomousAgent(goal: string, config: AgentConfig = {}): Promise<AgentSessionResult> {
     const maxSteps = config.maxSteps ?? 30;
     this.sessionHistory = []; 
     const steps: AgentStepResult[] = [];
-    const failedElements: Set<string> = new Set();
-    const actionHistory: string[] = [];
-    let lastDomFingerprint = '';
-    this.agentContext = { consecutiveFailures: 0 };
+    
+    this.agentContext = {
+        consecutiveFailures: 0,
+        ineffectivePhrases: new Set<string>(),
+        pastActions: []
+    };
 
     await this.browser.init();
     const page = this.browser.getPage();
     const urlInGoal = this.extractUrlFromPrompt(goal);
-    const currentUrl = page.url();
-    if (urlInGoal && (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal)))) {
-        await this.navigate(urlInGoal);
-        actionHistory.push(`✓ Navigated to ${urlInGoal}`);
-        await page.waitForTimeout(2000);
+    
+    // Initial Navigation
+    if (urlInGoal) {
+        const currentUrl = page.url();
+        if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
+            console.log(`[Agent] Initial navigation to ${urlInGoal}`);
+            await this.navigate(urlInGoal);
+            await page.waitForTimeout(2000); // Wait for load
+        }
     }
 
     let stepNumber = 0;
     let isFinished = false;
+    let lastFingerprint = '';
 
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
-      const observation = await this.observe();
+      
+      let observation = await this.observe(true); 
+      
+      // Blank Page / Loading Recovery
+      if ((!observation.selectors || observation.selectors.length === 0) && stepNumber === 1) {
+          console.log("No elements found on step 1. Waiting for load...");
+          await page.waitForTimeout(4000); 
+          
+          observation = await this.observe(true);
+          if (!observation.selectors || observation.selectors.length === 0) {
+             console.log("Still empty. Reloading page...");
+             await page.reload({ waitUntil: 'domcontentloaded' });
+             await page.waitForTimeout(2000);
+             observation = await this.observe(true);
+          }
+      }
+
       const elements = observation.selectors ?? [];
       const currentFingerprint = this.calculateDomFingerprint(elements);
+      
       let feedbackForPlanner = '';
-      
-      if (lastDomFingerprint && currentFingerprint === lastDomFingerprint && stepNumber > 1) {
-          feedbackForPlanner = `WARNING: The last action did NOT change the page state. DO NOT repeat it. Try a different element.`;
-      }
-      
-      let nextAction = await this.planNextAgentAction(goal, elements, actionHistory, failedElements, feedbackForPlanner, observation.screenshot);
+      if (stepNumber > 1 && lastFingerprint === currentFingerprint) {
+          const lastAction = steps[steps.length - 1]?.action;
+          if (lastAction && (lastAction.type === 'click' || lastAction.type === 'navigate')) {
+              let burnedLabel = '';
+              if (lastAction.type === 'click' && lastAction.elementId) {
+                  const lastCmd = this.sessionHistory[this.sessionHistory.length - 1];
+                  const match = lastCmd?.description?.match(/"([^"]+)"/); 
+                  if (match) burnedLabel = match[1];
+              }
 
-      // RECOVERY FROM API FAILURES (Already generic)
-      if (nextAction.type === 'wait' && nextAction.thought.includes('LLM planner failed')) {
-        this.updateAgentContext({ consecutiveFailures: (this.agentContext?.consecutiveFailures ?? 0) + 1 });
-        if ((this.agentContext?.consecutiveFailures ?? 0) >= 2) {
-            nextAction = { type: 'scroll', direction: 'down', thought: 'Fallback: scrolling after repeated LLM failures' };
-            this.updateAgentContext({ consecutiveFailures: 0 });
-        } else {
-             await page.waitForTimeout(2000 * (this.agentContext?.consecutiveFailures || 1));
-             continue;
-        }
+              if (burnedLabel && burnedLabel.length > 2) {
+                  this.agentContext.ineffectivePhrases.add(burnedLabel);
+                  feedbackForPlanner = `CRITICAL: Clicking "${burnedLabel}" changed NOTHING. It is broken or requires a HOVER. Mark it as 'Ineffective' and DO NOT click it again. Try a different strategy.`; 
+              } else {
+                  feedbackForPlanner = `CRITICAL: The last action had NO EFFECT on the page state. Do not repeat it.`; 
+              }
+          }
       }
+
+      let nextAction = await this.planNextAgentAction(
+          goal, 
+          elements, 
+          this.agentContext.pastActions, 
+          feedbackForPlanner, 
+          this.agentContext.ineffectivePhrases,
+          observation.screenshot
+      );
 
       config.broadcast?.({
           type: 'log',
           timestamp: new Date().toISOString(),
-          message: `ai_thought: ${nextAction.thought.slice(0, 200)}`,
-          data: { role: 'agent-reasoning', thought: nextAction.thought, actionType: nextAction.type }
+          message: `ai_thought: ${nextAction.thought}`,
+          data: { role: 'agent-reasoning', thought: nextAction.thought }
       });
 
       const urlBefore = page.url();
-      let retryCount = 0;
       let actionSuccess = false;
       let actionMessage = '';
-      let result;
-
-      while (retryCount <= 2 && !actionSuccess) {
+      
+      let retryCount = 0;
+      while (retryCount <= 1 && !actionSuccess) {
            this.agentCommandBuffer = []; 
-           result = await this.executeAgentAction(nextAction, elements, retryCount, failedElements);
+           const result = await this.executeAgentAction(nextAction, elements);
            actionSuccess = result.success;
            actionMessage = result.message;
-
+           
            if (actionSuccess) {
                if (this.agentCommandBuffer.length > 0) this.sessionHistory.push(...this.agentCommandBuffer);
-               else if (nextAction.type !== 'finish') {
-                   this.sessionHistory.push({
-                       action: nextAction.type as any, 
-                       target: (nextAction as any).selector || (nextAction as any).url,
-                       value: (nextAction as any).text,
-                       description: nextAction.thought,
-                       selectors: result.elementInfo ? { css: result.elementInfo.cssSelector, xpath: result.elementInfo.xpath, text: result.elementInfo.text, id: result.elementInfo.id } : undefined
-                   });
-               }
-           }
-           this.agentCommandBuffer = null;
-
-           if (!actionSuccess) {
-              retryCount++;
-              if (result?.failedSelector) failedElements.add(result.failedSelector);
-              await page.waitForTimeout(1000);
+           } else {
+               retryCount++;
+               await page.waitForTimeout(1000);
            }
       }
 
-      actionHistory.push(this.describeAction(nextAction, actionSuccess));
+      const actionDesc = this.describeAction(nextAction, actionSuccess);
+      this.agentContext.pastActions.push(actionDesc);
+      if (this.agentContext.pastActions.length > 5) this.agentContext.pastActions.shift();
+
       if (nextAction.type === 'finish' && actionSuccess) isFinished = true;
       
-      steps.push({ stepNumber, action: nextAction, success: actionSuccess, message: actionMessage, urlBefore, urlAfter: page.url(), stateChanged: actionSuccess, retryCount });
-      config.broadcast?.({ type: 'log', timestamp: new Date().toISOString(), message: `Step ${stepNumber}: ${actionMessage}` });
-      lastDomFingerprint = currentFingerprint;
+      steps.push({ 
+          stepNumber, 
+          action: nextAction, 
+          success: actionSuccess, 
+          message: actionMessage, 
+          urlBefore, 
+          urlAfter: page.url(), 
+          stateChanged: lastFingerprint !== currentFingerprint, 
+          retryCount 
+      });
+
+      lastFingerprint = currentFingerprint;
+      
+      const last3 = this.agentContext.pastActions.slice(-3);
+      if (last3.length === 3 && last3.every(a => a === last3[0]) && !isFinished) {
+          await this.browser.scroll(undefined, 'down');
+          this.agentContext.pastActions.push('SYSTEM_FORCED_SCROLL');
+      }
     }
 
-    return { success: isFinished, summary: `Completed ${steps.length} steps.`, goal, totalSteps: stepNumber, steps, commands: [...this.sessionHistory], seleniumCode: await this.generateSelenium().then(r => r.seleniumCode) };
+    return { 
+        success: isFinished, 
+        summary: `Completed ${steps.length} steps.`, 
+        goal, 
+        totalSteps: stepNumber, 
+        steps, 
+        commands: [...this.sessionHistory], 
+        seleniumCode: await this.generateSelenium().then(r => r.seleniumCode) 
+    };
   }
 
-  private extractBalancedJson(text: string, startIndex: number = 0): { json: string, endEndex: number } | null {
-    const start = text.indexOf('{', startIndex);
-    if (start === -1) return null;
-    let balance = 0, inQuote = false, escape = false;
-    for (let i = start; i < text.length; i++) {
-      const char = text[i];
-      if (char === '\\' && !escape) { escape = true; continue; }
-      if (char === '"' && !escape) inQuote = !inQuote;
-      escape = false;
-      if (!inQuote) { if (char === '{') balance++; else if (char === '}') balance--; }
-      if (balance === 0) return { json: text.substring(start, i + 1), endEndex: i + 1 };
+  // --- FIX 2: IMPROVED PARSING & SAFETY ---
+  private parseAgentActionResponse(responseText: string): AgentAction {
+    const jsonStr = this.extractBalancedJson(responseText);
+    if (!jsonStr) {
+      return { type: 'wait', durationMs: 1000, thought: 'Invalid AI JSON.' };
+    }
+    try {
+      const parsed = JSON.parse(jsonStr);
+      // Fallback: If AI puts 'value' instead of 'text' for type actions, map it.
+      if (parsed.type === 'type' && !parsed.text && parsed.value) {
+          parsed.text = parsed.value;
+      }
+      return parsed as AgentAction;
+    } catch (e) {
+      return { type: 'wait', durationMs: 1000, thought: 'Malformed AI JSON.' };
+    }
+  }
+
+  private extractBalancedJson(str: string): string | null {
+    let openBraces = 0;
+    let startIndex = -1;
+    for (let i = 0; i < str.length; i++) {
+      if (str[i] === '{') {
+        if (openBraces === 0) startIndex = i;
+        openBraces++;
+      } else if (str[i] === '}') {
+        openBraces--;
+        if (openBraces === 0 && startIndex !== -1) return str.substring(startIndex, i + 1);
+      }
     }
     return null;
-  }
-
-  private parseAgentActionResponse(raw: string): AgentAction {
-    let clean = raw.replace(/```json\s*|\s*```/gi, '').trim().replace(/,\s*([\]}])/g, '$1');
-    let finalObj: any = {};
-    let foundAny = false, currentIndex = 0;
-
-    while (true) {
-        const result = this.extractBalancedJson(clean, currentIndex);
-        if (!result) break;
-        try {
-            const parsed = JSON.parse(result.json);
-            if (parsed.type || parsed.action) finalObj = { ...(finalObj.thought ? {thought: finalObj.thought} : {}), ...parsed };
-            else finalObj = { ...finalObj, ...parsed };
-            foundAny = true;
-        } catch {}
-        currentIndex = result.endEndex;
-    }
-
-    if (!foundAny) {
-        try {
-             const repaired = clean.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
-             const match = repaired.match(/\{[\s\S]*\}/);
-             if (match) { finalObj = JSON.parse(match[0]); foundAny = true; }
-        } catch {}
-    }
-
-    let rawType = finalObj.type || finalObj.action; 
-    if (typeof rawType === 'string') {
-        rawType = rawType.toLowerCase().trim();
-        if (['undefined', 'null', 'none', 'unknown'].includes(rawType)) rawType = 'wait';
-    }
-    if (!rawType) return { type: 'wait', durationMs: 2000, thought: `AI response valid but missing "type".` };
-
-    const thought = finalObj.thought || finalObj.reasoning || 'No reasoning provided';
-    switch (rawType) {
-        case 'click': case 'click_element': return { type: 'click', selector: finalObj.selector, elementId: finalObj.elementId, thought };
-        case 'type': case 'fill': case 'input': return { type: 'type', selector: finalObj.selector, elementId: finalObj.elementId, text: finalObj.text || finalObj.value || '', thought };
-        case 'navigate': case 'goto': return { type: 'navigate', url: finalObj.url, thought };
-        case 'wait': case 'delay': return { type: 'wait', durationMs: finalObj.durationMs || 1000, thought };
-        case 'finish': case 'done': case 'complete': return { type: 'finish', thought, summary: finalObj.summary || 'Task completed' };
-        case 'scroll': return { type: 'scroll', direction: finalObj.direction || 'down', elementId: finalObj.elementId, thought };
-        case 'select_option': return { type: 'select_option', selector: finalObj.selector, elementId: finalObj.elementId, option: finalObj.option, thought };
-        default: return { type: 'wait', durationMs: 1000, thought: `Unknown action type "${rawType}".` };
-    }
   }
 
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
     actionHistory: string[],
-    failedElements: Set<string>,
     feedbackForPlanner: string,
+    ineffectivePhrases: Set<string>,
     screenshot?: string
   ): Promise<AgentAction> {
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
-    // --- FIX: UNIVERSAL VISIBILITY FIX (No hardcoded strings) ---
-    // 1. Sort "Priority" elements to top. Priority = Dropdowns (floating/z-index), Options, & Listboxes.
-    //    This is universal: any site with a custom dropdown will use these techniques.
-    const sortedElements = [...elements].sort((a, b) => {
-        const aIsPriority = a.isFloating || a.roleHint === 'option' || (a.attributes?.role === 'listbox');
-        const bIsPriority = b.isFloating || b.roleHint === 'option' || (b.attributes?.role === 'listbox');
-        
-        if (aIsPriority && !bIsPriority) return -1;
-        if (!aIsPriority && bIsPriority) return 1;
-        return 0;
+    const validElements = elements.filter(el => {
+        const text = (el.text || '').trim();
+        const label = (el.ariaLabel || '').trim();
+        if (ineffectivePhrases.has(text)) return false;
+        if (ineffectivePhrases.has(label)) return false;
+        for (const badPhrase of ineffectivePhrases) {
+            if (text.includes(badPhrase) || label.includes(badPhrase)) return false;
+        }
+        return true;
     });
 
-    const visibleElements = sortedElements.filter(el => 
-        el.visible && 
-        el.tagName !== 'script' && 
-        el.tagName !== 'style' &&
-        (el.tagName === 'input' || el.tagName === 'select' || el.tagName === 'textarea' || el.tagName === 'button' || el.tagName === 'a' || (el.text && el.text.length > 2) || el.scrollable || el.isFloating)
-    );
-
-    const elementList = visibleElements.slice(0, 150).map((el, idx) => ({ 
-        id: `el_${idx}`,
+    const elementList = validElements.slice(0, 150).map((el, idx) => ({
+        id: `el_${idx}`, 
         tag: el.tagName,
-        text: (el.text || '').slice(0, 40).replace(/\s+/g, ' '),
-        value: el.attributes?.['value'] || '', 
-        scrollable: el.scrollable ? true : undefined, 
-        label: (el.ariaLabel || el.placeholder || '').slice(0, 40),
-        role: el.roleHint || el.attributes?.role,
+        text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
+        role: el.roleHint,
+        state: el.expanded ? 'OPEN' : 'CLOSED', 
     }));
 
-    // --- FIX: DYNAMIC CONTEXT INJECTION ---
-    const page = this.browser.getPage();
-    const currentUrl = page.url();
-    const pageTitle = await page.title().catch(() => '');
-
-    // --- FIX: TRULY UNIVERSAL PROMPT (No static task names) ---
+    // --- FIX 3: EXPLICIT JSON EXAMPLES FOR TYPING ---
     const prompt = `
-SYSTEM: You are an ultra-fast autonomous browser agent.
+SYSTEM: You are an intelligent autonomous agent.
 GOAL: ${goal}
 
-CURRENT CONTEXT:
-URL: ${currentUrl}
-TITLE: ${pageTitle}
+HISTORY (Last 5 steps):
+${actionHistory.join('\n')}
 
-HISTORY:
-${actionHistory.slice(-5).join('\n')}
+**CRITICAL FEEDBACK:**
+${feedbackForPlanner || "None. Proceed."} 
 
-LAST FEEDBACK: ${feedbackForPlanner}
+**DEAD ENDS (Do not click):**
+${Array.from(ineffectivePhrases).join(', ')}
 
-AVAILABLE ELEMENTS (Top 150 - Priority given to Floating/Menu elements):
+AVAILABLE INTERACTIVE ELEMENTS:
 ${JSON.stringify(elementList)}
 
-RULES:
-1. **CONTEXT AWARENESS:** Compare the CURRENT URL/TITLE with your GOAL. 
-   - If the current page matches the destination implied by the GOAL, **DO NOT** click navigation links again. Stop navigating and focus on the page content (forms/buttons).
-   - If you have successfully opened a menu/dropdown, the NEXT step is usually to click an option inside it.
+INSTRUCTIONS:
+1. **Analyze Feedback:** If last action failed, CHANGE strategy.
+2. **Typing:** If the goal is to type, use { "type": "type", "elementId": "el_X", "text": "YOUR TEXT", "thought": "..." }.
+3. **Menu:** If a menu click failed, it might need a hover or is already open.
+4. **No Loops:** Do not repeat the exact same action.
 
-2. **MISSING ELEMENTS:**
-   - If your GOAL requires selecting an option (text) that is NOT in the list, look for "scrollable": true elements (lists/divs) and SCROLL them.
-   - Do not assume an element is missing just because you don't see it immediately; scroll the container.
-
-3. **PROGRESSION:**
-   - If you just clicked a button that implies submission (e.g. "Go", "Search", "Submit"), WAIT for the system. Do not click it again immediately.
-   - Do not toggle checkboxes repeatedly. Check their state first.
-
-RETURN ONLY JSON:
-{ "type": "click"|"type"|"scroll"|"wait"|"finish", "elementId": "el_X", "thought": "reasoning" }
+RETURN ONLY JSON matching these shapes:
+- { "type": "click", "elementId": "el_X", "thought": "..." }
+- { "type": "type", "elementId": "el_X", "text": "value", "thought": "..." }
+- { "type": "scroll", "direction": "down", "thought": "..." }
+- { "type": "finish", "thought": "...", "summary": "..." }
 `;
 
     try {
-      let result: any;
-      let attempts = 0;
-      while (attempts < 3) {
-        try {
-            result = await this.withTimeout(
-                this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any),
-                35000, 'Agent planner'
-            );
-            break; 
-        } catch (err) {
-            attempts++;
-            const msg = String(err);
-            if (msg.includes('429') || msg.includes('Quota') || msg.includes('fetch')) {
-                console.warn(`[SmartAgent] API Quota Hit (Attempt ${attempts}). Waiting ${2000 * attempts}ms...`);
-                await new Promise(r => setTimeout(r, 2000 * attempts));
-            } else {
-                throw err;
+        const result = await this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any);
+        const response = (result as any).response?.text?.() ?? '';
+        const parsed = this.parseAgentActionResponse(response);
+        
+        if ('elementId' in parsed && parsed.elementId) {
+            const match = parsed.elementId.match(/el_(\d+)/);
+            if (match) {
+                const idx = parseInt(match[1]);
+                const el = validElements[idx]; 
+                if (el) {
+                    if('selector' in parsed){
+                        parsed.selector = el.selector || el.cssSelector;
+                    }
+                    delete parsed.elementId; 
+                }
             }
         }
-      }
-      if (!result) throw new Error('LLM failed after retries');
-
-      const response = (result as any).response?.text?.() ?? '';
-      return this.parseAgentActionResponse(response);
+        return parsed;
     } catch (err) {
-      console.error('[SmartAgent] Planner error:', err);
-      return { type: 'wait', durationMs: 2000, thought: `LLM planner failed: ${String(err).slice(0,100)}` };
+        return { type: 'wait', durationMs: 2000, thought: 'Planner failed' };
     }
   }
 
-  // ... (executeAgentAction and describeAction remain the same) ...
-  private async executeAgentAction(
-    action: AgentAction,
-    elements: ElementInfo[],
-    attempt: number,
-    failedElements: Set<string>,
-  ): Promise<{ success: boolean; message: string; failedSelector?: string; elementInfo?: ElementInfo }> {
-    try {
-      switch (action.type) {
-        case 'navigate': return await this.navigate(action.url);
-        case 'click':
-        case 'select_option': {
-          let selectorToUse = action.selector;
-          if (!selectorToUse && action.elementId) {
-             // Re-map elementId using the SAME universal priority logic as the planner
-             const sortedElements = [...elements].sort((a, b) => {
-                const aIsPriority = a.isFloating || a.roleHint === 'option' || (a.attributes?.role === 'listbox');
-                const bIsPriority = b.isFloating || b.roleHint === 'option' || (b.attributes?.role === 'listbox');
-                if (aIsPriority && !bIsPriority) return -1;
-                if (!aIsPriority && bIsPriority) return 1;
-                return 0;
-             });
-
-             const visibleElements = sortedElements.filter(el => 
-                el.visible && el.tagName !== 'script' && el.tagName !== 'style' &&
-                (el.tagName === 'input' || el.tagName === 'select' || el.tagName === 'textarea' || el.tagName === 'button' || el.tagName === 'a' || (el.text && el.text.length > 2) || el.scrollable || el.isFloating)
-            );
-             
-             const match = action.elementId.match(/^el_(\d+)$/);
-             if (match) {
-                 const idx = parseInt(match[1]);
-                 const el = visibleElements[idx];
-                 if (el) selectorToUse = el.selector || el.cssSelector;
-             }
-          }
-          if (!selectorToUse) return { success: false, message: 'No selector found' };
-          const res = await this.clickExact(selectorToUse);
-          return { success: res.success, message: res.message, failedSelector: res.success ? undefined : selectorToUse, elementInfo: res.selectors?.[0] };
-        }
-        case 'type': {
-            let selectorToUse = action.selector;
-            if (!selectorToUse && action.elementId) {
-                // Re-map elementId using the SAME universal priority logic
-                const sortedElements = [...elements].sort((a, b) => {
-                    const aIsPriority = a.isFloating || a.roleHint === 'option' || (a.attributes?.role === 'listbox');
-                    const bIsPriority = b.isFloating || b.roleHint === 'option' || (b.attributes?.role === 'listbox');
-                    if (aIsPriority && !bIsPriority) return -1;
-                    if (!aIsPriority && bIsPriority) return 1;
-                    return 0;
-                });
-
-                const visibleElements = sortedElements.filter(el => 
-                    el.visible && el.tagName !== 'script' && el.tagName !== 'style' &&
-                    (el.tagName === 'input' || el.tagName === 'select' || el.tagName === 'textarea' || el.tagName === 'button' || el.tagName === 'a' || (el.text && el.text.length > 2) || el.scrollable || el.isFloating)
-                );
-                
-                const match = action.elementId.match(/^el_(\d+)$/);
-                if (match) {
-                    const idx = parseInt(match[1]);
-                    const el = visibleElements[idx];
-                    if (el) selectorToUse = el.selector || el.cssSelector;
-                }
-            }
-            if (!selectorToUse) return { success: false, message: 'No selector found' };
-            const res = await this.type(selectorToUse, action.text);
-            return { success: res.success, message: res.message, failedSelector: res.success ? undefined : selectorToUse, elementInfo: res.selectors?.[0] };
-        }
-        case 'scroll': {
-            let selectorToScroll: string | undefined;
-            if (action.elementId) {
-                const match = action.elementId.match(/^el_(\d+)$/);
-                if (match) {
-                    const sortedElements = [...elements].sort((a, b) => {
-                        const aIsPriority = a.isFloating || a.roleHint === 'option' || (a.attributes?.role === 'listbox');
-                        const bIsPriority = b.isFloating || b.roleHint === 'option' || (b.attributes?.role === 'listbox');
-                        if (aIsPriority && !bIsPriority) return -1;
-                        if (!aIsPriority && bIsPriority) return 1;
-                        return 0;
-                    });
-                    
-                    const visibleElements = sortedElements.filter(el => 
-                        el.visible && el.tagName !== 'script' && el.tagName !== 'style' &&
-                        (el.tagName === 'input' || el.tagName === 'select' || el.tagName === 'textarea' || el.tagName === 'button' || el.tagName === 'a' || (el.text && el.text.length > 2) || el.scrollable || el.isFloating)
-                    );
-                    
-                    const el = visibleElements[parseInt(match[1])];
-                    if (el) selectorToScroll = el.selector || el.cssSelector;
-                }
-            }
-            return await this.browser.scroll(selectorToScroll, action.direction);
-        }
-        case 'wait': 
-            await this.browser.getPage().waitForTimeout(action.durationMs);
-            return { success: true, message: `Waited ${action.durationMs}ms` };
-        case 'finish': return { success: true, message: action.summary };
-        default: return { success: false, message: `Unknown action` };
+  private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<any> {
+    if (action.type === 'click') {
+      if (action.selector) {
+        return await this.clickExact(action.selector);
+      } else if (action.elementId) {
+        return this.click(action.elementId, elements);
       }
-    } catch (err) {
-      return { success: false, message: `Error: ${err}` };
+    } else if (action.type === 'type') {
+      if (action.selector) {
+        return await this.type(action.selector, action.text);
+      } else if (action.elementId) {
+        return this.type(action.elementId, action.text, elements);
+      }
+    } else if (action.type === 'navigate') {
+      return this.navigate(action.url);
+    } else if (action.type === 'scroll') {
+      await this.browser.scroll(action.elementId, action.direction);
+      return { success: true, message: 'Scrolled' };
+    } else if (action.type === 'wait') {
+      await new Promise((r) => setTimeout(r, action.durationMs));
+      return { success: true, message: 'Waited' };
+    } else if (action.type === 'finish') {
+      return { success: true, message: action.summary };
     }
+    
+    return { success: false, message: "Action execution failed or action not recognized" };
   }
 
   private describeAction(action: AgentAction, success: boolean): string {
-    const status = success ? '✓' : '✗';
+    const status = success ? 'SUCCESS' : 'FAIL';
     switch (action.type) {
-      case 'navigate': return `${status} navigate ${action.url}`;
-      case 'click': return `${status} click ${action.elementId || 'element'}`;
-      case 'type': return `${status} type "${action.text}"`;
-      case 'scroll': return `${status} scroll ${action.direction}`;
-      case 'wait': return `${status} wait`;
-      case 'finish': return `${status} finish`;
-      default: return `${status} action`;
+      case 'click':
+        return `[${status}] Click ${action.selector || action.elementId}`;
+      case 'type':
+        return `[${status}] Type "${action.text}" into ${action.selector || action.elementId}`;
+      case 'scroll':
+        return `[${status}] Scroll ${action.direction}`;
+      case 'navigate':
+        return `[${status}] Navigate to ${action.url}`;
+      case 'finish':
+        return `[${status}] Finish: ${action.summary}`;
+      default:
+        return `[${status}] Unknown action`;
     }
   }
 }

@@ -221,13 +221,13 @@ export function createServer(port: number, chromePath?: string) {
    // Deterministic helper: for clear cookie-banner intents (accept/allow/close
    // cookies), try the dedicated cookie handler before invoking the LLM. This
    // avoids unnecessary hallucinations when the task is simple.
-   async function maybeHandleCookieFromPrompt(prompt: string): Promise<ExecutionResult | null> {
+   async function maybeHandleCookieFromPrompt(prompt: string, elements: ElementInfo[]): Promise<ExecutionResult | null> {
      const lower = prompt.toLowerCase();
  
      if (!/cookie/.test(lower)) return null;
      if (!/(accept|allow|agree|ok|close|dismiss|reject|deny)/.test(lower)) return null;
  
-     const result = await tools.handleCookieBanner();
+     const result = await tools.handleCookieBanner(elements);
      // tools.handleCookieBanner always returns success=true; only treat it as
      // a real action if a banner was actually dismissed.
      if (result.message.toLowerCase().startsWith('cookie banner dismissed')) {
@@ -260,17 +260,17 @@ export function createServer(port: number, chromePath?: string) {
       };
     }
 
+    // 1) LOOK: capture current page state and candidate elements.
+    await browser.init();
+    const observation = await tools.observe(true);
+    const elements = observation.selectors ?? [];
+
     // For obvious cookie-banner prompts, prefer the deterministic handler
     // first so the LLM does not need to plan anything.
-    const cookieResult = await maybeHandleCookieFromPrompt(prompt);
+    const cookieResult = await maybeHandleCookieFromPrompt(prompt, elements);
     if (cookieResult) {
       return cookieResult;
     }
-
-    // 1) LOOK: capture current page state and candidate elements.
-    await browser.init();
-    const observation = await tools.observe(selector);
-    const elements = observation.selectors ?? [];
 
     type AiElement = {
       /** Stable identifier used by the LLM to reference this element. */
@@ -278,8 +278,8 @@ export function createServer(port: number, chromePath?: string) {
       /** Raw DOM id attribute, if present. */
       domId: string;
       tagName: string;
-      role: string;
-      region: string;
+      role: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other';
+      region: 'header' | 'main' | 'footer' | 'sidebar';
       text: string;
       ariaLabel: string;
       placeholder: string;
@@ -297,6 +297,7 @@ export function createServer(port: number, chromePath?: string) {
       height?: number;
       /** Human-readable location summary for the LLM (e.g. "x:120,y:340"). */
       location: string;
+      attributes: Record<string, string | undefined>;
     };
 
     const baseCandidates: AiElement[] = elements
@@ -333,7 +334,8 @@ export function createServer(port: number, chromePath?: string) {
             ? `x:${Math.round(x as number)},y:${Math.round(y as number)},w:${Math.round(
                 width as number
               )},h:${Math.round(height as number)}`
-            : 'unknown'
+            : 'unknown',
+            attributes: el.attributes,
         } satisfies AiElement;
       })
       .filter((e) => !!e.selector);
@@ -517,7 +519,7 @@ export function createServer(port: number, chromePath?: string) {
         // resolve the appropriate trigger and option using its own heuristics
         // and LLM-assisted matching.
         if (dropdownIntentFromPrompt) {
-          return tools.click(prompt);
+          return tools.clickWithHeuristics(prompt, limitedElements);
         }
 
         const byId = parsed.elementId
@@ -577,12 +579,12 @@ export function createServer(port: number, chromePath?: string) {
             byId.context ||
             byId.selector;
 
-          return tools.clickExact(byId.selector, historyLabel);
+          return tools.clickExact(byId.selector);
         }
 
         // Fallback: semantic target for fuzzy matching inside McpTools.
         if (parsed.semanticTarget) {
-          return tools.click(parsed.semanticTarget);
+          return tools.clickWithHeuristics(parsed.semanticTarget, limitedElements);
         }
 
         return {
@@ -621,8 +623,8 @@ export function createServer(port: number, chromePath?: string) {
         // Just return the observation; AI chose to do nothing.
         return {
           ...observation,
-          message:
-            observation.message || (parsed.action === 'noop'
+          success: true,
+          message: (parsed.action === 'noop'
               ? 'Observed page only (AI chose no safe action)'
               : 'Observed page only (AI action was unrecognized)')
         };
@@ -652,7 +654,7 @@ export function createServer(port: number, chromePath?: string) {
         case 'click':
           if (!selector) throw new Error('selector required');
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: `click ${selector}` });
-          result = await tools.click(selector);
+          result = await tools.clickExact(selector);
           break;
         case 'type':
           if (!selector || text == null) throw new Error('selector and text required');
@@ -661,15 +663,15 @@ export function createServer(port: number, chromePath?: string) {
           break;
         case 'handle_cookie_banner':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'handle_cookie_banner' });
-          result = await tools.handleCookieBanner();
+          result = await tools.handleCookieBanner((await tools.observe()).selectors);
           break;
         case 'extract_selectors':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'extract_selectors' });
-          result = await tools.extractSelectors(selector);
+          result = { success: true, message: 'Selectors extracted', ...(await tools.observe()) };
           break;
         case 'observe':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'observe' });
-          result = await tools.observe(selector);
+          result = { success: true, message: 'Page observed', ...(await tools.observe(true)) };
           break;
         case 'ai': {
           if (!prompt) throw new Error('prompt required');
@@ -788,7 +790,7 @@ export function createServer(port: number, chromePath?: string) {
         case 'generate_selenium':
           // We allow commands to be optional now, defaulting to session history
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'generate_selenium' });
-          result = await tools.generateSelenium(commands);
+          result = { ...(await tools.generateSelenium(commands)), message: 'Selenium code generated' };
           break;
         default:
           result = { success: false, message: `Unknown action: ${action}` };
