@@ -65,6 +65,7 @@ export class McpTools {
       this.recordCommand({
         action: 'navigate', target: url, description: `Mapsd to ${url}`,
       });
+      // Navigation resets the "burnt" cache because we are on a new page
       this.agentContext.burntPhrases.clear(); 
       return { success: true, message: `Mapsd to ${url}` };
     } catch (error: any) {
@@ -114,7 +115,6 @@ export class McpTools {
        const best = candidates[0];
        const selector = best.selector || best.cssSelector || best.xpath;
        if (selector) {
-           // Pass the element text as description to help the selenium generator
            const info = await this.browser.click(selector);
            this.recordCommand({
                action: 'click',
@@ -150,7 +150,6 @@ export class McpTools {
     const title = await page.title().catch(() => '');
     const extractor = new SelectorExtractor(page);
     
-    // IMPORTANT: Scans ALL frames now
     const selectors = await extractor.extractAllInteractive();
 
     if (useVision) {
@@ -195,91 +194,66 @@ export class McpTools {
   }
 
   // ===========================================================================
-  // =================== BLOCKER & PLANNER LOGIC ===============================
+  // =================== INTELLIGENT PLANNER LOGIC =============================
   // ===========================================================================
 
   /**
-   * Universal Blocker Detection.
-   * Checks for login fields or cookie banners that MUST be handled before anything else.
+   * Deterministic Planner V2:
+   * - No hardcoded blacklist.
+   * - Ignores complex inputs (User/Pass/Search) so AI handles them.
+   * - Uses "Burnt Phrase" logic to prevent loops naturally.
+   * - Supports Partial Matching for Dropdowns/Comboboxes to find "Insurance Filter" from "Insurance".
    */
-  private checkForBlockers(elements: ElementInfo[], goal: string): AgentAction | null {
-      // 1. Password Field Trap
-      const passwordField = elements.find(el => el.attributes?.['type'] === 'password');
-      if (passwordField) {
-          // If we see a password field, and we haven't just typed in it...
-          if (!this.agentContext.burntPhrases.has('login_password')) {
-              console.log("[Blocker] Login Screen Detected.");
-              // Does the goal contain credentials?
-              // Simple heuristic: look for "password" in goal or just assume generic fill
-              return {
-                  type: 'finish', // Stop and ask user, OR:
-                  // type: 'type', selector: passwordField.cssSelector, text: '...', 
-                  thought: 'Login Page Detected. I need credentials to proceed. Stopping to ask user.',
-                  summary: 'Login Required. Please provide username and password in the prompt.'
-              };
-          }
-      }
-
-      // 2. Cookie / Modal Trap (High Z-Index "Accept" buttons)
-      const acceptCookies = elements.find(el => 
-          (el.text?.toLowerCase().includes('accept') || el.text?.toLowerCase().includes('agree')) && 
-          (el.text?.toLowerCase().includes('cookie') || el.isFloating)
-      );
-
-      if (acceptCookies && !this.agentContext.burntPhrases.has('cookies_accepted')) {
-          return {
-              type: 'click',
-              selector: acceptCookies.cssSelector || acceptCookies.selector,
-              semanticTarget: 'Accept Cookies',
-              thought: 'Blocking Modal detected (Cookies). Clearing it first.'
-          };
-      }
-      
-      return null;
-  }
-
-  private tryDeterministicPlan(goal: string, elements: ElementInfo[], currentTitle: string, currentUrl: string): AgentAction | null {
+  private tryDeterministicPlan(goal: string, elements: ElementInfo[]): AgentAction | null {
       const lowerGoal = goal.toLowerCase();
-      const onTargetPage = currentTitle.toLowerCase().includes("patient master list");
-      const ignoredWords = ['navigate', 'click', 'to', 'the', 'open', 'filter', 'scroll', 'find', 'options', 'wait', 'check', 'select'];
+      
+      // 1. Delegate Complex Inputs to AI
+      if (lowerGoal.includes('username') || lowerGoal.includes('password') || lowerGoal.includes('login to') || lowerGoal.includes('search for')) {
+          return null; 
+      }
+
+      // 2. Tokenize (Generic Logic)
+      const ignoredWords = ['navigate', 'click', 'to', 'the', 'open', 'filter', 'scroll', 'find', 'options', 'wait', 'check', 'select', 'and', 'only', 'from', 'if', 'they', 'are', 'not', 'then', 'menu', 'button'];
       
       let cleanGoal = lowerGoal;
-      const goalKeywords = cleanGoal.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !ignoredWords.includes(w));
+      const goalKeywords = cleanGoal.split(/[^a-z0-9]+/).filter(w => w.length > 3 && !ignoredWords.includes(w));
 
       for (const keyword of goalKeywords) {
+          // 3. Loop Prevention: If we already clicked "Patient Master List", ignore it.
           if (this.agentContext.burntPhrases.has(keyword)) continue;
 
-          // Prevent loop on navigation parents
-          if (onTargetPage && (keyword === "reports" || keyword === "patients")) {
-              this.agentContext.burntPhrases.add(keyword);
-              continue;
-          }
-
           const matches = elements.filter(el => {
-              // Only consider VISIBLE elements
               if (!el.visible && !el.isVisible) return false;
               
+              const tag = el.tagName.toLowerCase();
+              const role = (el.roleHint || '').toLowerCase();
+              const isInteractive = tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select' || role === 'button' || role === 'link' || role === 'checkbox' || role === 'listbox' || role === 'combobox';
+
+              if (!isInteractive) return false;
+
               const text = (el.text || '').toLowerCase();
               const label = (el.ariaLabel || '').toLowerCase();
-              return text === keyword || label === keyword || text.includes(keyword);
+              
+              // 4. Intelligent Matching
+              // Exact Match: Preferred for everything.
+              if (text === keyword || label === keyword) return true;
+
+              // Partial Match: ALLOWED only for Dropdowns/Inputs (e.g. "Insurance" matches "Insurance Filter")
+              // This fixes the issue where "Insurance" was not found.
+              if ((role === 'listbox' || role === 'combobox' || tag === 'select' || role === 'input') && (text.includes(keyword) || label.includes(keyword))) {
+                  return true;
+              }
+
+              return false;
           });
 
-          // Sort: Exact Match > Interactive > visible
-          matches.sort((a, b) => {
-              const aTxt = (a.text || '').toLowerCase().trim();
-              const bTxt = (b.text || '').toLowerCase().trim();
-              if (aTxt === keyword && bTxt !== keyword) return -1;
-              if (bTxt === keyword && aTxt !== keyword) return 1;
-              return 0;
-          });
-
-          const bestMatch = matches[0];
-          if (bestMatch) {
+          if (matches.length === 1) { 
+             const bestMatch = matches[0];
              return {
                  type: 'click',
                  selector: bestMatch.selector || bestMatch.cssSelector,
                  semanticTarget: keyword,
-                 thought: `Deterministic: Found keyword "${keyword}" in goal. Executing.`
+                 thought: `Deterministic: Found unique interactive element "${keyword}". Executing.`
              };
           }
       }
@@ -298,6 +272,7 @@ export class McpTools {
     const urlInGoal = this.extractUrlFromPrompt(goal);
     let stepNumber = 0;
 
+    // 1. Intelligent Start
     if (urlInGoal) {
         const currentUrl = page.url();
         if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
@@ -316,41 +291,32 @@ export class McpTools {
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
       
-      // 1. Observe (Lite)
       const observationLite = await this.observe(false); 
       const elements = observationLite.selectors ?? [];
       
-      // 2. CHECK BLOCKERS (Login, Cookies)
-      let nextAction = this.checkForBlockers(elements, goal);
+      // 2. Deterministic Check
+      let nextAction = this.tryDeterministicPlan(goal, elements);
 
-      // 3. Deterministic Plan
-      if (!nextAction) {
-          nextAction = this.tryDeterministicPlan(goal, elements, observationLite.title || '', observationLite.url);
-      }
-
-      // 4. AI Plan (With 429 Retry)
+      // 3. AI Planning (The Brain)
       let screenshotForStep: string | undefined = undefined;
+      
       if (!nextAction) {
           const screenshotObj = await this.browser.screenshot();
           screenshotForStep = screenshotObj.replace('data:image/png;base64,', '');
           
           try {
               nextAction = await this.planNextAgentAction(
-                  goal, elements, this.agentContext.pastActions, "", 
-                  this.agentContext.burntPhrases, observationLite.title || '', observationLite.url, screenshotForStep
+                  goal, elements, this.agentContext.pastActions, 
+                  this.agentContext.burntPhrases, screenshotForStep
               );
           } catch (err: any) {
-              // RATE LIMIT HANDLER
               if (String(err).includes('429')) {
                    console.log("Rate Limit Hit. Waiting 20s...");
                    await new Promise(r => setTimeout(r, 20000));
-                   // Retry once
-                   nextAction = await this.planNextAgentAction(
-                      goal, elements, this.agentContext.pastActions, "", 
-                      this.agentContext.burntPhrases, observationLite.title || '', observationLite.url, screenshotForStep
-                   ).catch(() => ({ type: 'wait', durationMs: 5000, thought: 'Rate limit persist' } as AgentAction));
+                   nextAction = { type: 'wait', durationMs: 2000, thought: 'Rate limit recovery' };
               } else {
-                  nextAction = { type: 'wait', durationMs: 2000, thought: 'Error planning' };
+                  // Fallback: If AI fails, try scrolling to find more elements
+                  nextAction = { type: 'scroll', direction: 'down', thought: 'AI unavailable, scrolling to find more elements' };
               }
           }
       }
@@ -361,7 +327,7 @@ export class McpTools {
           data: { role: 'agent-reasoning', thought: nextAction.thought }
       });
 
-      // 5. Execute
+      // 4. Execution Loop
       let actionSuccess = false;
       let retryCount = 0;
       let executionMsg = "";
@@ -374,10 +340,16 @@ export class McpTools {
            
            if (actionSuccess) {
                if (this.agentCommandBuffer.length > 0) this.sessionHistory.push(...this.agentCommandBuffer);
-               const target = (nextAction as any).semanticTarget || (nextAction as any).text;
+               // CRITICAL: Burn the phrase so we don't repeat it
+               const target = (nextAction as any).semanticTarget || (nextAction as any).text || '';
                if (target) {
-                   this.agentContext.burntPhrases.add(target.toLowerCase().trim());
-                   if (nextAction.type === 'click' && target === 'Accept Cookies') this.agentContext.burntPhrases.add('cookies_accepted');
+                   const lowerTarget = target.toLowerCase().trim();
+                   this.agentContext.burntPhrases.add(lowerTarget);
+                   // Also burn the EXACT text of the element if available to be safe
+                   if (result.success && (nextAction as any).selector) {
+                        const el = elements.find(e => e.cssSelector === (nextAction as any).selector || e.selector === (nextAction as any).selector);
+                        if (el && el.text) this.agentContext.burntPhrases.add(el.text.toLowerCase().trim());
+                   }
                }
            } else {
                retryCount++;
@@ -404,7 +376,7 @@ export class McpTools {
     return { success: isFinished, summary: "Task Completed", goal, totalSteps: stepNumber, steps, commands: this.sessionHistory, seleniumCode: "" };
   }
 
-  // ... (parseAgentActionResponse, extractBalancedJson - Keep same as previous)
+  // ... (parseAgentActionResponse, extractBalancedJson - Keep same)
   private parseAgentActionResponse(responseText: string): AgentAction {
     let clean = responseText.replace(/```json\s*|\s*```/gi, '').trim();
     const jsonStr = this.extractBalancedJson(clean);
@@ -434,15 +406,12 @@ export class McpTools {
     return null;
   }
 
-  // ... (planNextAgentAction - Keep same, just ensure type safety)
+  // --- INTELLIGENT PROMPT ENGINEERING ---
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
     actionHistory: string[],
-    feedbackForPlanner: string,
     burntPhrases: Set<string>, 
-    currentTitle: string,
-    currentUrl: string,
     screenshot?: string
   ): Promise<AgentAction> {
     
@@ -451,37 +420,39 @@ export class McpTools {
     }
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
-    // Valid Elements Filtering 
-    // Filter out burned elements to save context and force progress
+    // Filter out "burnt" items so the AI doesn't see them as options
     const validElements = elements.filter(el => {
         const text = (el.text || '').toLowerCase().trim();
-        const label = (el.ariaLabel || '').toLowerCase().trim();
-        if (burntPhrases.has(text) || burntPhrases.has(label)) return false;
+        // Exception: Always show login-related fields even if burnt (retries)
+        if (text.includes('user') || text.includes('pass') || text.includes('log') || text.includes('sign')) return true;
+        if (burntPhrases.has(text)) return false;
         return true;
     });
 
-    const elementList = validElements.slice(0, 150).map((el, idx) => ({
+    const elementList = validElements.slice(0, 200).map((el, idx) => ({
         id: `el_${idx}`,  
         tag: el.tagName,
-        text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
-        context: (el.context || '').slice(0, 50),
+        text: (el.text || '').slice(0, 60).replace(/\s+/g, ' '),
         role: el.roleHint,
         label: (el.ariaLabel || '').slice(0, 50),
+        type: el.attributes?.['type'] 
     }));
 
     const prompt = `
 SYSTEM: Web Automation Agent.
 GOAL: ${goal}
 HISTORY: ${actionHistory.slice(-5).join('; ')}
-ALREADY DONE: ${Array.from(burntPhrases).join(', ')}
 
-ELEMENTS:
+ELEMENTS (Interactive):
 ${JSON.stringify(elementList)}
 
 INSTRUCTIONS:
-1. Pick the NEXT step to achieve GOAL. 
-2. IGNORE actions in "ALREADY DONE".
-3. RETURN JSON: { "type": "click"|"type"|"finish"|"wait", "elementId": "el_X", "text"?: "...", "thought": "..." }
+1. **Login Check**: If you just typed a password, you MUST look for a "Login", "Sign In", or "Go" button and CLICK it. Do not wait.
+2. **Missing Elements**: If you cannot find the target (e.g., "Insurance"), return a "scroll" action to find it.
+3. **Credentials**: If the goal has username/password, type them into the inputs.
+4. **Navigation**: If logged in, proceed with the menu steps.
+
+RETURN JSON: { "type": "click"|"type"|"finish"|"wait"|"scroll", "elementId": "el_X", "text"?: "...", "thought": "..." }
 `;
 
     try {
@@ -489,7 +460,6 @@ INSTRUCTIONS:
         const response = (result as any).response?.text?.() ?? '';
         const parsed = this.parseAgentActionResponse(response);
         
-        // Resolve elementId to Selector immediately
         if ((parsed.type === 'click' || parsed.type === 'type') && parsed.elementId) {
             const match = parsed.elementId.match(/el_(\d+)/);
             if (match) {
@@ -504,7 +474,6 @@ INSTRUCTIONS:
         return parsed;
 
     } catch (err: any) {
-        // RETHROW so runAutonomousAgent can handle 429
         throw err;
     }
   }
