@@ -349,8 +349,13 @@ export class BrowserManager {
 
   async click(selector: string): Promise<ElementInfo> {
     const page = this.getPage();
-    const baseLocator = await this.smartLocate(selector, this.defaultTimeout);
-    const locator = baseLocator.first();
+    // smartLocate searches ALL frames.
+    const locator = await this.smartLocate(selector, this.defaultTimeout);
+
+    // IMPORTANT: Check if we found it
+    if (await locator.count() === 0) {
+        throw new Error(`Element not found: ${selector}`);
+    }
 
     await locator.scrollIntoViewIfNeeded().catch(() => {});
 
@@ -360,7 +365,7 @@ export class BrowserManager {
       const handle = await locator.elementHandle();
       if (handle) {
         const extractor = new SelectorExtractor(this.getPage());
-        info = await extractor.extractFromHandle(handle);
+        info = (await extractor.extractFromHandle(handle)) ?? undefined;
       }
     } catch {}
 
@@ -373,7 +378,7 @@ export class BrowserManager {
 
     // 2. Attempt Standard Click
     try {
-        await locator.click({ timeout: 2000 });
+        await locator.click({ timeout: 5000 });
     } catch (e) {
         // 3. Fallback: JS Dispatch (often bypasses overlays)
         console.log("Standard click failed, attempting JS dispatch");
@@ -424,7 +429,7 @@ export class BrowserManager {
       const handle = await locator.elementHandle();
       if (handle) {
         const extractor = new SelectorExtractor(this.getPage());
-        info = await extractor.extractFromHandle(handle);
+        info = (await extractor.extractFromHandle(handle)) ?? undefined;
       }
     } catch (e) {}
 

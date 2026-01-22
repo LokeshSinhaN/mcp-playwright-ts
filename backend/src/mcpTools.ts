@@ -47,14 +47,15 @@ export class McpTools {
   }
 
   async navigate(url: string): Promise<ExecutionResult> {
-    const command: ExecutionCommand = {
-      action: 'navigate',
-      target: url,
-      description: `Mapsd to ${url}`,
-    };
     try {
+      console.log(`[Navigating] ${url}`);
       await this.browser.goto(url);
-      this.agentCommandBuffer?.push(command);
+      
+      // CRITICAL: Wait for the visual page to settle
+      const page = this.browser.getPage();
+      await page.waitForLoadState('domcontentloaded');
+      await page.waitForTimeout(2000); // Hard wait for React/Angular hydration
+      
       return { success: true, message: `Mapsd to ${url}` };
     } catch (error: any) {
       return { success: false, message: error.message };
@@ -373,9 +374,16 @@ export class McpTools {
     if (urlInGoal) {
         const currentUrl = page.url();
         if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
-            console.log(`[Agent] Initial navigation to ${urlInGoal}`);
             await this.navigate(urlInGoal);
-            await page.waitForTimeout(2000); // Wait for load
+            // Double check: Wait specifically for Inputs if "Login" is in the goal
+            if (goal.toLowerCase().includes('login')) {
+                console.log("[Agent] Waiting for login fields...");
+                try {
+                    await page.waitForSelector('input', { timeout: 5000 });
+                } catch {
+                    console.log("[Agent] Warning: No inputs found immediately.");
+                }
+            }
         }
     }
 
@@ -386,20 +394,12 @@ export class McpTools {
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
       
-      let observation = await this.observe(true); 
-      
-      // Blank Page / Loading Recovery
-      if ((!observation.selectors || observation.selectors.length === 0) && stepNumber === 1) {
-          console.log("No elements found on step 1. Waiting for load...");
-          await page.waitForTimeout(4000); 
-          
+      // Observation with Retry
+      let observation = await this.observe(true);
+      if (!observation.selectors || observation.selectors.length === 0) {
+          console.log("Empty page detected. Waiting...");
+          await page.waitForTimeout(3000);
           observation = await this.observe(true);
-          if (!observation.selectors || observation.selectors.length === 0) {
-             console.log("Still empty. Reloading page...");
-             await page.reload({ waitUntil: 'domcontentloaded' });
-             await page.waitForTimeout(2000);
-             observation = await this.observe(true);
-          }
       }
 
       const elements = observation.selectors ?? [];
@@ -425,11 +425,25 @@ export class McpTools {
           }
       }
 
+      // FIX 2: Strict "Login First" Logic in the Prompt
+      // We inject a specific instruction if we detect we are likely on a login page
+      const hasPasswordField = elements.some(el => 
+        (el.attributes?.type === 'password') || 
+        (el.text?.toLowerCase().includes('password')) ||
+        (el.placeholder?.toLowerCase().includes('password'))
+      );
+      
+      let systemInstruction = "";
+      if (hasPasswordField && stepNumber < 5) {
+          systemInstruction = "CRITICAL: You are on a LOGIN PAGE. You MUST fill in the Username and Password and click Login. DO NOT attempt to click other menu links (like 'Reports') until you have successfully logged in.";
+      }
+
+      // Pass this new instruction to planNextAgentAction
       let nextAction = await this.planNextAgentAction(
           goal, 
           elements, 
           this.agentContext.pastActions, 
-          feedbackForPlanner, 
+          feedbackForPlanner + "\n" + systemInstruction, 
           this.agentContext.ineffectivePhrases,
           observation.screenshot
       );

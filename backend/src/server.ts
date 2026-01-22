@@ -680,17 +680,10 @@ export function createServer(port: number, chromePath?: string) {
           const isMultiStep = detectMultiStepPrompt(prompt);
           
           if (isMultiStep) {
-            // Auto-route to autonomous agent for complex tasks
-            broadcast({
-              type: 'log',
-              timestamp: new Date().toISOString(),
-              message: `Prompt detected as multi-step. Starting agent: "${prompt.slice(0, 100)}"`
-            });
+            console.log(`[Server] Starting Agent with prompt: ${prompt}`);
 
             const config: AgentConfig = {
-              maxSteps: agentConfig?.maxSteps ?? 30, // Increased for complex multi-step tasks
-              maxRetriesPerAction: 2, // Allow more retries for reliability
-              generateSelenium: agentConfig?.generateSelenium ?? true,
+              maxSteps: 30,
               broadcast,
             };
 

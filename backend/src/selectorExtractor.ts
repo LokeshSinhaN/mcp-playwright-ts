@@ -1,12 +1,38 @@
-//
-import { Page, ElementHandle } from 'playwright';
+import { Page, ElementHandle, Frame } from 'playwright';
 import { ElementInfo } from './types';
 
 export class SelectorExtractor {
   constructor(private readonly page: Page) {}
 
+  // FIX: Scan ALL frames, not just the main page
   async extractAllInteractive(): Promise<ElementInfo[]> {
-    const handles = await this.page.$$(
+    const frames = this.page.frames();
+    const allElements: ElementInfo[] = [];
+    const seen = new Set<string>();
+
+    for (const frame of frames) {
+      try {
+        const results = await this.extractFromFrame(frame);
+        for (const info of results) {
+           if (!info) continue;
+           const bbox = info.boundingBox || { x: 0, y: 0 };
+           // Unique key including frame URL to differentiate identical forms
+           const key = `${info.tagName}|${info.text}|${bbox.x},${bbox.y}|${frame.url()}`;
+           
+           if (!seen.has(key)) {
+             seen.add(key);
+             allElements.push(info);
+           }
+        }
+      } catch (e) {
+        // Ignore cross-origin frame access errors
+      }
+    }
+    return allElements;
+  }
+
+  private async extractFromFrame(frame: Frame): Promise<(ElementInfo | null)[]> {
+    const handles = await frame.$$( 
       [
         'button', 'a', 'input', 'textarea', 'select',
         '[role=button]', '[role=link]', '[role="option"]', '[role="search"]',
@@ -14,206 +40,198 @@ export class SelectorExtractor {
         '[class*="btn" i]', '[class*="button" i]', '[class*="icon" i]',
         '[style*="cursor: pointer"]', '[style*="cursor:pointer"]',
         '[tabindex]:not([tabindex="-1"])',
-        // Universal Scroll Containers
         'ul', 'ol', 'div[style*="overflow"]', 'div[class*="scroll"]',
-        '[role="listbox"]', '[role="menu"]', '.dropdown-menu',
-        '[style*="z-index"]' // Floating elements
+        '[role="listbox"]', '[role="menu"]', '.dropdown-menu'
       ].join(', ')
     );
 
-    const results: ElementInfo[] = [];
-    const seen = new Set<string>();
-
+    const results: Promise<ElementInfo | null>[] = [];
     for (const h of handles) {
-      const info = await this.extractFromHandle(h);
-      if (!info) continue;
-
-      const bbox = info.boundingBox || info.rect || { x: 0, y: 0, width: 0, height: 0 };
-      const key = [info.tagName, info.text, `${bbox.x},${bbox.y}`].join('|');
-
-      if (seen.has(key)) continue;
-      seen.add(key);
-      results.push(info);
+      results.push(this.extractFromHandle(h, frame)); // Pass frame
     }
-    return results;
+    return Promise.all(results);
   }
 
   async extractForSelector(selector: string): Promise<ElementInfo> {
     const handle = await this.page.$(selector);
     if (!handle) throw new Error(`Element not found: ${selector}`);
-    return this.extractFromHandle(handle);
+    const info = await this.extractFromHandle(handle);
+    if (!info) throw new Error(`Could not extract info for element: ${selector}`);
+    return info;
   }
 
-  async extractFromHandle(handle: ElementHandle): Promise<ElementInfo> {
+  async extractFromHandle(handle: ElementHandle, frame?: Frame): Promise<ElementInfo | null> {
     const interactiveHandle = await this.resolveInteractiveHandle(handle);
 
-    const base = await interactiveHandle.evaluate((el: any) => {
-      const win = el.ownerDocument && el.ownerDocument.defaultView;
-      const rect = el.getBoundingClientRect();
-      const style = win ? win.getComputedStyle(el) : null;
-      
-      const zIndex = style ? parseInt(style.zIndex || '0', 10) : 0;
-      const isFloating = zIndex > 100 || (style && (style.position === 'absolute' || style.position === 'fixed'));
+    try {
+      const base = await interactiveHandle.evaluate((el: any) => {
+        const win = el.ownerDocument && el.ownerDocument.defaultView;
+        const rect = el.getBoundingClientRect();
+        const style = win ? win.getComputedStyle(el) : null;
+        
+        const visible =
+          !!el.offsetParent &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          (!style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
+        
+        if (!visible) return null;
 
-      // UNIVERSAL SCROLL DETECTION
-      let isScrollable = style && (
-        (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
-        (style.overflowX === 'auto' || style.overflowX === 'scroll')
-      );
-      
-      const getAttr = (name: string): string =>
-        typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
+        const zIndex = style ? parseInt(style.zIndex || '0', 10) : 0;
+        const isFloating = zIndex > 100 || (style && (style.position === 'absolute' || style.position === 'fixed'));
 
-      const role = getAttr('role');
-      if (role === 'listbox' || role === 'menu' || role === 'tree') isScrollable = true;
+        // UNIVERSAL SCROLL DETECTION
+        let isScrollable = style && (
+          (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
+          (style.overflowX === 'auto' || style.overflowX === 'scroll')
+        );
+        
+        const getAttr = (name: string): string =>
+          typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
 
-      // UNIVERSAL STATE DETECTION
-      // Standard way websites signal an open dropdown
-      const ariaExpanded = getAttr('aria-expanded');
-      const isExpanded = ariaExpanded === 'true';
+        const role = getAttr('role');
+        if (role === 'listbox' || role === 'menu' || role === 'tree') isScrollable = true;
 
-      const visible =
-        !!el.offsetParent &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        (!style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
+        // UNIVERSAL STATE DETECTION
+        const ariaExpanded = getAttr('aria-expanded');
+        const isExpanded = ariaExpanded === 'true';
 
-      const tagName = (el.tagName || '').toLowerCase();
-      
-      let roleHint: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other' = 'other';
-      if (tagName === 'button') roleHint = 'button';
-      else if (tagName === 'a') roleHint = 'link';
-      else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') roleHint = 'input';
-      if (role === 'option' || role === 'menuitem') roleHint = 'option';
-      if (role === 'listbox' || role === 'combobox') roleHint = 'listbox';
+        const tagName = (el.tagName || '').toLowerCase();
+        
+        let roleHint: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other' = 'other';
+        if (tagName === 'button') roleHint = 'button';
+        else if (tagName === 'a') roleHint = 'link';
+        else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') roleHint = 'input';
+        if (role === 'option' || role === 'menuitem') roleHint = 'option';
+        if (role === 'listbox' || role === 'combobox') roleHint = 'listbox';
 
-      const typeAttr = getAttr('type');
-      const placeholder = getAttr('placeholder');
-      const ariaLabel = getAttr('aria-label');
-      const valueAttr = (el as any).value !== undefined ? String((el as any).value) : getAttr('value');
-      const titleAttr = getAttr('title');
-      const dataTestId = getAttr('data-testid');
-      const href = getAttr('href');
-      const isSearchField =
-        tagName === 'input' &&
-        (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
+        const typeAttr = getAttr('type');
+        const placeholder = getAttr('placeholder');
+        const ariaLabel = getAttr('aria-label');
+        const valueAttr = (el as any).value !== undefined ? String((el as any).value) : getAttr('value');
+        const titleAttr = getAttr('title');
+        const dataTestId = getAttr('data-testid');
+        const href = getAttr('href');
+        const isSearchField =
+          tagName === 'input' &&
+          (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
 
-      // --- UNIVERSAL LABEL DETECTION ("The Eyes") ---
-      // Dynamically find text next to the element to solve ambiguity.
-      const getText = (node: any | null): string => {
-        if (!node || node.nodeType !== 1) return '';
-        return (node.innerText || node.textContent || '').trim();
-      };
+        // --- UNIVERSAL LABEL DETECTION ("The Eyes") ---
+        const getText = (node: any | null): string => {
+          if (!node || node.nodeType !== 1) return '';
+          return (node.innerText || node.textContent || '').trim();
+        };
 
-      let nearbyLabel = '';
-      
-      // 1. Look Left (Previous Sibling)
-      let sibling = el.previousElementSibling;
-      if (sibling && getText(sibling).length > 1 && getText(sibling).length < 40) {
-          nearbyLabel = getText(sibling);
-      }
-
-      // 2. Look Up (Parent's Previous Sibling - Common in Forms)
-      if (!nearbyLabel && el.parentElement) {
-          const parentSibling = el.parentElement.previousElementSibling;
-          if (parentSibling && getText(parentSibling).length > 1 && getText(parentSibling).length < 40) {
-              nearbyLabel = getText(parentSibling);
-          }
-      }
-
-      // 3. Look at Table Headers (If inside a grid)
-      if (!nearbyLabel) {
-          const td = el.closest('td');
-          if (td && td.previousElementSibling) {
-              nearbyLabel = getText(td.previousElementSibling);
-          }
-      }
-      // ----------------------------------------------
-
-      const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
-      let region: 'header' | 'main' | 'footer' = 'main';
-      const closestSafe = (selector: string): Element | null => {
-        try {
-          return typeof el.closest === 'function' ? el.closest(selector) : null;
-        } catch {
-          return null;
+        let nearbyLabel = '';
+        
+        let sibling = el.previousElementSibling;
+        if (sibling && getText(sibling).length > 1 && getText(sibling).length < 40) {
+            nearbyLabel = getText(sibling);
         }
-      };
 
-      if (closestSafe('header') || closestSafe('nav')) {
-        region = 'header';
-      } else if (closestSafe('footer')) {
-        region = 'footer';
-      } else if (closestSafe('main')) {
-        region = 'main';
-      } else {
-        if (rect.top < viewportHeight * 0.25) region = 'header';
-        else if (rect.top > viewportHeight * 0.75) region = 'footer';
-        else region = 'main';
-      }
+        if (!nearbyLabel && el.parentElement) {
+            const parentSibling = el.parentElement.previousElementSibling;
+            if (parentSibling && getText(parentSibling).length > 1 && getText(parentSibling).length < 40) {
+                nearbyLabel = getText(parentSibling);
+            }
+        }
 
-      const rawText = (el.textContent || '').trim();
-      let effectiveText = rawText || (tagName === 'input' ? valueAttr : '') || '';
-      
-      // Inject the discovered label into the text for the LLM
-      if (nearbyLabel && !effectiveText.includes(nearbyLabel)) {
-          effectiveText = `${nearbyLabel} ${effectiveText}`;
-      }
+        if (!nearbyLabel) {
+            const td = el.closest('td');
+            if (td && td.previousElementSibling) {
+                nearbyLabel = getText(td.previousElementSibling);
+            }
+        }
+        // ----------------------------------------------
+
+        const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
+        let region: 'header' | 'main' | 'footer' = 'main';
+        const closestSafe = (selector: string): Element | null => {
+          try {
+            return typeof el.closest === 'function' ? el.closest(selector) : null;
+          } catch {
+            return null;
+          }
+        };
+
+        if (closestSafe('header') || closestSafe('nav')) {
+          region = 'header';
+        } else if (closestSafe('footer')) {
+          region = 'footer';
+        } else if (closestSafe('main')) {
+          region = 'main';
+        } else {
+          if (rect.top < viewportHeight * 0.25) region = 'header';
+          else if (rect.top > viewportHeight * 0.75) region = 'footer';
+          else region = 'main';
+        }
+
+        const rawText = (el.textContent || '').trim();
+        let effectiveText = rawText || (tagName === 'input' ? valueAttr : '') || '';
+        
+        if (nearbyLabel && !effectiveText.includes(nearbyLabel)) {
+            effectiveText = `${nearbyLabel} ${effectiveText}`;
+        }
+
+        return {
+          tagName,
+          id: el.id || undefined,
+          className: el.className || undefined,
+          text: effectiveText,
+          ariaLabel,
+          placeholder: placeholder || undefined,
+          title: titleAttr || undefined,
+          dataTestId: dataTestId || undefined,
+          href,
+          visible,
+          roleHint,
+          scrollable: isScrollable,
+          isFloating,
+          expanded: isExpanded,
+          searchField: isSearchField,
+          region,
+          boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+          context: nearbyLabel || undefined,
+          attrs: Array.from(el.attributes).map((a: any) => [a.name, a.value] as const)
+        };
+      });
+
+      if (!base) return null;
+
+      const cssSelector = await this.generateCss(interactiveHandle);
+      const xpath = await this.generateXpath(interactiveHandle);
+      const rawAttrs = Object.fromEntries(base.attrs);
+      if (base.tagName === 'input' || base.tagName === 'textarea') rawAttrs['value'] = base.text || '';
 
       return {
-        tagName,
-        id: el.id || undefined,
-        className: el.className || undefined,
-        text: effectiveText, // Now includes "Insurance: " automatically
-        ariaLabel,
-        placeholder: placeholder || undefined,
-        title: titleAttr || undefined,
-        dataTestId: dataTestId || undefined,
-        href,
-        visible,
-        roleHint,
-        scrollable: isScrollable,
-        isFloating,
-        expanded: isExpanded, // Export state
-        searchField: isSearchField,
-        region,
-        boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
-        context: nearbyLabel || undefined,
-        attrs: Array.from(el.attributes).map((a: any) => [a.name, a.value] as const)
+        tagName: base.tagName,
+        id: base.id,
+        className: base.className,
+        text: base.text,
+        ariaLabel: base.ariaLabel,
+        placeholder: base.placeholder,
+        title: base.title,
+        dataTestId: base.dataTestId,
+        href: base.href,
+        cssSelector,
+        xpath,
+        selector: cssSelector,
+        visible: base.visible,
+        isVisible: base.visible,
+        roleHint: base.roleHint as any,
+        scrollable: base.scrollable,
+        isFloating: base.isFloating,
+        expanded: base.expanded,
+        searchField: base.searchField,
+        region: base.region,
+        boundingBox: base.boundingBox,
+        rect: base.boundingBox,
+        context: base.context,
+        attributes: rawAttrs
       };
-    });
-
-    const cssSelector = await this.generateCss(interactiveHandle);
-    const xpath = await this.generateXpath(interactiveHandle);
-    const rawAttrs = Object.fromEntries(base.attrs);
-    if (base.tagName === 'input' || base.tagName === 'textarea') rawAttrs['value'] = base.text || '';
-
-    return {
-      tagName: base.tagName,
-      id: base.id,
-      className: base.className,
-      text: base.text,
-      ariaLabel: base.ariaLabel,
-      placeholder: base.placeholder,
-      title: base.title,
-      dataTestId: base.dataTestId,
-      href: base.href,
-      cssSelector,
-      xpath,
-      selector: cssSelector,
-      visible: base.visible,
-      isVisible: base.visible,
-      roleHint: base.roleHint as any,
-      scrollable: base.scrollable,
-      isFloating: base.isFloating,
-      expanded: base.expanded,
-      searchField: base.searchField,
-      region: base.region,
-      boundingBox: base.boundingBox,
-      rect: base.boundingBox,
-      context: base.context,
-      attributes: rawAttrs
-    };
+    } catch {
+      return null;
+    }
   }
 
   private async resolveInteractiveHandle(handle: ElementHandle): Promise<ElementHandle> {
@@ -282,7 +300,7 @@ export class SelectorExtractor {
         if (typeof (globalThis as any).CSS !== 'undefined' && (globalThis as any).CSS.escape) {
           return (globalThis as any).CSS.escape(str);
         }
-        return str.replace(/([:.[\]#])/g, '\\$1');
+        return str.replace(/([:.[\\\]#])/g, '\\$1');
       };
 
       const getAttr = (name: string): string | null =>
