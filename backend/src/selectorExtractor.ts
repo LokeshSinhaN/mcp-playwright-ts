@@ -43,7 +43,13 @@ export class SelectorExtractor {
         'svg[style*="cursor: pointer"]',
         'svg[style*="cursor:pointer"]',
         // Any element with tabindex (keyboard-accessible, often clickable)
-        '[tabindex]:not([tabindex="-1"])'
+        '[tabindex]:not([tabindex="-1"])',
+        // NEW: Explicitly capture potential scroll containers
+        'ul', 
+        'ol',
+        'div[role="listbox"]',
+        'div[style*="overflow"]',
+        'div[class*="scroll"]',
       ].join(', ')
     );
 
@@ -87,6 +93,13 @@ export class SelectorExtractor {
       const win = el.ownerDocument && el.ownerDocument.defaultView;
       const rect = el.getBoundingClientRect();
       const style = win ? win.getComputedStyle(el) : null;
+      
+      // NEW: Universal Scroll Detection
+      const isScrollable = style && (
+        (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
+        (style.overflowX === 'auto' || style.overflowX === 'scroll')
+      );
+
       const visible =
         !!el.offsetParent &&
         rect.width > 0 &&
@@ -204,6 +217,7 @@ export class SelectorExtractor {
         href,
         visible,
         roleHint,
+        scrollable: isScrollable,
         searchField: isSearchField,
         region,
         boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
@@ -245,6 +259,7 @@ export class SelectorExtractor {
       visible: base.visible,
       isVisible: base.visible,
       roleHint: base.roleHint,
+      scrollable: base.scrollable,
       searchField: base.searchField,
       region: base.region,
       boundingBox: base.boundingBox,

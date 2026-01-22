@@ -26,6 +26,10 @@ export interface ElementInfo {
   isVisible?: boolean;
   // High-level role hint to help reasoning about elements.
   roleHint?: 'button' | 'link' | 'input' | 'other';
+  
+  // NEW: Flag to tell the AI "You can scroll this specific element!"
+  scrollable?: boolean; 
+  
   // True if this looks like a search input field.
   searchField?: boolean;
   // Approximate vertical region of the page.

@@ -1126,18 +1126,19 @@ async runAutonomousAgent(
   }
 
   // ---------------------------------------------------------------------------
-  // FINAL FIX: DEFENSIVE PARSER (Guaranteed to return a valid AgentAction)
+  // FIX: ROBUST JSON PARSER (Handles trailing commas & bad quotes)
   // ---------------------------------------------------------------------------
-  //
   private parseAgentActionResponse(raw: string): AgentAction {
     // 1. Basic cleanup
     let clean = raw.replace(/```json\s*|\s*```/gi, '').trim();
     
-    // 2. Initialize
+    // FIX: Remove trailing commas before closing braces (Common LLM error)
+    clean = clean.replace(/,\s*([\]}])/g, '$1');
+
     let finalObj: any = {};
     let foundAny = false;
 
-    // 3. Scan for ALL JSON objects (chunks) and merge them.
+    // 2. Scan for ALL JSON objects and merge them
     let currentIndex = 0;
     while (true) {
         const result = this.extractBalancedJson(clean, currentIndex);
@@ -1145,8 +1146,6 @@ async runAutonomousAgent(
 
         try {
             const parsed = JSON.parse(result.json);
-            
-            // If the chunk contains a new action type, it overrides previous ones.
             if (parsed.type || parsed.action) {
                  const preservedThought = parsed.thought || parsed.reasoning || finalObj.thought || finalObj.reasoning;
                  finalObj = { 
@@ -1161,7 +1160,7 @@ async runAutonomousAgent(
         currentIndex = result.endEndex;
     }
 
-    // 4. Fallback for unquoted keys
+    // 3. Fallback for unquoted keys
     if (!foundAny) {
         try {
              const repaired = clean.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:/g, '$1"$2":');
@@ -1173,19 +1172,17 @@ async runAutonomousAgent(
         } catch {}
     }
 
-    // 5. Normalization & Type Safety
+    // 4. Normalization
     const thought = finalObj.thought || finalObj.reasoning || 'No reasoning provided';
     let rawType = finalObj.type || finalObj.action; 
 
-    // Handle "undefined" string literals or bad types universally
     if (typeof rawType === 'string') {
         rawType = rawType.toLowerCase().trim();
         if (['undefined', 'null', 'none', 'unknown'].includes(rawType)) {
-            rawType = 'wait'; // Default to safe wait
+            rawType = 'wait';
         }
     }
 
-    // 6. Safety Check
     if (!rawType) {
          return { 
             type: 'wait', 
@@ -1194,7 +1191,7 @@ async runAutonomousAgent(
         };
     }
 
-    // 7. Universal Map to AgentAction types
+    // Map types
     switch (rawType) {
         case 'click':
         case 'click_element':
@@ -1218,15 +1215,13 @@ async runAutonomousAgent(
         case 'select_option':
              return { type: 'select_option', selector: finalObj.selector, option: finalObj.option, thought };
         default:
-            // Safe fallback for any hallucinated action type
             return { type: 'wait', durationMs: 1000, thought: `Unknown action type "${rawType}". Waiting to retry.` };
     }
   }
 
   // ---------------------------------------------------------------------------
-  // FIX 2: INTELLIGENT PLANNER (Forces Single-Step & Visibility)
+  // FIX: INTELLIGENT PLANNER PROMPT (Prevents "Wrong Item" clicks)
   // ---------------------------------------------------------------------------
-  //
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
@@ -1236,71 +1231,63 @@ async runAutonomousAgent(
   ): Promise<AgentAction> {
     if (!this.model) return { type: 'finish', thought: 'No AI', summary: 'No AI' };
 
-    // FILTER HIDDEN ELEMENTS
+    // Increase limit to 500 to catch items deep in the dropdown
     const visibleElements = elements.filter(el => 
-        el.visible && 
-        el.tagName !== 'script' && 
-        el.tagName !== 'style' && 
-        el.tagName !== 'link' &&
-        !(el.tagName === 'input' && el.attributes?.type === 'hidden')
+        el.visible && el.tagName !== 'script' && el.tagName !== 'style' && el.tagName !== 'link'
     );
 
-    const elementList = visibleElements.slice(0, 300).map((el, idx) => ({
+    const elementList = visibleElements.slice(0, 500).map((el, idx) => ({
         id: `el_${idx}`,
         tag: el.tagName,
-        // Show text OR value clearly so the AI knows if a field is filled
         text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
-        value: el.attributes?.['value'] || '', 
+        value: el.attributes?.['value'] || '',
+        scrollable: el.scrollable ? true : undefined, 
         label: el.ariaLabel || el.placeholder || '',
-        selector: el.selector || el.cssSelector
     }));
 
-    // --- UNIVERSAL PROMPT (NO HARDCODED VALUES) ---
     const prompt = `
-    SYSTEM: You are an autonomous browser agent.
+    SYSTEM: You are an ultra-fast autonomous browser agent.
     GOAL: ${goal}
     
     HISTORY:
     ${actionHistory.slice(-5).join('\n')}
 
-    VISIBLE ELEMENTS (truncated to 300):
+    VISIBLE ELEMENTS (truncated to 500):
     ${JSON.stringify(elementList)}
 
     FAILED ELEMENT IDS:
     ${JSON.stringify(Array.from(failedElements))}
 
     RULES:
-    1. RETURN ONLY ONE JSON OBJECT.
-    2. CHECKBOX SAFETY: Before clicking a checkbox, check its 'checked' attribute or value.
-       - If the goal is to SELECT it and it is ALREADY checked, DO NOT click it.
-       - If the goal is to UNSELECT it and it is ALREADY unchecked, DO NOT click it.
-    3. DROPDOWN SAFETY: If clicking an option in a list, verify you are clicking the specific text label, not the container.
-    4. // ... (rest of your existing rules) ...
+    1. **SCROLLING IS CRITICAL:** - If you need an option (e.g. "Medicare") and it is NOT in the visible list, do NOT try to click a random element.
+       - Look for an element with "scrollable": true (likely a <div> or <ul>).
+       - SCROLL that specific element: { "type": "scroll", "elementId": "el_XX", "direction": "down" }.
+
+    2. **VERIFY BEFORE CLICKING:** - If clicking a list item, verify the 'text' or 'label' matches your goal.
+       - Do NOT click blank lines or neighbors just because they are close.
+
+    3. **CHECKBOX SAFETY:** - IF GOAL is "Uncheck X" AND X is ALREADY unchecked (based on value/attribute) -> DO NOT CLICK.
+       - IF GOAL is "Check X" AND X is ALREADY checked -> DO NOT CLICK.
+       
+    4. **FAIL FAST:** - If an element ID is in "FAILED ELEMENT IDS", pick a different strategy (scroll or search).
+
+    5. **STRICT JSON FORMAT:**
+       Return ONLY this JSON object (no markdown):
+       {
+         "type": "navigate" | "click" | "type" | "scroll" | "wait" | "finish",
+         "elementId": "el_123", 
+         "thought": "Reasoning..."
+       }
     `;
 
     try {
       const llmResult = await this.withTimeout(
-        this.model.generateContent({
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: prompt }],
-            },
-          ],
-        } as any),
-        45000,
-        'Agent planner',
+        this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any),
+        45000, 'Agent planner'
       );
-
-      const rawText = (llmResult as any).response?.text?.() ?? '';
-      return this.parseAgentActionResponse(rawText);
+      return this.parseAgentActionResponse((llmResult as any).response?.text?.() ?? '');
     } catch (err) {
-      console.warn('planNextAgentAction LLM failure, falling back to wait:', err);
-      return {
-        type: 'wait',
-        durationMs: 1000,
-        thought: 'LLM planner failed; waiting briefly before retrying.',
-      };
+      return { type: 'wait', durationMs: 1000, thought: 'LLM planner failed; waiting briefly.' };
     }
   }
 
@@ -1425,13 +1412,20 @@ async runAutonomousAgent(
         }
 
         case 'scroll': {
-          const page = this.browser.getPage();
-          const distance = action.direction === 'up' ? -500 : 500;
-          await page.mouse.wheel(0, distance);
-          return {
-            success: true,
-            message: `Scrolled ${action.direction}.`,
-          };
+          let selectorToScroll: string | undefined;
+          
+          // Map elementId (el_5) to actual selector if provided
+          if ((action as any).elementId) {
+             const match = (action as any).elementId.match(/^el_(\d+)$/);
+             if (match) {
+                 const idx = parseInt(match[1]);
+                 const el = elements[idx];
+                 if (el) selectorToScroll = el.selector || el.cssSelector;
+             }
+          }
+
+          // Call our new Universal Scroll method
+          return await this.browser.scroll(selectorToScroll, action.direction);
         }
 
         case 'wait': {

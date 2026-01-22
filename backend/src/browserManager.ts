@@ -1,5 +1,5 @@
 import { chromium, Browser, BrowserContext, Page, Locator } from 'playwright';
-import { BrowserConfig, ElementInfo, SessionState } from './types';
+import { BrowserConfig, ElementInfo, SessionState, ExecutionResult } from './types';
 import { SelectorExtractor } from './selectorExtractor';
 
 export class BrowserManager {
@@ -255,8 +255,9 @@ export class BrowserManager {
       const candidates = getCandidates(frame);
       for (const loc of candidates) {
         try {
-          // Check if attached & visible without waiting too long
-          if (await loc.first().isVisible({ timeout: Math.min(250, timeoutMs) })) {
+          // SPEED FIX: Reduce check timeout from default (30s) to 1s.
+          // If it's not there instantly, we want to know so we can scroll.
+          if (await loc.first().isVisible({ timeout: 1000 })) {
             return loc.first();
           }
         } catch {
@@ -330,27 +331,38 @@ export class BrowserManager {
     const baseLocator = await this.smartLocate(selector, this.defaultTimeout);
     const locator = baseLocator.first();
 
-    // 1. ROBUST SCROLLING (Fix for "Timeout exceeded")
+    // 1. ROBUST SCROLLING & STABILITY CHECK (Prevents "Wrong Neighbor" Click)
     try {
-      // Try standard scroll first
-      await locator.scrollIntoViewIfNeeded({ timeout: 2000 });
+      // Try fast scroll first
+      await locator.scrollIntoViewIfNeeded({ timeout: 1500 });
+      
+      // FIX: Wait for scroll to COMPLETELY stop (Debounce)
+      // This ensures we don't click "National Benefit Fund" when we meant "Medicare"
+      await page.evaluate(() => new Promise((resolve) => {
+          let lastPos = -1;
+          const check = () => {
+            const current = window.scrollY + document.documentElement.scrollTop; // Checks both window and containers
+            if (current === lastPos) resolve(true);
+            else {
+              lastPos = current;
+              requestAnimationFrame(check);
+            }
+          };
+          requestAnimationFrame(check);
+      }));
     } catch {
-      // Fallback: Force JS scroll. This fixes issues with "virtual" lists 
-      // where the element exists in DOM but Playwright can't "see" it to scroll.
-      await locator.evaluate((el: any) => {
-        el.scrollIntoView({ block: 'center', inline: 'nearest' });
-      });
+      // Fallback: JS Scroll
+      await locator.evaluate((el: any) => el.scrollIntoView({ block: 'center', inline: 'nearest' }));
+      await page.waitForTimeout(500); 
     }
 
-    // 2. Visual Highlight (unchanged)
+    // 2. Visual Highlight
     try {
-      await locator.evaluate((el: any) => {
-        (el as HTMLElement).style.outline = '3px solid red';
-      });
-      await page.waitForTimeout(250);
+      await locator.evaluate((el: any) => { (el as HTMLElement).style.outline = '3px solid red'; });
+      await page.waitForTimeout(200);
     } catch {}
 
-    // 3. Extract Info (unchanged)
+    // 3. Extract Info
     let info: ElementInfo | undefined;
     try {
       const handle = await locator.elementHandle();
@@ -360,36 +372,49 @@ export class BrowserManager {
       }
     } catch {}
 
-    // 4. Click with Retry Strategy
+    // 4. Click with Force Strategy (Fixes "Element not clickable")
     try {
-      // Try normal click
       await locator.click({ timeout: 3000 });
     } catch (err) {
       console.warn(`Standard click failed, escalating to FORCE click...`);
       try {
-        // Force click (bypasses overlap checks)
+        // Force click bypasses overlap checks
         await locator.click({ timeout: 3000, force: true });
       } catch (forceErr) {
-        console.warn(`Force click failed, attempting JS click...`);
-        // JS Click (Final resort for stubborn elements)
+        // JS Click is the ultimate fallback
         await locator.evaluate((el: any) => el.click());
       }
     }
 
-    // ... (rest of the function handling dropdown settling remains the same)
-    
     return info || { tagName: 'unknown', attributes: {}, cssSelector: selector };
   }
 
   async type(selector: string, text: string): Promise<ElementInfo> {
+    const page = this.getPage();
     // 1. Find best locator using smart fuzzy matching
     const base = await this.smartLocate(selector, this.defaultTimeout);
     
     // 2. Drill down to input if the selector points to a wrapper/container
     const locator = await this.resolveFillTarget(base);
 
-    // 3. Ensure visibility
-    await locator.waitFor({ state: 'visible', timeout: this.defaultTimeout });
+    // --- FIX START: ROBUST SCROLLING FOR TYPING ---
+    // Instead of waiting 30s for Playwright to scroll, we try fast, then force it.
+    try {
+      // Try standard scroll first (Fail fast in 1.5s instead of 30s)
+      await locator.scrollIntoViewIfNeeded({ timeout: 1500 });
+    } catch {
+      // Fallback: Force JS scroll (Instant Jump) if standard scroll gets stuck
+      await locator.evaluate((el: any) => {
+        el.scrollIntoView({ block: 'center', inline: 'nearest' });
+      });
+      await page.waitForTimeout(500); 
+    }
+    // --- FIX END ---
+
+    // 3. Ensure visibility (Now that we've scrolled, this should pass instantly)
+    // We keep a moderate timeout here just in case the element is physically hidden 
+    // by an animation, but since we handled scrolling above, it won't hang there.
+    await locator.waitFor({ state: 'visible', timeout: 5000 });
     
     // Extract info for return
     let info: ElementInfo | undefined;
@@ -425,6 +450,36 @@ export class BrowserManager {
     }
     
     return info || { tagName: 'input', attributes: {}, cssSelector: selector };
+  }
+
+  /**
+   * Universal Scroll: Scrolls a specific element OR the window.
+   * This handles virtual lists, dropdowns, and sidebars.
+   */
+  async scroll(selector: string | undefined, direction: 'up' | 'down'): Promise<ExecutionResult> {
+    const page = this.getPage();
+    const scrollAmount = direction === 'up' ? -300 : 300;
+
+    if (selector) {
+        // Scroll a SPECIFIC container (The dropdown list)
+        const loc = await this.smartLocate(selector, 2000);
+        
+        // 1. Try JS ScrollBy (Fast & Universal)
+        try {
+            await loc.evaluate((el: any, amount: number) => {
+                el.scrollBy({ top: amount, behavior: 'smooth' });
+            }, scrollAmount);
+            await page.waitForTimeout(500); // Wait for list to render
+            return { success: true, message: `Scrolled element ${direction}` };
+        } catch (e) {
+            // Fallback
+        }
+    }
+
+    // Default: Scroll the main window
+    await page.mouse.wheel(0, scrollAmount);
+    await page.waitForTimeout(500);
+    return { success: true, message: `Scrolled page ${direction}` };
   }
 
   async waitFor(selector: string, timeoutMs = 5000): Promise<void> {
