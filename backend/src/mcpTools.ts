@@ -31,9 +31,7 @@ export class McpTools {
 
   constructor(private readonly browser: BrowserManager, private readonly model?: GenerativeModel) {}
 
-  // --- FIX 1: CORRECT URL REGEX ---
   private extractUrlFromPrompt(prompt: string): string | null {
-    // Previous code had a typo: /https?:\]\/[^\s]+/
     const match = prompt.match(/https?:\/\/[^\s]+/);
     return match ? match[0] : null;
   }
@@ -46,15 +44,17 @@ export class McpTools {
     }
   }
 
+  // --- NAVIGATION WITH STABILITY CHECK ---
   async navigate(url: string): Promise<ExecutionResult> {
     try {
       console.log(`[Navigating] ${url}`);
       await this.browser.goto(url);
       
-      // CRITICAL: Wait for the visual page to settle
       const page = this.browser.getPage();
       await page.waitForLoadState('domcontentloaded');
-      await page.waitForTimeout(2000); // Hard wait for React/Angular hydration
+      
+      // Heuristic: Wait for visual stability
+      await page.waitForTimeout(2000); 
       
       return { success: true, message: `Mapsd to ${url}` };
     } catch (error: any) {
@@ -62,57 +62,15 @@ export class McpTools {
     }
   }
 
-  async click(
-    elementId: string,
-    elements: ElementInfo[]
-  ): Promise<ExecutionResult> {
-    const element = elements[parseInt(elementId.split('_')[1])];
-    if (!element) {
-      return { success: false, message: 'Element not found' };
-    }
-
-    const selector = element.selector;
-    if (!selector) {
-        return { success: false, message: 'Element has no selector' };
-    }
-
-    const desc =
-      element.text || element.ariaLabel || element.tagName || 'element';
-    const command: ExecutionCommand = {
-      action: 'click',
-      target: selector,
-      description: `Clicked "${desc}"`,
-    };
-
-    try {
-      await this.browser.click(selector);
-      this.agentCommandBuffer?.push(command);
-      return { success: true, message: `Clicked ${desc}` };
-    } catch (e1) {
-      console.log(`Direct click failed for ${selector}, trying JS click.`);
-      try {
-        await this.browser.getPage().evaluate((sel) => {
-          const el = document.querySelector(sel) as HTMLElement;
-          el?.click();
-        }, selector);
-        this.agentCommandBuffer?.push(command);
-        return {
-          success: true,
-          message: `Clicked ${desc} using JavaScript.`,
-        };
-      } catch (e2: any) {
-        return { success: false, message: e2.message };
-      }
-    }
-  }
-
+  // --- ROBUST CLICK ---
   async clickExact(selector: string): Promise<ExecutionResult> {
     const command: ExecutionCommand = {
       action: 'click',
       target: selector,
-      description: `Clicked element matching selector ${selector}`,
+      description: `Clicked element ${selector}`,
     };
     try {
+      // Use BrowserManager's robust click (handles frames/hover)
       await this.browser.click(selector);
       this.agentCommandBuffer?.push(command);
       return { success: true, message: `Clicked ${selector}` };
@@ -121,185 +79,21 @@ export class McpTools {
     }
   }
 
-  async withTimeout<T>(
-    promise: Promise<T>,
-    ms: number,
-    timeoutMessage: string
-  ): Promise<T> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(timeoutMessage));
-      }, ms);
-
-      promise
-        .then((res) => {
-          clearTimeout(timer);
-          resolve(res);
-        })
-        .catch((err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-    });
-  }
-
-  private sanitizeElementsForLLM(elements: ElementInfo[]): any[] {
-    return elements.slice(0, 150).map((el, idx) => ({
-      id: `el_${idx}`,
-      tag: el.tagName,
-      text: (el.text || '').slice(0, 100).replace(/\s+/g, ' '),
-      ariaLabel: (el.ariaLabel || '').slice(0, 100).replace(/\s+/g, ' '),
-      role: el.roleHint,
-    }));
-  }
-
-  private extractCoreLabel(element: ElementInfo): string {
-    return (
-      element.text ||
-      element.ariaLabel ||
-      element.placeholder ||
-      'Unnamed Element'
-    ).trim();
-  }
-
-  async identifyTargetWithLLM(
-    elements: ElementInfo[],
-    instruction: string
-  ): Promise<string | null> {
-    if (!this.model) {
-      throw new Error('Generative model not available.');
-    }
-
-    const simplifiedElements = this.sanitizeElementsForLLM(elements);
-
-    const prompt = `
-      You are an expert system for mapping human language to web elements.
-      Based on the following instruction, identify the single best element from the list.
-      Instruction: "${instruction}"
-      Elements:
-      ${JSON.stringify(simplifiedElements, null, 2)}
-
-      Respond with ONLY the JSON object for the single best matching element, or null if no clear match is found.
-    `;
-
-    try {
-      const result = await this.withTimeout(
-        this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any),
-        3000,
-        'LLM element identification timed out.'
-      );
-      const responseText = (result as any).response?.text?.() ?? '';
-      const matchedElement = JSON.parse(responseText.trim());
-
-      if (matchedElement && matchedElement.id) {
-        const elementIndex = parseInt(matchedElement.id.split('_')[1]);
-        if (!isNaN(elementIndex) && elements[elementIndex]) {
-          const selector = elements[elementIndex].selector;
-          return selector || null;
-        }
-      }
-      return null;
-    } catch (error) {
-      console.error('Error identifying target with LLM:', error);
-      return null;
-    }
-  }
-
-  async clickWithHeuristics(
-    instruction: string,
-    elements: ElementInfo[]
-  ): Promise<ExecutionResult> {
-    const selector = await this.identifyTargetWithLLM(elements, instruction);
-    if (selector) {
-      return this.clickExact(selector);
-    }
-
-    const dropdownInstruction = parseDropdownInstruction(instruction);
-    if (dropdownInstruction) {
-      if (dropdownInstruction.kind === 'open-and-select') {
-        const result = await selectFromDropdown(
-          this.browser.getPage(),
-          dropdownInstruction.dropdownLabel,
-          dropdownInstruction.optionLabel
-        );
-        return { success: !!result.optionSelector, message: `Selected option using ${result.method}` };
-      } else if (dropdownInstruction.kind === 'select-only') {
-        const result = await selectOptionInOpenDropdown(
-          this.browser.getPage(),
-          dropdownInstruction.optionLabel
-        );
-        return { success: !!result.optionSelector, message: `Selected option using ${result.method}` };
-      }
-    }
-
-    return {
-      success: false,
-      message: `Could not identify a clickable element for: "${instruction}"`,
-    };
-  }
-
-  async type(
-    elementIdOrSelector: string,
-    text: string,
-    elements?: ElementInfo[]
-  ): Promise<ExecutionResult> {
-    let selector: string | undefined;
-    let desc: string;
-
-    if (elements && elementIdOrSelector.startsWith('el_')) {
-      const element = elements[parseInt(elementIdOrSelector.split('_')[1])];
-      if (!element) {
-        return { success: false, message: 'Element not found' };
-      }
-      selector = element.selector;
-      desc =
-        element.text || element.ariaLabel || element.tagName || 'element';
-    } else {
-      selector = elementIdOrSelector;
-      desc = `element with selector ${selector}`;
-    }
-
-    if (!selector) {
-        return { success: false, message: 'Element has no selector' };
-    }
-
+  async type(selector: string, text: string): Promise<ExecutionResult> {
     const command: ExecutionCommand = {
       action: 'type',
       target: selector,
       value: text,
-      description: `Typed "${text}" into ${desc}`,
+      description: `Typed "${text}" into ${selector}`,
     };
 
     try {
       await this.browser.type(selector, text);
       this.agentCommandBuffer?.push(command);
-      return { success: true, message: `Typed "${text}" into ${desc}` };
+      return { success: true, message: `Typed "${text}"` };
     } catch (error: any) {
       return { success: false, message: error.message };
     }
-  }
-
-  async handleCookieBanner(
-    elements: ElementInfo[]
-  ): Promise<ExecutionResult> {
-    const bannerKeywords = [
-      'accept all',
-      'agree',
-      'allow cookies',
-      'ok',
-      'got it',
-      'i agree',
-    ];
-    const cookieElement = elements.find((el) => {
-      const elText = (el.text || '').toLowerCase();
-      return bannerKeywords.some((keyword) => elText.includes(keyword));
-    });
-
-    if (cookieElement && cookieElement.selector) {
-      return this.clickExact(cookieElement.selector);
-    }
-
-    return { success: false, message: 'No cookie banner found.' };
   }
 
   async observe(useVision: boolean = false): Promise<{
@@ -309,11 +103,11 @@ export class McpTools {
   }> {
     const page = this.browser.getPage();
     const url = page.url();
+    // Use the Extractor to find elements (pierces Shadow DOM/Frames)
     const extractor = new SelectorExtractor(page);
     const selectors = await extractor.extractAllInteractive();
 
     if (useVision) {
-      // Use a safer screenshot approach (return existing if current fails)
       const screenshot = await this.browser.screenshot();
       return {
         url,
@@ -323,6 +117,36 @@ export class McpTools {
     }
 
     return { url, selectors };
+  }
+
+  // --- RESTORED: Handle Cookie Banner ---
+  async handleCookieBanner(elements?: ElementInfo[]): Promise<ExecutionResult> {
+    // The BrowserManager has a robust implementation, call it directly
+    const info = await this.browser.handleCookieBanner();
+    if (info) {
+        return { success: true, message: 'Cookie banner dismissed', selectors: [info] };
+    }
+    return { success: false, message: 'No cookie banner found or dismissed' };
+  }
+
+  // --- RESTORED: Click With Heuristics (for server.ts single-step mode) ---
+  async clickWithHeuristics(prompt: string, candidates: any[]): Promise<ExecutionResult> {
+    // 1. Simple text matching first
+    const tokens = prompt.toLowerCase().split(/\s+/).filter(t => t.length > 3);
+    
+    // Find best match among candidates (which are typically AiElement objects from server.ts)
+    const best = candidates.find(c => {
+        const text = (c.text || c.ariaLabel || '').toLowerCase();
+        return tokens.some(t => text.includes(t));
+    });
+
+    if (best && best.selector) {
+        return this.clickExact(best.selector);
+    }
+
+    // 2. If no candidate matched, rely on the LLM to pick via the server.ts flow
+    // or fail gracefully. For now, we return failure so the AI can try again or user can clarify.
+    return { success: false, message: `Could not confidently identify an element for "${prompt}"` };
   }
 
   async generateSelenium(
@@ -337,9 +161,7 @@ export class McpTools {
   private calculateDomFingerprint(elements: ElementInfo[]): string {
     const signature = elements
         .filter(el => el.visible && ['button', 'a', 'input', 'select', 'textarea'].includes(el.tagName))
-        .map(el => {
-            return `${el.tagName}|${(el.text||'').slice(0,10)}|${el.roleHint}`;
-        })
+        .map(el => `${el.tagName}|${(el.text||'').slice(0,10)}|${el.roleHint}`)
         .join(';');
     
     let hash = 0;
@@ -370,19 +192,17 @@ export class McpTools {
     const page = this.browser.getPage();
     const urlInGoal = this.extractUrlFromPrompt(goal);
     
-    // Initial Navigation
+    // 1. Initial Navigation
     if (urlInGoal) {
         const currentUrl = page.url();
         if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
+            console.log(`[Agent] Initial navigation to ${urlInGoal}`);
             await this.navigate(urlInGoal);
-            // Double check: Wait specifically for Inputs if "Login" is in the goal
+            
+            // Wait for Login fields if relevant
             if (goal.toLowerCase().includes('login')) {
-                console.log("[Agent] Waiting for login fields...");
-                try {
-                    await page.waitForSelector('input', { timeout: 5000 });
-                } catch {
-                    console.log("[Agent] Warning: No inputs found immediately.");
-                }
+                 console.log("[Agent] Waiting for login fields...");
+                 try { await page.waitForSelector('input', { timeout: 5000 }); } catch {}
             }
         }
     }
@@ -394,10 +214,10 @@ export class McpTools {
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
       
-      // Observation with Retry
+      // 2. Observation (With Retry for Empty Pages)
       let observation = await this.observe(true);
       if (!observation.selectors || observation.selectors.length === 0) {
-          console.log("Empty page detected. Waiting...");
+          console.log("Empty page detected. Waiting 3s...");
           await page.waitForTimeout(3000);
           observation = await this.observe(true);
       }
@@ -405,45 +225,41 @@ export class McpTools {
       const elements = observation.selectors ?? [];
       const currentFingerprint = this.calculateDomFingerprint(elements);
       
+      // 3. Loop Detection
       let feedbackForPlanner = '';
       if (stepNumber > 1 && lastFingerprint === currentFingerprint) {
           const lastAction = steps[steps.length - 1]?.action;
           if (lastAction && (lastAction.type === 'click' || lastAction.type === 'navigate')) {
-              let burnedLabel = '';
-              if (lastAction.type === 'click' && lastAction.elementId) {
-                  const lastCmd = this.sessionHistory[this.sessionHistory.length - 1];
-                  const match = lastCmd?.description?.match(/"([^"]+)"/); 
-                  if (match) burnedLabel = match[1];
-              }
+              // Extract what we tried to click
+              const lastCmd = this.sessionHistory[this.sessionHistory.length - 1];
+              const match = lastCmd?.description?.match(/"([^"]+)"/);
+              const burnedLabel = match ? match[1] : null;
 
               if (burnedLabel && burnedLabel.length > 2) {
                   this.agentContext.ineffectivePhrases.add(burnedLabel);
-                  feedbackForPlanner = `CRITICAL: Clicking "${burnedLabel}" changed NOTHING. It is broken or requires a HOVER. Mark it as 'Ineffective' and DO NOT click it again. Try a different strategy.`; 
+                  feedbackForPlanner = `CRITICAL: Clicking "${burnedLabel}" did nothing. DO NOT click it again. Try a different element.`; 
               } else {
-                  feedbackForPlanner = `CRITICAL: The last action had NO EFFECT on the page state. Do not repeat it.`; 
+                  feedbackForPlanner = `CRITICAL: Last action had NO EFFECT. Choose a different action.`; 
               }
           }
       }
 
-      // FIX 2: Strict "Login First" Logic in the Prompt
-      // We inject a specific instruction if we detect we are likely on a login page
+      // 4. Inject Login Awareness
       const hasPasswordField = elements.some(el => 
         (el.attributes?.type === 'password') || 
         (el.text?.toLowerCase().includes('password')) ||
         (el.placeholder?.toLowerCase().includes('password'))
       );
-      
-      let systemInstruction = "";
       if (hasPasswordField && stepNumber < 5) {
-          systemInstruction = "CRITICAL: You are on a LOGIN PAGE. You MUST fill in the Username and Password and click Login. DO NOT attempt to click other menu links (like 'Reports') until you have successfully logged in.";
+          feedbackForPlanner += "\nCRITICAL: You are on a LOGIN PAGE. Fill Username & Password first.";
       }
 
-      // Pass this new instruction to planNextAgentAction
+      // 5. Plan Next Move
       let nextAction = await this.planNextAgentAction(
           goal, 
           elements, 
           this.agentContext.pastActions, 
-          feedbackForPlanner + "\n" + systemInstruction, 
+          feedbackForPlanner, 
           this.agentContext.ineffectivePhrases,
           observation.screenshot
       );
@@ -455,14 +271,15 @@ export class McpTools {
           data: { role: 'agent-reasoning', thought: nextAction.thought }
       });
 
+      // 6. Execute
       const urlBefore = page.url();
       let actionSuccess = false;
       let actionMessage = '';
-      
       let retryCount = 0;
+
       while (retryCount <= 1 && !actionSuccess) {
            this.agentCommandBuffer = []; 
-           const result = await this.executeAgentAction(nextAction, elements);
+           const result = await this.executeAgentAction(nextAction, elements); // elements param is now mostly unused but kept for fallback
            actionSuccess = result.success;
            actionMessage = result.message;
            
@@ -493,6 +310,7 @@ export class McpTools {
 
       lastFingerprint = currentFingerprint;
       
+      // Safety Valve: Force scroll if stuck
       const last3 = this.agentContext.pastActions.slice(-3);
       if (last3.length === 3 && last3.every(a => a === last3[0]) && !isFinished) {
           await this.browser.scroll(undefined, 'down');
@@ -511,18 +329,22 @@ export class McpTools {
     };
   }
 
-  // --- FIX 2: IMPROVED PARSING & SAFETY ---
+  // --- PARSING ---
   private parseAgentActionResponse(responseText: string): AgentAction {
-    const jsonStr = this.extractBalancedJson(responseText);
+    // Basic cleanup
+    let clean = responseText.replace(/```json\s*|\s*```/gi, '').trim();
+    const jsonStr = this.extractBalancedJson(clean);
+    
     if (!jsonStr) {
-      return { type: 'wait', durationMs: 1000, thought: 'Invalid AI JSON.' };
+       // Fallback: if LLM just replied text, treat as wait/think
+       return { type: 'wait', durationMs: 1000, thought: responseText.slice(0, 100) };
     }
+
     try {
       const parsed = JSON.parse(jsonStr);
-      // Fallback: If AI puts 'value' instead of 'text' for type actions, map it.
-      if (parsed.type === 'type' && !parsed.text && parsed.value) {
-          parsed.text = parsed.value;
-      }
+      // Fix common LLM mistakes
+      if (parsed.type === 'type' && !parsed.text && parsed.value) parsed.text = parsed.value;
+      if (!parsed.thought) parsed.thought = "Executing action...";
       return parsed as AgentAction;
     } catch (e) {
       return { type: 'wait', durationMs: 1000, thought: 'Malformed AI JSON.' };
@@ -530,20 +352,19 @@ export class McpTools {
   }
 
   private extractBalancedJson(str: string): string | null {
-    let openBraces = 0;
-    let startIndex = -1;
-    for (let i = 0; i < str.length; i++) {
-      if (str[i] === '{') {
-        if (openBraces === 0) startIndex = i;
-        openBraces++;
-      } else if (str[i] === '}') {
-        openBraces--;
-        if (openBraces === 0 && startIndex !== -1) return str.substring(startIndex, i + 1);
-      }
+    const start = str.indexOf('{');
+    if (start === -1) return null;
+    let balance = 0;
+    for (let i = start; i < str.length; i++) {
+      if (str[i] === '{') balance++;
+      else if (str[i] === '}') balance--;
+      
+      if (balance === 0) return str.substring(start, i + 1);
     }
     return null;
   }
 
+  // --- THE FIXED BRAIN ---
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
@@ -553,140 +374,154 @@ export class McpTools {
     screenshot?: string
   ): Promise<AgentAction> {
     
-    // FIX 1: Debug Log - See exactly what the AI sees
-    console.log(`[Planner] Planning with ${elements.length} elements.`);
+    // 1. Fail Fast
     if (elements.length === 0) {
-        // CRITICAL: Fail fast if no elements
-        return { type: 'wait', durationMs: 3000, thought: 'CRITICAL: No interactive elements found. The page might be loading or blocked. I will wait.' };
+        return { type: 'wait', durationMs: 3000, thought: 'CRITICAL: No interactive elements found. Page likely loading.' };
     }
-
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
+    // 2. Filter & Map Elements
+    // CRITICAL: We create a derived list 'validElements' that removes junk.
+    // The LLM sees indices 0..N of THIS list.
     const validElements = elements.filter(el => {
         const text = (el.text || '').trim();
         const label = (el.ariaLabel || '').trim();
-        if (ineffectivePhrases.has(text)) return false;
-        if (ineffectivePhrases.has(label)) return false;
-        for (const badPhrase of ineffectivePhrases) {
-            if (text.includes(badPhrase) || label.includes(badPhrase)) return false;
+        // Exact block
+        if (ineffectivePhrases.has(text) || ineffectivePhrases.has(label)) return false;
+        // Semantic block
+        for (const bad of ineffectivePhrases) {
+            if (text.includes(bad) || label.includes(bad)) return false;
         }
         return true;
     });
 
-    const elementList = validElements.slice(0, 150).map((el, idx) => ({
-        id: `el_${idx}`, 
+    // We send a lightweight version to the LLM to prevent Token Limit errors
+    const elementList = validElements.slice(0, 100).map((el, idx) => ({
+        id: `el_${idx}`,  // Matches the index in 'validElements'
         tag: el.tagName,
         text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
         role: el.roleHint,
-        state: el.expanded ? 'OPEN' : 'CLOSED', 
+        label: (el.ariaLabel || '').slice(0, 50),
+        ph: (el.placeholder || ''),
+        type: el.attributes?.type
     }));
 
-    // --- FIX 3: EXPLICIT JSON EXAMPLES FOR TYPING ---
     const prompt = `
-SYSTEM: You are an intelligent autonomous agent.
+SYSTEM: Intelligent Web Agent.
 GOAL: ${goal}
 
-HISTORY (Last 5 steps):
-${actionHistory.join('\n')}
+HISTORY:
+${actionHistory.slice(-5).join('\n')}
 
-**CRITICAL FEEDBACK:**
-${feedbackForPlanner || "None. Proceed."} 
+FEEDBACK: ${feedbackForPlanner || "None."}
+DEAD ENDS: ${Array.from(ineffectivePhrases).join(', ')}
 
-**DEAD ENDS (Do not click):**
-${Array.from(ineffectivePhrases).join(', ')}
-
-AVAILABLE INTERACTIVE ELEMENTS:
+ELEMENTS:
 ${JSON.stringify(elementList)}
 
 INSTRUCTIONS:
-1. **Analyze Feedback:** If last action failed, CHANGE strategy.
-2. **Typing:** If the goal is to type, use { "type": "type", "elementId": "el_X", "text": "YOUR TEXT", "thought": "..." }.
-3. **Menu:** If a menu click failed, it might need a hover or is already open.
-4. **No Loops:** Do not repeat the exact same action.
+1. **Login:** If you see username/password fields, FILL THEM.
+2. **Type:** Use { "type": "type", "elementId": "el_X", "text": "...", "thought": "..." }
+3. **Click:** Use { "type": "click", "elementId": "el_X", "thought": "..." }
+4. **Retry:** If "el_X" failed before, choose a different one.
 
-RETURN ONLY JSON matching these shapes:
-- { "type": "click", "elementId": "el_X", "thought": "..." }
-- { "type": "type", "elementId": "el_X", "text": "value", "thought": "..." }
-- { "type": "scroll", "direction": "down", "thought": "..." }
-- { "type": "finish", "thought": "...", "summary": "..." }
+RETURN ONLY JSON.
 `;
 
     try {
-        const result = await this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any);
-        const response = (result as any).response?.text?.() ?? '';
+        // API RETRY LOGIC (Fixes "Planner Crashed")
+        let response = '';
+        let attempts = 0;
+        while (attempts < 3) {
+            try {
+                const result = await this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any);
+                response = (result as any).response?.text?.() ?? '';
+                break;
+            } catch (e) {
+                attempts++;
+                await new Promise(r => setTimeout(r, 2000));
+                if (attempts === 3) throw e;
+            }
+        }
+
         const parsed = this.parseAgentActionResponse(response);
         
-        if ('elementId' in parsed && parsed.elementId) {
+        // --- CRITICAL FIX: RESOLVE ID TO SELECTOR HERE ---
+        // FIX: Ensure we only access elementId on types that support it
+        if ((parsed.type === 'click' || parsed.type === 'type' || parsed.type === 'select_option') && parsed.elementId) {
             const match = parsed.elementId.match(/el_(\d+)/);
             if (match) {
                 const idx = parseInt(match[1]);
-                const el = validElements[idx]; 
+                const el = validElements[idx]; // Map using VALID elements list
                 if (el) {
-                    if('selector' in parsed){
-                        parsed.selector = el.selector || el.cssSelector;
-                    }
-                    delete parsed.elementId; 
+                    parsed.selector = el.cssSelector || el.selector || el.xpath;
+                } else {
+                     return { type: 'wait', durationMs: 2000, thought: `AI hallucinated ID ${parsed.elementId}. Waiting.` };
                 }
             }
         }
         return parsed;
+
     } catch (err: any) {
-        // FIX 2: EXPOSE THE ERROR
-        const errorMessage = err.message || String(err);
-        console.error('[Planner Error]', errorMessage);
-        
-        // Return a wait action but INCLUDE the error in the thought so it shows in the UI
+        console.error('[Planner Error]', err.message);
         return { 
             type: 'wait', 
             durationMs: 3000, 
-            thought: `Planner crashed: ${errorMessage.substring(0, 100)}. Retrying...` 
+            thought: `Planner API Error: ${err.message}. Retrying...` 
         };
     }
   }
 
   private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<any> {
+    // 1. CLICK
     if (action.type === 'click') {
       if (action.selector) {
         return await this.clickExact(action.selector);
-      } else if (action.elementId) {
-        return this.click(action.elementId, elements);
       }
-    } else if (action.type === 'type') {
+      return { success: false, message: "Missing selector for click" };
+    } 
+    // 2. TYPE
+    else if (action.type === 'type') {
       if (action.selector) {
         return await this.type(action.selector, action.text);
-      } else if (action.elementId) {
-        return this.type(action.elementId, action.text, elements);
       }
-    } else if (action.type === 'navigate') {
+      return { success: false, message: "Missing selector for type" };
+    } 
+    // 3. NAVIGATE
+    else if (action.type === 'navigate') {
       return this.navigate(action.url);
-    } else if (action.type === 'scroll') {
-      await this.browser.scroll(action.elementId, action.direction);
+    } 
+    // 4. SCROLL
+    else if (action.type === 'scroll') {
+      await this.browser.scroll(action.elementId, action.direction); // BrowserManager handles generic scrolling if elementId is missing
       return { success: true, message: 'Scrolled' };
-    } else if (action.type === 'wait') {
+    } 
+    // 5. WAIT
+    else if (action.type === 'wait') {
       await new Promise((r) => setTimeout(r, action.durationMs));
       return { success: true, message: 'Waited' };
-    } else if (action.type === 'finish') {
+    } 
+    // 6. FINISH
+    else if (action.type === 'finish') {
       return { success: true, message: action.summary };
     }
     
-    return { success: false, message: "Action execution failed or action not recognized" };
+    return { success: false, message: "Unknown action type" };
   }
 
   private describeAction(action: AgentAction, success: boolean): string {
     const status = success ? 'SUCCESS' : 'FAIL';
-    switch (action.type) {
-      case 'click':
-        return `[${status}] Click ${action.selector || action.elementId}`;
-      case 'type':
-        return `[${status}] Type "${action.text}" into ${action.selector || action.elementId}`;
-      case 'scroll':
-        return `[${status}] Scroll ${action.direction}`;
-      case 'navigate':
-        return `[${status}] Navigate to ${action.url}`;
-      case 'finish':
-        return `[${status}] Finish: ${action.summary}`;
-      default:
-        return `[${status}] Unknown action`;
+    
+    // FIX: Safely extract target only for supported types
+    let tgt = 'page';
+    if (action.type === 'click' || action.type === 'type' || action.type === 'select_option') {
+        tgt = action.selector || action.elementId || 'page';
     }
+
+    if (action.type === 'type') return `[${status}] Type "${action.text}" into ${tgt}`;
+    if (action.type === 'click') return `[${status}] Click ${tgt}`;
+    if (action.type === 'navigate') return `[${status}] Navigate to ${action.url}`;
+    
+    return `[${status}] ${action.type}`;
   }
 }
