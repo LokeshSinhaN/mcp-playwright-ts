@@ -30,6 +30,8 @@ export interface ElementInfo {
   // NEW: Flag to tell the AI "You can scroll this specific element!"
   scrollable?: boolean; 
   
+  isFloating?: boolean;
+
   // True if this looks like a search input field.
   searchField?: boolean;
   // Approximate vertical region of the page.

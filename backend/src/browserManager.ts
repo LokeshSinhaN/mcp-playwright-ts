@@ -472,34 +472,68 @@ export class BrowserManager {
   }
 
   /**
-   * Universal Scroll: Scrolls a specific element OR the window.
-   * This handles virtual lists, dropdowns, and sidebars.
-   */
-  async scroll(selector: string | undefined, direction: 'up' | 'down'): Promise<ExecutionResult> {
+ * Universal Scroll: Automatically finds the best scroll target if none is provided.
+ */
+async scroll(selector: string | undefined, direction: 'up' | 'down'): Promise<ExecutionResult> {
     const page = this.getPage();
-    const scrollAmount = direction === 'up' ? -300 : 300;
+    const scrollAmount = direction === 'up' ? -400 : 400; // Increased amount for efficiency
+
+    let targetLocator: Locator;
 
     if (selector) {
-        // Scroll a SPECIFIC container (The dropdown list)
-        const loc = await this.smartLocate(selector, 2000);
-        
-        // 1. Try JS ScrollBy (Fast & Universal)
-        try {
-            await loc.evaluate((el: any, amount: number) => {
-                el.scrollBy({ top: amount, behavior: 'smooth' });
-            }, scrollAmount);
-            await page.waitForTimeout(500); // Wait for list to render
-            return { success: true, message: `Scrolled element ${direction}` };
-        } catch (e) {
-            // Fallback
+        // A specific container was requested
+        targetLocator = await this.smartLocate(selector, 2000);
+    } else {
+        // INTELLIGENT FALLBACK: Find the largest scrollable container
+        // This fixes the "list inside a div" issue
+        const scrollableSelector = await page.evaluate(() => {
+            const all = document.querySelectorAll('*');
+            let largestArea = 0;
+            let bestSelector = 'body'; // Default to body/window
+
+            for (const el of Array.from(all)) {
+                const style = window.getComputedStyle(el);
+                const isScrollable = (style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight;
+                
+                if (isScrollable) {
+                    const rect = el.getBoundingClientRect();
+                    const area = rect.width * rect.height;
+                    // Prefer larger areas (main content) over tiny scrollbars
+                    if (area > largestArea && area > 20000) { 
+                        largestArea = area;
+                        // Generate a simple unique selector path
+                        bestSelector = (el.id) ? `#${el.id}` : el.tagName; 
+                        // (Ideally use a robust selector generator logic here, simplified for brevity)
+                    }
+                }
+            }
+            return bestSelector === 'body' ? null : bestSelector; // Return null to use window scroll
+        });
+
+        if (scrollableSelector) {
+            console.log(`[AutoScroll] Detected scrollable container: ${scrollableSelector}`);
+            targetLocator = page.locator(scrollableSelector).first();
+        } else {
+            // Standard window scroll
+            await page.mouse.wheel(0, scrollAmount);
+            await page.waitForTimeout(500);
+            return { success: true, message: `Scrolled page ${direction}` };
         }
     }
 
-    // Default: Scroll the main window
-    await page.mouse.wheel(0, scrollAmount);
-    await page.waitForTimeout(500);
-    return { success: true, message: `Scrolled page ${direction}` };
-  }
+    // Perform the scroll on the identified locator
+    try {
+        await targetLocator.evaluate((el: any, amount: number) => {
+            el.scrollBy({ top: amount, behavior: 'smooth' });
+        }, scrollAmount);
+        await page.waitForTimeout(700); // Wait longer for rendering
+        return { success: true, message: `Scrolled container ${direction}` };
+    } catch (e) {
+        // Fallback if locator fails
+        await page.mouse.wheel(0, scrollAmount);
+        return { success: true, message: `Scrolled page (fallback) ${direction}` };
+    }
+}
 
   /**
    * Smart wait that checks for specific conditions rather than just time.

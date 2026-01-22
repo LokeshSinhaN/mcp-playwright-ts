@@ -937,6 +937,28 @@ export class McpTools {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
+   * Calculates a simple fingerprint of the DOM's interactive elements to detect state changes.
+   * This helps the agent notice when an action failed to produce any meaningful change.
+   */
+  private calculateDomFingerprint(elements: ElementInfo[]): string {
+    // Create a string representing the current state of interactive elements
+    // We use IDs, text, and visibility to determine "uniqueness"
+    const signature = elements
+        .filter(el => el.visible)
+        .map(el => `${el.tagName}#${el.id || ''}.${el.className || ''}[${el.text || ''}]`)
+        .join('|');
+    
+    // Simple numeric hash for efficiency
+    let hash = 0;
+    for (let i = 0; i < signature.length; i++) {
+        const char = signature.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash |= 0;
+    }
+    return hash.toString(16);
+  }
+
+  /**
    * Run an autonomous agent that accomplishes a high-level goal through
    * an observe-think-act loop with self-healing capabilities.
    *
@@ -961,6 +983,7 @@ async runAutonomousAgent(
   const steps: AgentStepResult[] = [];
   const failedElements: Set<string> = new Set();
   const actionHistory: string[] = [];
+  let lastDomFingerprint = '';
 
   // Simple context for tracking LLM failures only
   this.agentContext = { consecutiveFailures: 0 };
@@ -987,6 +1010,17 @@ async runAutonomousAgent(
     // OBSERVE - Get current page state
     const observation = await this.observe();
     const elements = observation.selectors ?? [];
+    const currentFingerprint = this.calculateDomFingerprint(observation.selectors || []);
+
+    // DETECT STAGNATION
+    let feedbackForPlanner = '';
+    if (lastDomFingerprint && currentFingerprint === lastDomFingerprint && stepNumber > 1) {
+        console.warn('[SmartAgent] State stagnation detected (DOM did not change).');
+        feedbackForPlanner = `WARNING: The last action did NOT change the page state (DOM fingerprint remained identical). The element might not be clickable, or the page is loading slowly. DO NOT repeat the exact same action. Try a different element or check if a specific filter/menu needs to be opened first.`;
+        
+        // Mark the previous action as suspicious in the prompt context
+        this.updateAgentContext({ consecutiveFailures: (this.agentContext?.consecutiveFailures ?? 0) + 1 });
+    }
     
     // THINK - Let the LLM plan the next action (NO heuristic overrides)
     let nextAction = await this.planNextAgentAction(
@@ -994,6 +1028,7 @@ async runAutonomousAgent(
       elements,
       actionHistory,
       failedElements,
+      feedbackForPlanner,
       observation.screenshot,
     );
 
@@ -1115,6 +1150,7 @@ async runAutonomousAgent(
         }
     });
     
+    lastDomFingerprint = currentFingerprint;
     // SAFETY: If we failed 3 steps in a row, pause to let the user intervene? 
     // For now, we just continue, but the 'failedElements' set helps avoid repeating mistakes.
   }
@@ -1297,6 +1333,7 @@ async runAutonomousAgent(
     elements: ElementInfo[],
     actionHistory: string[],
     failedElements: Set<string>,
+    feedbackForPlanner: string,
     screenshot?: string
   ): Promise<AgentAction> {
     if (!this.model) return { type: 'finish', thought: 'No AI model configured', summary: 'No AI' };
@@ -1336,34 +1373,26 @@ async runAutonomousAgent(
 
 GOAL: ${goal}
 
-COMPLETED ACTIONS:
+COMPLETED ACTIONS (History):
 ${actionHistory.slice(-8).join('\n') || '(none yet)'}
+
+LAST FEEDBACK: ${feedbackForPlanner || 'None'}
 
 AVAILABLE ELEMENTS:
 ${JSON.stringify(elementList, null, 1)}
 
-FAILED ELEMENTS (avoid these): ${Array.from(failedElements).join(', ') || 'none'}
-
 INSTRUCTIONS:
-1. Analyze the GOAL and COMPLETED ACTIONS to determine what step comes next
-2. Find the right element from AVAILABLE ELEMENTS
-3. Return ONLY a JSON object with your action
+1. REVIEW the "LAST FEEDBACK". If the previous action failed or had no effect, DO NOT TRY IT AGAIN using the same method.
+2. If you are stuck in a loop (e.g., clicking "Reports" repeatedly):
+   - STOP clicking the same link.
+   - Look for a different way (e.g., is there a sidebar icon? Is it already open?).
+   - Try scrolling the *container* if elements are missing.
+3. For Dropdowns:
+   - If you clicked "Select" and no options appeared, the click might have been intercepted.
+   - Try clicking the *label* next to the dropdown or a different part of the button.
 
-ACTION TYPES:
-- click: {"type":"click", "elementId":"el_X", "thought":"why"}
-- type: {"type":"type", "elementId":"el_X", "text":"value", "thought":"why"}
-- scroll: {"type":"scroll", "direction":"down", "thought":"why"}
-- wait: {"type":"wait", "durationMs":1000, "thought":"why"}
-- finish: {"type":"finish", "thought":"why", "summary":"what was done"}
-
-CRITICAL RULES:
-- DO NOT repeat actions that are already in COMPLETED ACTIONS
-- If you already clicked "Reports", "Patients", etc. - move to the NEXT step
-- For login: type username, type password, then click the submit/login button
-- For menus: click parent first, then child items appear
-- Return "finish" ONLY when the entire GOAL is complete
-
-Return ONLY valid JSON, no other text:`;
+RETURN ONLY JSON.
+`;
 
     try {
       const llmResult = await this.withTimeout(

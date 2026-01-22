@@ -47,9 +47,16 @@ export class SelectorExtractor {
         // NEW: Explicitly capture potential scroll containers
         'ul', 
         'ol',
-        'div[role="listbox"]',
         'div[style*="overflow"]',
         'div[class*="scroll"]',
+        // Fix: "Ghost Element" Extraction (Fix Dropdown Blindness)
+        '[role="listbox"]', // Standard ARIA dropdowns
+        '[role="menu"]',
+        '[role="presentation"]', // Often used erroneously for wrappers
+        '.dropdown-menu',
+        '.MuiPopover-root', // Material UI
+        '.cdk-overlay-container', // Angular Material
+        '[style*="z-index"]', // Catch floating elements
       ].join(', ')
     );
 
@@ -94,6 +101,9 @@ export class SelectorExtractor {
       const rect = el.getBoundingClientRect();
       const style = win ? win.getComputedStyle(el) : null;
       
+      const zIndex = style ? parseInt(style.zIndex || '0', 10) : 0;
+      const isFloating = zIndex > 100 || (style && (style.position === 'absolute' || style.position === 'fixed'));
+
       // NEW: Universal Scroll Detection
       const isScrollable = style && (
         (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
@@ -218,6 +228,7 @@ export class SelectorExtractor {
         visible,
         roleHint,
         scrollable: isScrollable,
+        isFloating,
         searchField: isSearchField,
         region,
         boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
@@ -260,6 +271,7 @@ export class SelectorExtractor {
       isVisible: base.visible,
       roleHint: base.roleHint,
       scrollable: base.scrollable,
+      isFloating: base.isFloating,
       searchField: base.searchField,
       region: base.region,
       boundingBox: base.boundingBox,
