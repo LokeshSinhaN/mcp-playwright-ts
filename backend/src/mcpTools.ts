@@ -63,11 +63,11 @@ export class McpTools {
   }
 
   // --- ROBUST CLICK ---
-  async clickExact(selector: string): Promise<ExecutionResult> {
+  async clickExact(selector: string, description?: string): Promise<ExecutionResult> {
     const command: ExecutionCommand = {
       action: 'click',
       target: selector,
-      description: `Clicked element ${selector}`,
+      description: description || `Clicked element ${selector}`,
     };
     try {
       // Use BrowserManager's robust click (handles frames/hover)
@@ -100,9 +100,12 @@ export class McpTools {
     url: string;
     selectors: ElementInfo[];
     screenshot?: string;
+    title?: string;
   }> {
     const page = this.browser.getPage();
     const url = page.url();
+    const title = await page.title().catch(() => '');
+    
     // Use the Extractor to find elements (pierces Shadow DOM/Frames)
     const extractor = new SelectorExtractor(page);
     const selectors = await extractor.extractAllInteractive();
@@ -111,17 +114,16 @@ export class McpTools {
       const screenshot = await this.browser.screenshot();
       return {
         url,
+        title,
         selectors,
         screenshot: screenshot.replace('data:image/png;base64,', ''),
       };
     }
 
-    return { url, selectors };
+    return { url, title, selectors };
   }
 
-  // --- RESTORED: Handle Cookie Banner ---
   async handleCookieBanner(elements?: ElementInfo[]): Promise<ExecutionResult> {
-    // The BrowserManager has a robust implementation, call it directly
     const info = await this.browser.handleCookieBanner();
     if (info) {
         return { success: true, message: 'Cookie banner dismissed', selectors: [info] };
@@ -129,12 +131,8 @@ export class McpTools {
     return { success: false, message: 'No cookie banner found or dismissed' };
   }
 
-  // --- RESTORED: Click With Heuristics (for server.ts single-step mode) ---
   async clickWithHeuristics(prompt: string, candidates: any[]): Promise<ExecutionResult> {
-    // 1. Simple text matching first
     const tokens = prompt.toLowerCase().split(/\s+/).filter(t => t.length > 3);
-    
-    // Find best match among candidates (which are typically AiElement objects from server.ts)
     const best = candidates.find(c => {
         const text = (c.text || c.ariaLabel || '').toLowerCase();
         return tokens.some(t => text.includes(t));
@@ -143,9 +141,6 @@ export class McpTools {
     if (best && best.selector) {
         return this.clickExact(best.selector);
     }
-
-    // 2. If no candidate matched, rely on the LLM to pick via the server.ts flow
-    // or fail gracefully. For now, we return failure so the AI can try again or user can clarify.
     return { success: false, message: `Could not confidently identify an element for "${prompt}"` };
   }
 
@@ -173,18 +168,15 @@ export class McpTools {
     return hash.toString(16);
   }
 
-  // --- NEW: Deterministic Planner (Saves API Calls) ---
-  private tryDeterministicPlan(goal: string, elements: ElementInfo[]): AgentAction | null {
+  // --- IMPROVED: Deterministic Planner (Loop-Proof & Context Aware) ---
+  private tryDeterministicPlan(goal: string, elements: ElementInfo[], currentTitle: string, currentUrl: string): AgentAction | null {
       const lowerGoal = goal.toLowerCase();
       
-      // 1. Check for "Click [Text]" pattern
-      // Simple heuristic: look for matches of significant words from the goal in the elements
       const potentialTargets = elements.filter(el => {
           const text = (el.text || '').toLowerCase();
           const label = (el.ariaLabel || '').toLowerCase();
-          const context = (el.context || '').toLowerCase(); // Use the new context
+          const context = (el.context || '').toLowerCase(); // Critical for "Insurance" label
           
-          // Strict: The element text must appear in the goal
           if (text.length > 2 && lowerGoal.includes(text)) return true;
           if (label.length > 2 && lowerGoal.includes(label)) return true;
           // Context match (e.g. goal "Insurance", context "Insurance")
@@ -193,39 +185,62 @@ export class McpTools {
           return false;
       });
 
-      // Filter out low-quality matches
-      const bestTargets = potentialTargets.filter(t => {
-          // If we have "Patient Master List" in goal, "Patient" is a weak match, "Patient Master List" is strong.
-          // We prefer longer matches.
-          return true; 
-      }).sort((a, b) => (b.text?.length || 0) - (a.text?.length || 0));
+      // Filter matches
+      const bestTargets = potentialTargets.sort((a, b) => (b.text?.length || 0) - (a.text?.length || 0));
 
       if (bestTargets.length > 0) {
           const best = bestTargets[0];
-          // Determine action type
+          const bestText = (best.text || best.context || best.ariaLabel || '').toLowerCase().trim();
+
+          // --- FIX 1: GLOBAL SESSION HISTORY CHECK (The Loop Killer) ---
+          // If we have EVER clicked this specific text in this session, assume it's done.
+          const alreadyClickedInSession = this.sessionHistory.some(cmd => {
+              const desc = (cmd.description || '').toLowerCase();
+              return desc.includes(`"${bestText}"`) || desc.includes(` ${bestText} `) || desc.includes(`'${bestText}'`);
+          });
+          
+          if (alreadyClickedInSession) {
+             console.log(`[Deterministic] Skipping "${bestText}" - already interacted in this session.`);
+             return null; // YIELD TO LLM
+          }
+
+          // --- FIX 2: GOAL AWARENESS (The Context Fix) ---
+          // If the page Title or URL already contains the navigation target, stop clicking nav links.
+          // Example: Goal "Navigate to Patient Master List" and Title is "Patient Master List".
+          if (lowerGoal.includes('navigate') && bestText.length > 4) {
+             const titleClean = currentTitle.toLowerCase();
+             const urlClean = currentUrl.toLowerCase();
+             
+             // If the button text (e.g. "Patient Master List") is already in the title/url, we are likely THERE.
+             if (titleClean.includes(bestText) || urlClean.includes(bestText.replace(/\s/g, ''))) {
+                  console.log(`[Deterministic] Skipping "${bestText}" - seems we are already on this page.`);
+                  return null; // YIELD TO LLM (It will move to step 2)
+             }
+          }
+          // ----------------------------------------
+
           if (lowerGoal.includes('click') || lowerGoal.includes('navigate') || lowerGoal.includes('open')) {
-              // High confidence check: If goal is "Click Reports" and we found "Reports"
               return {
                   type: 'click',
                   selector: best.selector || best.cssSelector,
-                  thought: `Deterministic: Found exact text match "${best.text || best.context}" for goal "${goal}". Skipping AI.`
+                  semanticTarget: bestText, // Pass this so we can log it properly
+                  thought: `Deterministic: Found exact text match "${best.text || best.context}" for goal. Skipping AI.`
               };
           }
           if (lowerGoal.includes('type') || lowerGoal.includes('enter')) {
-              // Extract text to type (simple quote extraction)
               const match = goal.match(/["']([^"']+)["']/);
               if (match) {
                   return {
                       type: 'type',
                       selector: best.selector || best.cssSelector,
                       text: match[1],
-                      thought: `Deterministic: Found input "${best.text}" and text "${match[1]}". Skipping AI.`
+                      thought: `Deterministic: Found input "${bestText}" and text "${match[1]}". Skipping AI.`
                   };
               }
           }
       }
       
-      return null; // Fallback to AI if not sure
+      return null; // Fallback to AI
   }
 
   // ===========================================================================
@@ -247,22 +262,36 @@ export class McpTools {
     const page = this.browser.getPage();
     const urlInGoal = this.extractUrlFromPrompt(goal);
     
-    // 1. Initial Navigation
+    // 1. Initial Navigation (Explicit Step 1)
+    let stepNumber = 0;
     if (urlInGoal) {
         const currentUrl = page.url();
-        if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
-            console.log(`[Agent] Initial navigation to ${urlInGoal}`);
+        const targetDomain = this.extractDomain(urlInGoal);
+        
+        // Only navigate if we aren't already there
+        if (currentUrl === 'about:blank' || !currentUrl.includes(targetDomain)) {
+            stepNumber++;
+            config.broadcast?.({ type: 'log', timestamp: new Date().toISOString(), message: `ai_thought: Navigating to ${urlInGoal} as the start of the session.` });
+            
             await this.navigate(urlInGoal);
+            
+            // Record this as a step
+            const navAction: AgentAction = { type: 'navigate', url: urlInGoal, thought: 'Initial navigation' };
+            steps.push({ stepNumber, action: navAction, success: true, message: `Mapsd to ${urlInGoal}`, urlBefore: 'about:blank', urlAfter: urlInGoal, stateChanged: true, retryCount: 0 });
+            
+            // Log explicitly to UI
+            config.broadcast?.({ type: 'log', timestamp: new Date().toISOString(), message: `Step ${stepNumber}: Navigated to ${urlInGoal}` });
+            
+            // Add to history so LLM knows we did it
+            this.sessionHistory.push({ action: 'navigate', target: urlInGoal, description: `Mapsd to ${urlInGoal}` });
             
             // Wait for Login fields if relevant
             if (goal.toLowerCase().includes('login')) {
-                 console.log("[Agent] Waiting for login fields...");
-                 try { await page.waitForSelector('input', { timeout: 5000 }); } catch {}
+                 try { await page.waitForSelector('input', { timeout: 4000 }); } catch {}
             }
         }
     }
 
-    let stepNumber = 0;
     let isFinished = false;
     let lastFingerprint = '';
 
@@ -272,13 +301,14 @@ export class McpTools {
       // 2. Observation (With Retry for Empty Pages)
       let observation = await this.observe(true);
       if (!observation.selectors || observation.selectors.length === 0) {
-          console.log("Empty page detected. Waiting 3s...");
-          await page.waitForTimeout(3000);
+          await page.waitForTimeout(2000);
           observation = await this.observe(true);
       }
 
       const elements = observation.selectors ?? [];
       const currentFingerprint = this.calculateDomFingerprint(elements);
+      const currentTitle = observation.title || '';
+      const currentUrl = observation.url || '';
       
       // 3. Loop Detection
       let feedbackForPlanner = '';
@@ -316,9 +346,12 @@ export class McpTools {
           this.agentContext.pastActions, 
           feedbackForPlanner, 
           this.agentContext.ineffectivePhrases,
+          currentTitle,
+          currentUrl,
           observation.screenshot
       );
 
+      // Log thought to UI
       config.broadcast?.({
           type: 'log',
           timestamp: new Date().toISOString(),
@@ -334,12 +367,14 @@ export class McpTools {
 
       while (retryCount <= 1 && !actionSuccess) {
            this.agentCommandBuffer = []; 
-           const result = await this.executeAgentAction(nextAction, elements); // elements param is now mostly unused but kept for fallback
+           const result = await this.executeAgentAction(nextAction, elements); 
            actionSuccess = result.success;
            actionMessage = result.message;
            
            if (actionSuccess) {
-               if (this.agentCommandBuffer.length > 0) this.sessionHistory.push(...this.agentCommandBuffer);
+               if (this.agentCommandBuffer.length > 0) {
+                   this.sessionHistory.push(...this.agentCommandBuffer);
+               }
            } else {
                retryCount++;
                await page.waitForTimeout(1000);
@@ -349,6 +384,15 @@ export class McpTools {
       const actionDesc = this.describeAction(nextAction, actionSuccess);
       this.agentContext.pastActions.push(actionDesc);
       if (this.agentContext.pastActions.length > 5) this.agentContext.pastActions.shift();
+
+      // LOG STEP TO UI (The "Step X: Clicked..." log)
+      if (actionSuccess) {
+           config.broadcast?.({ 
+               type: 'log', 
+               timestamp: new Date().toISOString(), 
+               message: `Step ${stepNumber}: ${actionDesc.replace('[SUCCESS] ', '')}` 
+           });
+      }
 
       if (nextAction.type === 'finish' && actionSuccess) isFinished = true;
       
@@ -386,18 +430,15 @@ export class McpTools {
 
   // --- PARSING ---
   private parseAgentActionResponse(responseText: string): AgentAction {
-    // Basic cleanup
     let clean = responseText.replace(/```json\s*|\s*```/gi, '').trim();
     const jsonStr = this.extractBalancedJson(clean);
     
     if (!jsonStr) {
-       // Fallback: if LLM just replied text, treat as wait/think
        return { type: 'wait', durationMs: 1000, thought: responseText.slice(0, 100) };
     }
 
     try {
       const parsed = JSON.parse(jsonStr);
-      // Fix common LLM mistakes
       if (parsed.type === 'type' && !parsed.text && parsed.value) parsed.text = parsed.value;
       if (!parsed.thought) parsed.thought = "Executing action...";
       return parsed as AgentAction;
@@ -419,13 +460,15 @@ export class McpTools {
     return null;
   }
 
-  // --- THE FIXED BRAIN ---
+  // --- PLANNER ---
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
     actionHistory: string[],
     feedbackForPlanner: string,
     ineffectivePhrases: Set<string>,
+    currentTitle: string,
+    currentUrl: string,
     screenshot?: string
   ): Promise<AgentAction> {
     
@@ -435,9 +478,9 @@ export class McpTools {
     }
 
     // --- NEW: Try Deterministic Plan First ---
-    // If we are not in a retry loop (consecutiveFailures == 0), try to save tokens.
+    // Pass current title/URL to help it avoid navigation loops
     if (this.agentContext.consecutiveFailures === 0 && !feedbackForPlanner.includes('CRITICAL')) {
-        const deterministicAction = this.tryDeterministicPlan(goal, elements);
+        const deterministicAction = this.tryDeterministicPlan(goal, elements, currentTitle, currentUrl);
         if (deterministicAction) {
             return deterministicAction;
         }
@@ -447,23 +490,18 @@ export class McpTools {
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
     // 2. Filter & Map Elements
-    // CRITICAL: We create a derived list 'validElements' that removes junk.
-    // The LLM sees indices 0..N of THIS list.
     const validElements = elements.filter(el => {
         const text = (el.text || '').trim();
         const label = (el.ariaLabel || '').trim();
-        // Exact block
         if (ineffectivePhrases.has(text) || ineffectivePhrases.has(label)) return false;
-        // Semantic block
         for (const bad of ineffectivePhrases) {
             if (text.includes(bad) || label.includes(bad)) return false;
         }
         return true;
     });
 
-    // We send a lightweight version to the LLM to prevent Token Limit errors
     const elementList = validElements.slice(0, 100).map((el, idx) => ({
-        id: `el_${idx}`,  // Matches the index in 'validElements'
+        id: `el_${idx}`,  
         tag: el.tagName,
         text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
         role: el.roleHint,
@@ -495,7 +533,6 @@ RETURN ONLY JSON.
 `;
 
     try {
-        // API RETRY LOGIC (Fixes "Planner Crashed")
         let response = '';
         let attempts = 0;
         while (attempts < 3) {
@@ -512,13 +549,11 @@ RETURN ONLY JSON.
 
         const parsed = this.parseAgentActionResponse(response);
         
-        // --- CRITICAL FIX: RESOLVE ID TO SELECTOR HERE ---
-        // FIX: Ensure we only access elementId on types that support it
         if ((parsed.type === 'click' || parsed.type === 'type' || parsed.type === 'select_option') && parsed.elementId) {
             const match = parsed.elementId.match(/el_(\d+)/);
             if (match) {
                 const idx = parseInt(match[1]);
-                const el = validElements[idx]; // Map using VALID elements list
+                const el = validElements[idx];
                 if (el) {
                     parsed.selector = el.cssSelector || el.selector || el.xpath;
                 } else {
@@ -539,35 +574,36 @@ RETURN ONLY JSON.
   }
 
   private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<any> {
-    // 1. CLICK
+    // --- FIX: ENHANCED DESCRIPTION FOR HISTORY TRACKING ---
+    // We construct a descriptive string (e.g., "Clicked 'Patients'") so the
+    // Deterministic Planner can see "Patients" in the history later.
+    const desc = (action as any).semanticTarget 
+        ? `${action.type === 'type' ? 'Typed into' : 'Clicked'} "${(action as any).semanticTarget}"`
+        : undefined;
+
     if (action.type === 'click') {
       if (action.selector) {
-        return await this.clickExact(action.selector);
+        return await this.clickExact(action.selector, desc);
       }
       return { success: false, message: "Missing selector for click" };
     } 
-    // 2. TYPE
     else if (action.type === 'type') {
       if (action.selector) {
         return await this.type(action.selector, action.text);
       }
       return { success: false, message: "Missing selector for type" };
     } 
-    // 3. NAVIGATE
     else if (action.type === 'navigate') {
       return this.navigate(action.url);
     } 
-    // 4. SCROLL
     else if (action.type === 'scroll') {
-      await this.browser.scroll(action.elementId, action.direction); // BrowserManager handles generic scrolling if elementId is missing
+      await this.browser.scroll(action.elementId, action.direction); 
       return { success: true, message: 'Scrolled' };
     } 
-    // 5. WAIT
     else if (action.type === 'wait') {
       await new Promise((r) => setTimeout(r, action.durationMs));
       return { success: true, message: 'Waited' };
     } 
-    // 6. FINISH
     else if (action.type === 'finish') {
       return { success: true, message: action.summary };
     }
@@ -578,10 +614,9 @@ RETURN ONLY JSON.
   private describeAction(action: AgentAction, success: boolean): string {
     const status = success ? 'SUCCESS' : 'FAIL';
     
-    // FIX: Safely extract target only for supported types
     let tgt = 'page';
     if (action.type === 'click' || action.type === 'type' || action.type === 'select_option') {
-        tgt = action.selector || action.elementId || 'page';
+        tgt = (action as any).semanticTarget || action.selector || action.elementId || 'page';
     }
 
     if (action.type === 'type') return `[${status}] Type "${action.text}" into ${tgt}`;
