@@ -12,9 +12,12 @@ import {
   AgentConfig,
 } from './types';
 
+// Track context about what works and what doesn't
 interface AgentContext {
   consecutiveFailures: number;
-  ineffectivePhrases: Set<string>; 
+  // "Burnt" phrases are keywords we have already successfully clicked.
+  // We strictly ignore them to force the agent to find the *next* keyword in the goal.
+  burntPhrases: Set<string>; 
   pastActions: string[]; 
 }
 
@@ -23,7 +26,7 @@ export class McpTools {
   private agentCommandBuffer: ExecutionCommand[] | null = null;
   private agentContext: AgentContext = {
       consecutiveFailures: 0,
-      ineffectivePhrases: new Set(),
+      burntPhrases: new Set(),
       pastActions: []
   };
 
@@ -50,6 +53,8 @@ export class McpTools {
       const page = this.browser.getPage();
       await page.waitForLoadState('domcontentloaded');
       await page.waitForTimeout(2000); 
+      // Reset burnt phrases on navigation (new page = new context)
+      this.agentContext.burntPhrases.clear(); 
       return { success: true, message: `Mapsd to ${url}` };
     } catch (error: any) {
       return { success: false, message: error.message };
@@ -156,64 +161,74 @@ export class McpTools {
     return hash.toString(16);
   }
 
-  // --- INTELLIGENT DETERMINISTIC PLANNER ---
+  // --- INTELLIGENT DETERMINISTIC PLANNER (Universal Loop Killer) ---
   private tryDeterministicPlan(goal: string, elements: ElementInfo[], currentTitle: string, currentUrl: string): AgentAction | null {
       const lowerGoal = goal.toLowerCase();
       
-      // 1. STATE GUARD (The Loop Killer)
-      // If we are already on "Patient Master List", strictly IGNORE navigation keywords.
-      const onTargetPage = 
-          currentTitle.toLowerCase().includes("patient master list") || 
-          currentUrl.toLowerCase().includes("patientmasterlist");
+      // 1. UNIVERSAL STATE GUARD
+      // If the current page Title or URL *contains* a phrase from the goal, we assume that navigation step is COMPLETE.
+      // Example: Goal="Navigate to Patient Master List", Title="Patient Master List" -> IGNORE navigation buttons.
+      let blockNavigation = false;
+      const titleWords = currentTitle.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+      const urlWords = currentUrl.toLowerCase().split(/[^a-z0-9]/).filter(w => w.length > 3);
+      
+      // Check if significant title/url words appear in the goal
+      if (titleWords.some(w => lowerGoal.includes(w)) || urlWords.some(w => lowerGoal.includes(w))) {
+          // We are likely ON the target page. Block navigation links to prevent "Reports -> Reports" loop.
+          blockNavigation = true;
+      }
 
       // Filter elements
       const potentialTargets = elements.filter(el => {
           const text = (el.text || '').toLowerCase();
           const label = (el.ariaLabel || '').toLowerCase();
-          const context = (el.context || '').toLowerCase(); // "Insurance" label usually lives here
+          const context = (el.context || '').toLowerCase(); 
           
-          // STRICT RULE: If we are on the target page, ignore "Reports" and "Patients" buttons
-          if (onTargetPage) {
-              if (text.includes("reports") || text.includes("patients")) return false;
-              if (label.includes("reports") || label.includes("patients")) return false;
+          // Strict Navigation Blocking
+          if (blockNavigation) {
+              // Heuristic: If we are 'arrived', ignore buttons that look like navigation path parents
+              // This is dynamic: it ignores words that are already in the Title.
+              if (text && currentTitle.toLowerCase().includes(text)) return false; 
           }
 
+          // Match Logic
           if (text.length > 2 && lowerGoal.includes(text)) return true;
           if (label.length > 2 && lowerGoal.includes(label)) return true;
           if (context.length > 2 && lowerGoal.includes(context)) return true;
           return false;
       });
 
-      // Sort by relevance (Context matches are highest priority for dropdowns)
-      const bestTargets = potentialTargets.sort((a, b) => {
+      // Sort by relevance (Prioritize Context/Label matches over generic text)
+      const sortedTargets = potentialTargets.sort((a, b) => {
           const aContextMatch = a.context && lowerGoal.includes(a.context.toLowerCase());
           const bContextMatch = b.context && lowerGoal.includes(b.context.toLowerCase());
           
-          // Prefer elements where the 'context' (label) matches the goal
           if (aContextMatch && !bContextMatch) return -1;
           if (!aContextMatch && bContextMatch) return 1;
           
           return (b.text?.length || 0) - (a.text?.length || 0);
       });
 
-      if (bestTargets.length > 0) {
-          const best = bestTargets[0];
+      // --- CRITICAL FIX: "BURNT PHRASE" FILTERING ---
+      // We iterate through potential targets. If we find one we haven't clicked yet, we take it.
+      // If we encounter one we HAVE clicked, we SKIP it and look for the next match in the goal.
+      for (const best of sortedTargets) {
           const bestText = (best.text || best.context || best.ariaLabel || '').toLowerCase().trim();
 
-          // 2. HISTORY CHECK
+          // 1. Global History Check (Double Safety)
           const alreadyClickedInSession = this.sessionHistory.some(cmd => {
               const desc = (cmd.description || '').toLowerCase();
-              // Check if we clicked this exact text
               return desc.includes(`"${bestText}"`) || desc.includes(` ${bestText} `) || desc.includes(`'${bestText}'`);
           });
-          
-          if (alreadyClickedInSession) {
-             console.log(`[Deterministic] Skipping "${bestText}" - already clicked.`);
-             return null; 
+
+          // 2. Active Session Burn Check
+          if (this.agentContext.burntPhrases.has(bestText) || alreadyClickedInSession) {
+             console.log(`[Deterministic] Skipping "${bestText}" - previously interacted. Checking next candidate...`);
+             continue; // <--- MOVE TO NEXT CANDIDATE (e.g. Skip 'Uninsured', try 'Medicare')
           }
 
-          if (lowerGoal.includes('click') || lowerGoal.includes('navigate') || lowerGoal.includes('open')) {
-              // Construct the thought to explain WHY we picked this (e.g. "Found context 'Insurance'")
+          // Construct Action
+          if (lowerGoal.includes('click') || lowerGoal.includes('navigate') || lowerGoal.includes('open') || lowerGoal.includes('uncheck') || lowerGoal.includes('check')) {
               const reason = best.context && lowerGoal.includes(best.context.toLowerCase()) 
                   ? `Found element with context "${best.context}" matching goal.`
                   : `Found exact text match "${best.text}"`;
@@ -221,7 +236,7 @@ export class McpTools {
               return {
                   type: 'click',
                   selector: best.selector || best.cssSelector,
-                  semanticTarget: best.context || bestText, // Use context as the semantic name if available
+                  semanticTarget: best.context || bestText, 
                   thought: `Deterministic: ${reason} Skipping AI.`
               };
           }
@@ -239,6 +254,7 @@ export class McpTools {
           }
       }
       
+      // If everything matching the goal is already burnt, yield to AI to find a NEW step.
       return null;
   }
 
@@ -251,9 +267,10 @@ export class McpTools {
     this.sessionHistory = []; 
     const steps: AgentStepResult[] = [];
     
+    // Reset context on new run
     this.agentContext = {
         consecutiveFailures: 0,
-        ineffectivePhrases: new Set<string>(),
+        burntPhrases: new Set<string>(),
         pastActions: []
     };
 
@@ -308,23 +325,11 @@ export class McpTools {
       const currentFingerprint = this.calculateDomFingerprint(elements);
       const currentTitle = observation.title || '';
       const currentUrl = observation.url || '';
-      
-      // Loop Detection
+
+      // Loop Detection / Stagnation
       let feedbackForPlanner = '';
       if (stepNumber > 1 && lastFingerprint === currentFingerprint) {
-          const lastAction = steps[steps.length - 1]?.action;
-          if (lastAction && (lastAction.type === 'click' || lastAction.type === 'navigate')) {
-              const lastCmd = this.sessionHistory[this.sessionHistory.length - 1];
-              const match = lastCmd?.description?.match(/"([^"]+)"/);
-              const burnedLabel = match ? match[1] : null;
-
-              if (burnedLabel && burnedLabel.length > 2) {
-                  this.agentContext.ineffectivePhrases.add(burnedLabel);
-                  feedbackForPlanner = `CRITICAL: Clicking "${burnedLabel}" did nothing. DO NOT click it again. Try a different element.`; 
-              } else {
-                  feedbackForPlanner = `CRITICAL: Last action had NO EFFECT. Choose a different action.`; 
-              }
-          }
+          feedbackForPlanner = `CRITICAL: Last action had NO EFFECT. Do not repeat it.`; 
       }
 
       // Login Awareness
@@ -337,13 +342,13 @@ export class McpTools {
           feedbackForPlanner += "\nCRITICAL: You are on a LOGIN PAGE. Fill Username & Password first.";
       }
 
-      // 2. Plan Next Move
+      // 2. Plan Next Move (Pass Burnt Phrases to Block LLM Repetition too)
       let nextAction = await this.planNextAgentAction(
           goal, 
           elements, 
           this.agentContext.pastActions, 
           feedbackForPlanner, 
-          this.agentContext.ineffectivePhrases,
+          this.agentContext.burntPhrases, 
           currentTitle,
           currentUrl,
           observation.screenshot
@@ -371,6 +376,15 @@ export class McpTools {
            if (actionSuccess) {
                if (this.agentCommandBuffer.length > 0) {
                    this.sessionHistory.push(...this.agentCommandBuffer);
+               }
+               
+               // --- UNIVERSAL FIX: Burn the successful semantic target ---
+               // This prevents the agent from selecting "Uninsured" again in the very next step.
+               if (nextAction.type === 'click' || nextAction.type === 'type') {
+                   const targetText = (nextAction as any).semanticTarget || '';
+                   if (targetText && targetText.length > 2) {
+                       this.agentContext.burntPhrases.add(targetText.toLowerCase().trim());
+                   }
                }
            } else {
                retryCount++;
@@ -459,7 +473,7 @@ export class McpTools {
     elements: ElementInfo[],
     actionHistory: string[],
     feedbackForPlanner: string,
-    ineffectivePhrases: Set<string>,
+    burntPhrases: Set<string>, // Universal Block List
     currentTitle: string,
     currentUrl: string,
     screenshot?: string
@@ -469,7 +483,7 @@ export class McpTools {
         return { type: 'wait', durationMs: 3000, thought: 'CRITICAL: No interactive elements found.' };
     }
 
-    // Try Deterministic Plan First (Token Saver)
+    // Try Deterministic Plan First (Universal Logic)
     if (this.agentContext.consecutiveFailures === 0 && !feedbackForPlanner.includes('CRITICAL')) {
         const deterministicAction = this.tryDeterministicPlan(goal, elements, currentTitle, currentUrl);
         if (deterministicAction) return deterministicAction;
@@ -477,14 +491,14 @@ export class McpTools {
 
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
-    // Valid Elements Filtering
+    // Valid Elements Filtering (Applying Universal Block)
     const validElements = elements.filter(el => {
-        const text = (el.text || '').trim();
-        const label = (el.ariaLabel || '').trim();
-        if (ineffectivePhrases.has(text) || ineffectivePhrases.has(label)) return false;
-        for (const bad of ineffectivePhrases) {
-            if (text.includes(bad) || label.includes(bad)) return false;
-        }
+        const text = (el.text || '').toLowerCase().trim();
+        const label = (el.ariaLabel || '').toLowerCase().trim();
+        const context = (el.context || '').toLowerCase().trim();
+        
+        // Universal Block: If any identifying text is burnt, hide it from LLM
+        if (burntPhrases.has(text) || burntPhrases.has(label) || burntPhrases.has(context)) return false;
         return true;
     });
 
@@ -508,16 +522,15 @@ HISTORY:
 ${actionHistory.slice(-5).join('\n')}
 
 FEEDBACK: ${feedbackForPlanner || "None."}
-DEAD ENDS: ${Array.from(ineffectivePhrases).join(', ')}
+ALREADY DONE: ${Array.from(burntPhrases).join(', ')}
 
 ELEMENTS:
 ${JSON.stringify(elementList)}
 
 INSTRUCTIONS:
-1. **Context Check:** Look at the 'context' field! If goal says "Insurance dropdown", pick the element where context="Insurance".
+1. **Context Check:** Look at the 'context' field! It identifies buttons by their nearby label (e.g. context="Insurance").
 2. **Login:** If you see username/password fields, FILL THEM.
-3. **Type:** Use { "type": "type", "elementId": "el_X", "text": "...", "thought": "..." }
-4. **Click:** Use { "type": "click", "elementId": "el_X", "thought": "..." }
+3. **Progress:** Do NOT repeat actions listed in "ALREADY DONE". Choose the NEXT step.
 
 RETURN ONLY JSON.
 `;
@@ -546,7 +559,6 @@ RETURN ONLY JSON.
                 const el = validElements[idx];
                 if (el) {
                     parsed.selector = el.cssSelector || el.selector || el.xpath;
-                    // Inject context into semantic target for logging
                     parsed.semanticTarget = el.context || el.text || el.ariaLabel;
                 } else {
                      return { type: 'wait', durationMs: 2000, thought: `AI hallucinated ID ${parsed.elementId}. Waiting.` };
