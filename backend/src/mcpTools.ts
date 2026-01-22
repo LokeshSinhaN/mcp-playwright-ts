@@ -173,6 +173,61 @@ export class McpTools {
     return hash.toString(16);
   }
 
+  // --- NEW: Deterministic Planner (Saves API Calls) ---
+  private tryDeterministicPlan(goal: string, elements: ElementInfo[]): AgentAction | null {
+      const lowerGoal = goal.toLowerCase();
+      
+      // 1. Check for "Click [Text]" pattern
+      // Simple heuristic: look for matches of significant words from the goal in the elements
+      const potentialTargets = elements.filter(el => {
+          const text = (el.text || '').toLowerCase();
+          const label = (el.ariaLabel || '').toLowerCase();
+          const context = (el.context || '').toLowerCase(); // Use the new context
+          
+          // Strict: The element text must appear in the goal
+          if (text.length > 2 && lowerGoal.includes(text)) return true;
+          if (label.length > 2 && lowerGoal.includes(label)) return true;
+          // Context match (e.g. goal "Insurance", context "Insurance")
+          if (context.length > 2 && lowerGoal.includes(context)) return true;
+          
+          return false;
+      });
+
+      // Filter out low-quality matches
+      const bestTargets = potentialTargets.filter(t => {
+          // If we have "Patient Master List" in goal, "Patient" is a weak match, "Patient Master List" is strong.
+          // We prefer longer matches.
+          return true; 
+      }).sort((a, b) => (b.text?.length || 0) - (a.text?.length || 0));
+
+      if (bestTargets.length > 0) {
+          const best = bestTargets[0];
+          // Determine action type
+          if (lowerGoal.includes('click') || lowerGoal.includes('navigate') || lowerGoal.includes('open')) {
+              // High confidence check: If goal is "Click Reports" and we found "Reports"
+              return {
+                  type: 'click',
+                  selector: best.selector || best.cssSelector,
+                  thought: `Deterministic: Found exact text match "${best.text || best.context}" for goal "${goal}". Skipping AI.`
+              };
+          }
+          if (lowerGoal.includes('type') || lowerGoal.includes('enter')) {
+              // Extract text to type (simple quote extraction)
+              const match = goal.match(/["']([^"']+)["']/);
+              if (match) {
+                  return {
+                      type: 'type',
+                      selector: best.selector || best.cssSelector,
+                      text: match[1],
+                      thought: `Deterministic: Found input "${best.text}" and text "${match[1]}". Skipping AI.`
+                  };
+              }
+          }
+      }
+      
+      return null; // Fallback to AI if not sure
+  }
+
   // ===========================================================================
   // =================== INTELLIGENT AUTONOMOUS AGENT ==========================
   // ===========================================================================
@@ -378,6 +433,17 @@ export class McpTools {
     if (elements.length === 0) {
         return { type: 'wait', durationMs: 3000, thought: 'CRITICAL: No interactive elements found. Page likely loading.' };
     }
+
+    // --- NEW: Try Deterministic Plan First ---
+    // If we are not in a retry loop (consecutiveFailures == 0), try to save tokens.
+    if (this.agentContext.consecutiveFailures === 0 && !feedbackForPlanner.includes('CRITICAL')) {
+        const deterministicAction = this.tryDeterministicPlan(goal, elements);
+        if (deterministicAction) {
+            return deterministicAction;
+        }
+    }
+    // ----------------------------------------
+
     if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
     // 2. Filter & Map Elements

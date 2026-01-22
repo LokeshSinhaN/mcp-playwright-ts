@@ -112,12 +112,27 @@ export class SelectorExtractor {
         if (tagName === 'button') roleHint = 'button';
         if (tagName === 'input') roleHint = 'input';
         
+        // --- NEW: Context Extraction (Fix for "Insurance" Label) ---
+        // Grab text from the direct parent or previous sibling to identify unlabeled inputs
+        let context = '';
+        if (el.parentElement) {
+             // Get parent text but remove the element's own text to reduce noise
+             const parentText = el.parentElement.innerText || '';
+             const ownText = el.innerText || '';
+             // Simple heuristic: take the first 50 chars of parent text if it's short
+             if (parentText.length < 100 && parentText.length > ownText.length) {
+                 context = parentText.replace(ownText, '').trim().slice(0, 50);
+             }
+        }
+        // -----------------------------------------------------------
+
         return {
           tagName,
           text: (el.innerText || el.value || '').substring(0, 100).trim(),
           ariaLabel: getAttr('aria-label'),
           placeholder: getAttr('placeholder'),
           visible: true,
+          context: context, // Return the captured context
           boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
           attributes: Array.from(el.attributes).map((a: any) => [a.name, a.value])
         };
