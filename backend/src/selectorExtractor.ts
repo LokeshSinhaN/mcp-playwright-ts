@@ -105,10 +105,20 @@ export class SelectorExtractor {
       const isFloating = zIndex > 100 || (style && (style.position === 'absolute' || style.position === 'fixed'));
 
       // NEW: Universal Scroll Detection
-      const isScrollable = style && (
+      let isScrollable = style && (
         (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
         (style.overflowX === 'auto' || style.overflowX === 'scroll')
       );
+      
+      const getAttr = (name: string): string =>
+        typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
+
+      // FIX: Force scrollable status for semantic list containers
+      // This tells the LLM "You can try scrolling this" even if CSS is tricky
+      const role = getAttr('role');
+      if (role === 'listbox' || role === 'menu' || role === 'tree' || role === 'grid') {
+          isScrollable = true;
+      }
 
       const visible =
         !!el.offsetParent &&
@@ -117,13 +127,19 @@ export class SelectorExtractor {
         (!style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
 
       const tagName = (el.tagName || '').toLowerCase();
-      let roleHint: 'button' | 'link' | 'input' | 'other' = 'other';
+      
+      // FIX: UPDATE ROLE HINT LOGIC HERE
+      // -----------------------------------------------------------------------
+      let roleHint: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other' = 'other';
+      
       if (tagName === 'button') roleHint = 'button';
       else if (tagName === 'a') roleHint = 'link';
       else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') roleHint = 'input';
-
-      const getAttr = (name: string): string =>
-        typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
+      
+      // Explicitly capture dropdown roles for the Priority Sorter
+      if (role === 'option' || role === 'menuitem') roleHint = 'option';
+      if (role === 'listbox' || role === 'combobox') roleHint = 'listbox';
+      // -----------------------------------------------------------------------
 
       const typeAttr = getAttr('type');
       const placeholder = getAttr('placeholder');

@@ -356,7 +356,7 @@ export class BrowserManager {
       await locator.scrollIntoViewIfNeeded({ timeout: 1500 });
       
       // FIX: Wait for scroll to COMPLETELY stop (Debounce)
-      // This ensures we don't click "National Benefit Fund" when we meant "Medicare"
+      
       await page.evaluate(() => new Promise((resolve) => {
           let lastPos = -1;
           const check = () => {
@@ -481,15 +481,27 @@ async scroll(selector: string | undefined, direction: 'up' | 'down'): Promise<Ex
     let targetLocator: Locator;
 
     if (selector) {
-        // A specific container was requested
         targetLocator = await this.smartLocate(selector, 2000);
     } else {
-        // INTELLIGENT FALLBACK: Find the largest scrollable container
-        // This fixes the "list inside a div" issue
+        // INTELLIGENT FALLBACK V2: Prioritize "Active" Dropdowns/Menus
         const scrollableSelector = await page.evaluate(() => {
+            // 1. Priority: Is there an open dropdown/menu? (High confidence)
+            const activeMenus = document.querySelectorAll('[role="listbox"], [role="menu"], .dropdown-menu, .MuiMenu-paper');
+            for (const menu of Array.from(activeMenus)) {
+                const style = window.getComputedStyle(menu);
+                // Check if it's visible and actually scrollable
+                if (style.display !== 'none' && style.visibility !== 'hidden' && menu.scrollHeight > menu.clientHeight) {
+                    // Generate a unique selector for this menu
+                    return (menu.id) ? `#${menu.id}` : 
+                           (menu.className) ? `.${menu.className.split(' ')[0]}` : 
+                           `[role="${menu.getAttribute('role')}"]`;
+                }
+            }
+
+            // 2. Fallback: Find the largest scrollable container (Your original logic)
             const all = document.querySelectorAll('*');
             let largestArea = 0;
-            let bestSelector = 'body'; // Default to body/window
+            let bestSelector = 'body'; 
 
             for (const el of Array.from(all)) {
                 const style = window.getComputedStyle(el);
@@ -498,16 +510,13 @@ async scroll(selector: string | undefined, direction: 'up' | 'down'): Promise<Ex
                 if (isScrollable) {
                     const rect = el.getBoundingClientRect();
                     const area = rect.width * rect.height;
-                    // Prefer larger areas (main content) over tiny scrollbars
                     if (area > largestArea && area > 20000) { 
                         largestArea = area;
-                        // Generate a simple unique selector path
                         bestSelector = (el.id) ? `#${el.id}` : el.tagName; 
-                        // (Ideally use a robust selector generator logic here, simplified for brevity)
                     }
                 }
             }
-            return bestSelector === 'body' ? null : bestSelector; // Return null to use window scroll
+            return bestSelector === 'body' ? null : bestSelector; 
         });
 
         if (scrollableSelector) {

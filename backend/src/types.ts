@@ -25,7 +25,7 @@ export interface ElementInfo {
   // Explicit visibility flag used by Intelligent Interaction logic.
   isVisible?: boolean;
   // High-level role hint to help reasoning about elements.
-  roleHint?: 'button' | 'link' | 'input' | 'other';
+  roleHint?: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other';
   
   // NEW: Flag to tell the AI "You can scroll this specific element!"
   scrollable?: boolean; 
