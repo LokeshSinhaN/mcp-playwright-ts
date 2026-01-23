@@ -1,4 +1,5 @@
 import { GenerativeModel } from '@google/generative-ai';
+import OpenAI from 'openai'; // NEW
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
@@ -42,7 +43,12 @@ export class McpTools {
     }
   }
 
-  constructor(private readonly browser: BrowserManager, private readonly model?: GenerativeModel) {}
+  // Updated Constructor to accept both models
+  constructor(
+    private readonly browser: BrowserManager, 
+    private readonly gemini?: GenerativeModel,
+    private readonly openai?: OpenAI
+  ) {}
 
   private extractUrlFromPrompt(prompt: string): string | null {
     const match = prompt.match(/https?:\/\/[^\s]+/);
@@ -134,7 +140,7 @@ export class McpTools {
       this.recordCommand({
         action: 'type', target: selector, value: text,
         selectors: { css: info.cssSelector, text: info.text },
-        description: `Typed "${text}"`,
+        description: `Typed "${text}"`, 
       });
       return { success: true, message: `Typed "${text}"` };
     } catch (error: any) {
@@ -197,29 +203,19 @@ export class McpTools {
   // =================== INTELLIGENT PLANNER LOGIC =============================
   // ===========================================================================
 
-  /**
-   * Deterministic Planner V2:
-   * - No hardcoded blacklist.
-   * - Ignores complex inputs (User/Pass/Search) so AI handles them.
-   * - Uses "Burnt Phrase" logic to prevent loops naturally.
-   * - Supports Partial Matching for Dropdowns/Comboboxes to find "Insurance Filter" from "Insurance".
-   */
   private tryDeterministicPlan(goal: string, elements: ElementInfo[]): AgentAction | null {
       const lowerGoal = goal.toLowerCase();
       
-      // 1. Delegate Complex Inputs to AI
       if (lowerGoal.includes('username') || lowerGoal.includes('password') || lowerGoal.includes('login to') || lowerGoal.includes('search for')) {
           return null; 
       }
 
-      // 2. Tokenize (Generic Logic)
       const ignoredWords = ['navigate', 'click', 'to', 'the', 'open', 'filter', 'scroll', 'find', 'options', 'wait', 'check', 'select', 'and', 'only', 'from', 'if', 'they', 'are', 'not', 'then', 'menu', 'button'];
       
       let cleanGoal = lowerGoal;
       const goalKeywords = cleanGoal.split(/[^a-z0-9]+/).filter(w => w.length > 3 && !ignoredWords.includes(w));
 
       for (const keyword of goalKeywords) {
-          // 3. Loop Prevention: If we already clicked "Patient Master List", ignore it.
           if (this.agentContext.burntPhrases.has(keyword)) continue;
 
           const matches = elements.filter(el => {
@@ -234,12 +230,7 @@ export class McpTools {
               const text = (el.text || '').toLowerCase();
               const label = (el.ariaLabel || '').toLowerCase();
               
-              // 4. Intelligent Matching
-              // Exact Match: Preferred for everything.
               if (text === keyword || label === keyword) return true;
-
-              // Partial Match: ALLOWED only for Dropdowns/Inputs (e.g. "Insurance" matches "Insurance Filter")
-              // This fixes the issue where "Insurance" was not found.
               if ((role === 'listbox' || role === 'combobox' || tag === 'select' || role === 'input') && (text.includes(keyword) || label.includes(keyword))) {
                   return true;
               }
@@ -307,7 +298,8 @@ export class McpTools {
           try {
               nextAction = await this.planNextAgentAction(
                   goal, elements, this.agentContext.pastActions, 
-                  this.agentContext.burntPhrases, screenshotForStep
+                  this.agentContext.burntPhrases, screenshotForStep,
+                  config.modelProvider // Pass the chosen provider
               );
           } catch (err: any) {
               if (String(err).includes('429')) {
@@ -315,7 +307,7 @@ export class McpTools {
                    await new Promise(r => setTimeout(r, 20000));
                    nextAction = { type: 'wait', durationMs: 2000, thought: 'Rate limit recovery' };
               } else {
-                  // Fallback: If AI fails, try scrolling to find more elements
+                  console.error("Agent planning error:", err);
                   nextAction = { type: 'scroll', direction: 'down', thought: 'AI unavailable, scrolling to find more elements' };
               }
           }
@@ -340,12 +332,10 @@ export class McpTools {
            
            if (actionSuccess) {
                if (this.agentCommandBuffer.length > 0) this.sessionHistory.push(...this.agentCommandBuffer);
-               // CRITICAL: Burn the phrase so we don't repeat it
                const target = (nextAction as any).semanticTarget || (nextAction as any).text || '';
                if (target) {
                    const lowerTarget = target.toLowerCase().trim();
                    this.agentContext.burntPhrases.add(lowerTarget);
-                   // Also burn the EXACT text of the element if available to be safe
                    if (result.success && (nextAction as any).selector) {
                         const el = elements.find(e => e.cssSelector === (nextAction as any).selector || e.selector === (nextAction as any).selector);
                         if (el && el.text) this.agentContext.burntPhrases.add(el.text.toLowerCase().trim());
@@ -368,7 +358,7 @@ export class McpTools {
       
       steps.push({ 
           stepNumber, action: nextAction, success: actionSuccess, message: actionDesc, 
-          urlBefore: observationLite.url, urlAfter: page.url(), stateChanged: actionSuccess, retryCount,
+          urlBefore: observationLite.url, urlAfter: page.url(), stateChanged: actionSuccess, retryCount, 
           screenshot: screenshotForStep 
       });
     }
@@ -376,7 +366,6 @@ export class McpTools {
     return { success: isFinished, summary: "Task Completed", goal, totalSteps: stepNumber, steps, commands: this.sessionHistory, seleniumCode: "" };
   }
 
-  // ... (parseAgentActionResponse, extractBalancedJson - Keep same)
   private parseAgentActionResponse(responseText: string): AgentAction {
     let clean = responseText.replace(/```json\s*|\s*```/gi, '').trim();
     const jsonStr = this.extractBalancedJson(clean);
@@ -412,15 +401,15 @@ export class McpTools {
     elements: ElementInfo[],
     actionHistory: string[],
     burntPhrases: Set<string>, 
-    screenshot?: string
+    screenshot: string | undefined,
+    modelProvider: 'gemini' | 'openai' = 'gemini'
   ): Promise<AgentAction> {
     
     if (elements.length === 0) {
         return { type: 'wait', durationMs: 3000, thought: 'No interactive elements found.' };
     }
-    if (!this.model) return { type: 'finish', thought: 'No AI model', summary: 'No AI' };
 
-    // Filter out "burnt" items so the AI doesn't see them as options
+    // Filter out "burnt" items
     const validElements = elements.filter(el => {
         const text = (el.text || '').toLowerCase().trim();
         // Exception: Always show login-related fields even if burnt (retries)
@@ -438,7 +427,7 @@ export class McpTools {
         type: el.attributes?.['type'] 
     }));
 
-    const prompt = `
+    const systemInstructions = `
 SYSTEM: Web Automation Agent.
 GOAL: ${goal}
 HISTORY: ${actionHistory.slice(-5).join('; ')}
@@ -452,33 +441,94 @@ INSTRUCTIONS:
 3. **Credentials**: If the goal has username/password, type them into the inputs.
 4. **Navigation**: If logged in, proceed with the menu steps.
 
-RETURN JSON: { "type": "click"|"type"|"finish"|"wait"|"scroll", "elementId": "el_X", "text"?: "...", "thought": "..." }
+RETURN JSON ONLY: { "type": "click"|"type"|"finish"|"wait"|"scroll", "elementId": "el_X", "text"?: "...", "thought": "..." }
 `;
 
-    try {
-        const result = await this.model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] } as any);
-        const response = (result as any).response?.text?.() ?? '';
-        const parsed = this.parseAgentActionResponse(response);
+    let responseText = '';
+
+    // --- GEMINI PROVIDER ---
+    if (modelProvider === 'gemini') {
+        if (!this.gemini) return { type: 'finish', thought: 'Gemini not configured', summary: 'No Gemini Model' };
         
-        if ((parsed.type === 'click' || parsed.type === 'type') && parsed.elementId) {
-            const match = parsed.elementId.match(/el_(\d+)/);
-            if (match) {
-                const idx = parseInt(match[1]);
-                const el = validElements[idx];
-                if (el) {
-                    parsed.selector = el.cssSelector || el.selector;
-                    parsed.semanticTarget = el.text || el.ariaLabel;
-                }
+        try {
+            // For Gemini, we pass parts. If screenshot exists, we add inline data.
+            const parts: any[] = [{ text: systemInstructions }];
+            if (screenshot) {
+                 parts.push({
+                    inlineData: {
+                        data: screenshot,
+                        mimeType: 'image/png'
+                    }
+                });
+            }
+
+            const result = await this.gemini.generateContent({ 
+                contents: [{ role: 'user', parts }]
+            });
+            responseText = result.response.text();
+        } catch (err) {
+            console.error("Gemini API Error:", err);
+            throw err;
+        }
+    } 
+    // --- OPENAI PROVIDER ---
+    else if (modelProvider === 'openai') {
+        if (!this.openai) return { type: 'finish', thought: 'OpenAI not configured', summary: 'No OpenAI Client' };
+
+        try {
+            const messages: any[] = [
+                { role: "system", content: "You are a web automation assistant. You respond only in JSON." },
+            ];
+
+            const userContent: any[] = [
+                { type: "text", text: systemInstructions }
+            ];
+
+            if (screenshot) {
+                userContent.push({
+                    type: "image_url",
+                    image_url: {
+                        url: `data:image/png;base64,${screenshot}`,
+                        detail: "high"
+                    }
+                });
+            }
+
+            messages.push({ role: "user", content: userContent });
+
+            const completion = await this.openai.chat.completions.create({
+                model: "gpt-5", // Uses GPT-4o for best vision capabilities
+                messages: messages,
+                response_format: { type: "json_object" }, // Enforce JSON
+                max_tokens: 1000
+            });
+
+            responseText = completion.choices[0].message.content || '';
+        } catch (err) {
+            console.error("OpenAI API Error:", err);
+            throw err;
+        }
+    } else {
+        return { type: 'finish', thought: 'Unknown Model Provider', summary: 'Config Error' };
+    }
+
+    // --- PARSE & MAP BACK ---
+    const parsed = this.parseAgentActionResponse(responseText);
+    
+    if ((parsed.type === 'click' || parsed.type === 'type') && parsed.elementId) {
+        const match = parsed.elementId.match(/el_(\d+)/);
+        if (match) {
+            const idx = parseInt(match[1]);
+            const el = validElements[idx];
+            if (el) {
+                parsed.selector = el.cssSelector || el.selector;
+                parsed.semanticTarget = el.text || el.ariaLabel;
             }
         }
-        return parsed;
-
-    } catch (err: any) {
-        throw err;
     }
+    return parsed;
   }
 
-  // ... (executeAgentAction, describeAction, clickExact - Keep same)
   private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<{success: boolean, message: string}> {
     
     if (action.type === 'click') {

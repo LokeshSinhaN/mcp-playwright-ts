@@ -14,6 +14,7 @@ const seleniumCodeOutput = document.getElementById('selenium-code-output');
 const copySeleniumCodeBtn = document.getElementById('copy-selenium-code-btn');
 const wsStatusDot = document.getElementById('ws-status-dot');
 const wsStatusText = document.getElementById('ws-status-text');
+const modelSelect = document.getElementById('model-provider-select');
 function setWsStatus(state, label) {
     if (!wsStatusDot || !wsStatusText)
         return;
@@ -107,12 +108,18 @@ chatForm.addEventListener('submit', async (e) => {
     const text = promptInput.value.trim();
     if (!text)
         return;
+    const provider = modelSelect ? modelSelect.value : 'gemini';
     appendLog({ type: 'info', message: text, role: 'user' });
     promptInput.value = '';
     const isUrl = /^https?:\/\//i.test(text);
     const action = isUrl ? 'navigate' : 'ai'; // use AI brain for natural language commands
     try {
-        const res = await api.execute(action, isUrl ? { url: text } : { prompt: text });
+        const res = await api.execute(action, isUrl
+            ? { url: text }
+            : {
+                prompt: text,
+                agentConfig: { modelProvider: provider },
+            });
         if (res.screenshot) {
             screenshotImg.src = res.screenshot;
             screenshotImg.hidden = false;

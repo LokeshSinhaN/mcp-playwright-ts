@@ -15,6 +15,7 @@ const seleniumCodeOutput = document.getElementById('selenium-code-output') as HT
 const copySeleniumCodeBtn = document.getElementById('copy-selenium-code-btn') as HTMLButtonElement | null;
 const wsStatusDot = document.getElementById('ws-status-dot');
 const wsStatusText = document.getElementById('ws-status-text');
+const modelSelect = document.getElementById('model-provider-select') as HTMLSelectElement | null;
 
 function setWsStatus(state: 'connected' | 'disconnected' | 'error', label: string) {
   if (!wsStatusDot || !wsStatusText) return;
@@ -123,6 +124,8 @@ chatForm.addEventListener('submit', async (e) => {
   const text = promptInput.value.trim();
   if (!text) return;
 
+  const provider = modelSelect ? (modelSelect.value as 'gemini' | 'openai') : 'gemini';
+
   appendLog({ type: 'info', message: text, role: 'user' });
   promptInput.value = '';
 
@@ -130,7 +133,15 @@ chatForm.addEventListener('submit', async (e) => {
   const action = isUrl ? 'navigate' : 'ai'; // use AI brain for natural language commands
 
   try {
-    const res = await api.execute(action, isUrl ? { url: text } : { prompt: text });
+    const res = await api.execute(
+      action,
+      isUrl
+        ? { url: text }
+        : {
+            prompt: text,
+            agentConfig: { modelProvider: provider },
+          }
+    );
     if (res.screenshot) {
       screenshotImg.src = res.screenshot;
       screenshotImg.hidden = false;
