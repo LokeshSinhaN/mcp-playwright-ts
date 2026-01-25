@@ -5,6 +5,14 @@ export interface BrowserConfig {
   viewport: { width: number; height: number };
 }
 
+// NEW: Captures the "DNA" of the page state
+export interface StateFingerprint {
+  url: string;
+  title: string;
+  elementCount: number;
+  contentHash: string; // Hash of visible text to detect content changes
+}
+
 export interface ElementInfo {
   tagName: string;
   id?: string;
@@ -57,6 +65,9 @@ export interface ExecutionResult {
   isAmbiguous?: boolean;
   requiresInteraction?: boolean;
   candidates?: ElementInfo[];
+  // NEW: Feedback for the intelligent agent
+  stateChanged?: boolean;
+  failedSelector?: string;
 }
 
 export interface WebSocketMessage {
@@ -118,7 +129,6 @@ export interface AgentConfig {
   onStepComplete?: (step: AgentStepResult) => void;
   onThought?: (thought: string, action: AgentAction) => void;
   broadcast?: (msg: WebSocketMessage) => void;
-  /** Select which AI model to use for reasoning */
   modelProvider?: 'gemini' | 'openai'; 
 }
 

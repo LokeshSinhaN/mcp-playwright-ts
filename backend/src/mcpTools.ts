@@ -1,5 +1,5 @@
 import { GenerativeModel } from '@google/generative-ai';
-import OpenAI from 'openai'; // NEW
+import OpenAI from 'openai';
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
@@ -11,28 +11,13 @@ import {
   AgentStepResult,
   AgentSessionResult,
   AgentConfig,
+  StateFingerprint
 } from './types';
-import { 
-  selectFromDropdown, 
-  selectOptionInOpenDropdown, 
-  parseDropdownInstruction, 
-  DropdownIntent 
-} from './dropdownUtils';
-
-interface AgentContext {
-  consecutiveFailures: number;
-  burntPhrases: Set<string>; 
-  pastActions: string[]; 
-}
+import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent } from './dropdownUtils';
 
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
   private agentCommandBuffer: ExecutionCommand[] | null = null;
-  private agentContext: AgentContext = {
-      consecutiveFailures: 0,
-      burntPhrases: new Set(),
-      pastActions: []
-  };
 
   private recordCommand(cmd: ExecutionCommand | ExecutionCommand[]): void {
     const cmds = Array.isArray(cmd) ? cmd : [cmd];
@@ -43,275 +28,119 @@ export class McpTools {
     }
   }
 
-  // Updated Constructor to accept both models
   constructor(
     private readonly browser: BrowserManager, 
     private readonly gemini?: GenerativeModel,
     private readonly openai?: OpenAI
   ) {}
 
+  // ... [extractUrlFromPrompt, extractDomain helper methods] ...
   private extractUrlFromPrompt(prompt: string): string | null {
     const match = prompt.match(/https?:\/\/[^\s]+/);
     return match ? match[0] : null;
   }
-
   private extractDomain(url: string): string {
-    try {
-      return new URL(url).hostname;
-    } catch {
-      return url;
-    }
+    try { return new URL(url).hostname; } catch { return url; }
   }
 
-  // --- NAVIGATION ---
+  // ... [navigate, click, type methods tailored for direct API use] ...
+  // (Keeping these briefly as they are used by the server direct endpoints)
   async navigate(url: string): Promise<ExecutionResult> {
-    try {
-      await this.browser.goto(url);
-      await this.browser.handleCookieBanner();
-      this.recordCommand({
-        action: 'navigate', target: url, description: `Mapsd to ${url}`,
-      });
-      // Navigation resets the "burnt" cache because we are on a new page
-      this.agentContext.burntPhrases.clear(); 
-      return { success: true, message: `Mapsd to ${url}` };
-    } catch (error: any) {
-      return { success: false, message: error.message };
-    }
-  }
-
-  // --- COMPATIBILITY ---
-  async clickWithHeuristics(target: string, _candidates?: any[]): Promise<ExecutionResult> {
-    return this.click(target);
-  }
-
-  // --- UNIVERSAL CLICK ---
-  async click(target: string): Promise<ExecutionResult> {
-    const page = this.browser.getPage();
-    const dropdownIntent = parseDropdownInstruction(target);
-    
-    if (dropdownIntent) {
       try {
-        let message: string;
-        if (dropdownIntent.kind === 'open-and-select') {
-          const res = await selectFromDropdown(page, dropdownIntent.dropdownLabel, dropdownIntent.optionLabel);
-          this.recordCommand([
-             { action: 'click', target: dropdownIntent.dropdownLabel, selectors: { text: dropdownIntent.dropdownLabel }, description: `Open ${dropdownIntent.dropdownLabel}` },
-             { action: 'click', target: res.optionSelector || dropdownIntent.optionLabel, selectors: { css: res.optionSelector, text: dropdownIntent.optionLabel }, description: `Select ${dropdownIntent.optionLabel}` }
-          ]);
-          message = `Selected "${dropdownIntent.optionLabel}" from "${dropdownIntent.dropdownLabel}"`;
-        } else {
-          const res = await selectOptionInOpenDropdown(page, dropdownIntent.optionLabel);
-          this.recordCommand({
-             action: 'click', target: res.optionSelector || dropdownIntent.optionLabel, selectors: { css: res.optionSelector, text: dropdownIntent.optionLabel }, description: `Select ${dropdownIntent.optionLabel}`
-          });
-          message = `Selected "${dropdownIntent.optionLabel}"`;
-        }
-        return { success: true, message };
-      } catch (e) {
-        // Fallback
-      }
-    }
+          await this.browser.goto(url);
+          await this.browser.handleCookieBanner();
+          this.recordCommand({ action: 'navigate', target: url });
+          return { success: true, message: `Navigated to ${url}` };
+      } catch (e: any) { return { success: false, message: e.message }; }
+  }
 
-    const extractor = new SelectorExtractor(page);
-    const coreTarget = this.extractCoreLabel(target);
-    let candidates = await extractor.findCandidates(coreTarget || target);
-    candidates = candidates.filter(el => this.elementMatchesPrompt(coreTarget || target, el));
-
-    if (candidates.length > 0) {
-       const best = candidates[0];
-       const selector = best.selector || best.cssSelector || best.xpath;
-       if (selector) {
-           const info = await this.browser.click(selector);
-           this.recordCommand({
-               action: 'click',
-               target: selector,
-               selectors: { css: info.cssSelector, xpath: info.xpath, text: info.text, id: info.id },
-               description: target
-           });
-           return { success: true, message: `Clicked "${info.text || target}"`, selectors: [info] };
-       }
-    }
-    return { success: false, message: `Could not confidently identify element for "${target}"` };
+  async clickExact(selector: string, desc?: string): Promise<ExecutionResult> {
+      try {
+          const info = await this.browser.click(selector);
+          this.recordCommand({ action: 'click', target: selector, description: desc });
+          return { success: true, message: `Clicked ${desc || selector}`, selectors: [info] };
+      } catch (e: any) { return { success: false, message: e.message }; }
   }
 
   async type(selector: string, text: string): Promise<ExecutionResult> {
     try {
-      const info = await this.browser.type(selector, text);
-      this.recordCommand({
-        action: 'type', target: selector, value: text,
-        selectors: { css: info.cssSelector, text: info.text },
-        description: `Typed "${text}"`, 
-      });
-      return { success: true, message: `Typed "${text}"` };
-    } catch (error: any) {
-      return { success: false, message: error.message };
+      await this.browser.type(selector, text);
+      this.recordCommand({ action: 'type', target: selector, value: text });
+      return { success: true, message: `Typed "${text}" into ${selector}` };
+    } catch (e: any) {
+      return { success: false, message: e.message };
     }
   }
 
-  async observe(useVision: boolean = false): Promise<{
-    url: string; selectors: ElementInfo[]; screenshot?: string; title?: string;
-  }> {
-    const page = this.browser.getPage();
-    const url = page.url();
-    const title = await page.title().catch(() => '');
-    const extractor = new SelectorExtractor(page);
-    
-    const selectors = await extractor.extractAllInteractive();
-
-    if (useVision) {
-      const screenshot = await this.browser.screenshot();
-      return {
-        url, title, selectors,
-        screenshot: screenshot.replace('data:image/png;base64,', ''),
-      };
+  async observe(): Promise<ExecutionResult> {
+    try {
+      const extractor = new SelectorExtractor(this.browser.getPage());
+      const elements = await extractor.extractAllInteractive();
+      return { success: true, message: 'Observed page', selectors: elements };
+    } catch (e: any) {
+      return { success: false, message: e.message };
     }
-    return { url, title, selectors };
   }
 
-  async handleCookieBanner(elements?: ElementInfo[]): Promise<ExecutionResult> {
-    const info = await this.browser.handleCookieBanner();
-    if (info) return { success: true, message: 'Cookie banner dismissed', selectors: [info] };
-    return { success: false, message: 'No cookie banner found' };
-  }
-
-  async generateSelenium(existingCommands: ExecutionCommand[] = []): Promise<{ seleniumCode: string; success: boolean }> {
-    const generator = new SeleniumGenerator();
-    const allCommands = [...this.sessionHistory, ...existingCommands];
-    return { seleniumCode: generator.generate(allCommands), success: true };
-  }
-  
-  private extractCoreLabel(prompt: string): string {
-    const raw = (prompt || '').trim();
-    if (!raw) return '';
-    const quoted = raw.match(/["\']([^"\']{2,})["\']/);
-    if (quoted && quoted[1].trim().length >= 3) return quoted[1].trim();
-    let core = raw.replace(/^(click|select|press|tap|open)\s+/i, '');
-    core = core.replace(/\b(button|link|input|dropdown|menu|tab)\b/gi, '').trim();
-    return core || raw;
-  }
-
-  private elementMatchesPrompt(prompt: string, el: ElementInfo): boolean {
-    const core = this.extractCoreLabel(prompt);
-    const tokens = core.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 3);
-    if (tokens.length === 0) return true;
-    const label = [el.text, el.ariaLabel, el.placeholder, el.dataTestId, el.context]
-       .filter(Boolean).join(' ').toLowerCase();
-    return tokens.some(tok => label.includes(tok));
+  async handleCookieBanner(): Promise<ExecutionResult> {
+    try {
+      await this.browser.handleCookieBanner();
+      return { success: true, message: 'Cookie banner dismissed' };
+    } catch (e: any) {
+      return { success: false, message: e.message };
+    }
   }
 
   // ===========================================================================
-  // =================== INTELLIGENT PLANNER LOGIC =============================
+  // =================== INTELLIGENT AGENT LOGIC ===============================
   // ===========================================================================
 
-  private tryDeterministicPlan(goal: string, elements: ElementInfo[]): AgentAction | null {
-      const lowerGoal = goal.toLowerCase();
-      
-      if (lowerGoal.includes('username') || lowerGoal.includes('password') || lowerGoal.includes('login to') || lowerGoal.includes('search for')) {
-          return null; 
-      }
-
-      const ignoredWords = ['navigate', 'click', 'to', 'the', 'open', 'filter', 'scroll', 'find', 'options', 'wait', 'check', 'select', 'and', 'only', 'from', 'if', 'they', 'are', 'not', 'then', 'menu', 'button'];
-      
-      let cleanGoal = lowerGoal;
-      const goalKeywords = cleanGoal.split(/[^a-z0-9]+/).filter(w => w.length > 3 && !ignoredWords.includes(w));
-
-      for (const keyword of goalKeywords) {
-          if (this.agentContext.burntPhrases.has(keyword)) continue;
-
-          const matches = elements.filter(el => {
-              if (!el.visible && !el.isVisible) return false;
-              
-              const tag = el.tagName.toLowerCase();
-              const role = (el.roleHint || '').toLowerCase();
-              const isInteractive = tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select' || role === 'button' || role === 'link' || role === 'checkbox' || role === 'listbox' || role === 'combobox';
-
-              if (!isInteractive) return false;
-
-              const text = (el.text || '').toLowerCase();
-              const label = (el.ariaLabel || '').toLowerCase();
-              
-              if (text === keyword || label === keyword) return true;
-              if ((role === 'listbox' || role === 'combobox' || tag === 'select' || role === 'input') && (text.includes(keyword) || label.includes(keyword))) {
-                  return true;
-              }
-
-              return false;
-          });
-
-          if (matches.length === 1) { 
-             const bestMatch = matches[0];
-             return {
-                 type: 'click',
-                 selector: bestMatch.selector || bestMatch.cssSelector,
-                 semanticTarget: keyword,
-                 thought: `Deterministic: Found unique interactive element "${keyword}". Executing.`
-             };
-          }
-      }
-      return null;
-  }
-
-  // --- AGENT LOOP ---
   async runAutonomousAgent(goal: string, config: AgentConfig = {}): Promise<AgentSessionResult> {
     const maxSteps = config.maxSteps ?? 30;
+    const maxRetries = 1;
+    
     this.sessionHistory = []; 
     const steps: AgentStepResult[] = [];
-    this.agentContext = { consecutiveFailures: 0, burntPhrases: new Set(), pastActions: [] };
+    // Key Robustness: Track failed selectors to prevent looping on bad elements
+    const failedElements: Set<string> = new Set();
+    const actionHistory: string[] = [];
 
     await this.browser.init();
     const page = this.browser.getPage();
-    const urlInGoal = this.extractUrlFromPrompt(goal);
-    let stepNumber = 0;
 
-    // 1. Intelligent Start
+    // 1. Auto-Navigation Check (Smart Start)
+    const urlInGoal = this.extractUrlFromPrompt(goal);
     if (urlInGoal) {
         const currentUrl = page.url();
         if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
-            stepNumber++;
-            await this.navigate(urlInGoal);
-            await page.waitForTimeout(2000);
-            steps.push({ 
-                stepNumber, action: { type: 'navigate', url: urlInGoal, thought: 'Init' }, 
-                success: true, message: `Mapsd to ${urlInGoal}`, urlBefore: '', urlAfter: urlInGoal, stateChanged: true, retryCount: 0 
-            });
+             await this.navigate(urlInGoal);
+             actionHistory.push(`[SUCCESS] Navigated to ${urlInGoal}`);
+             await page.waitForTimeout(1000);
         }
     }
 
+    let stepNumber = 0;
     let isFinished = false;
 
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
-      
-      const observationLite = await this.observe(false); 
-      const elements = observationLite.selectors ?? [];
-      
-      // 2. Deterministic Check
-      let nextAction = this.tryDeterministicPlan(goal, elements);
 
-      // 3. AI Planning (The Brain)
-      let screenshotForStep: string | undefined = undefined;
-      
-      if (!nextAction) {
-          const screenshotObj = await this.browser.screenshot();
-          screenshotForStep = screenshotObj.replace('data:image/png;base64,', '');
-          
-          try {
-              nextAction = await this.planNextAgentAction(
-                  goal, elements, this.agentContext.pastActions, 
-                  this.agentContext.burntPhrases, screenshotForStep,
-                  config.modelProvider // Pass the chosen provider
-              );
-          } catch (err: any) {
-              if (String(err).includes('429')) {
-                   console.log("Rate Limit Hit. Waiting 20s...");
-                   await new Promise(r => setTimeout(r, 20000));
-                   nextAction = { type: 'wait', durationMs: 2000, thought: 'Rate limit recovery' };
-              } else {
-                  console.error("Agent planning error:", err);
-                  nextAction = { type: 'scroll', direction: 'down', thought: 'AI unavailable, scrolling to find more elements' };
-              }
-          }
-      }
+      // OBSERVE
+      // We extract interactive elements to feed the brain
+      const extractor = new SelectorExtractor(page);
+      const elements = await extractor.extractAllInteractive();
+      const screenshotObj = await this.browser.screenshot();
+      const screenshotBase64 = screenshotObj.replace('data:image/png;base64,', '');
+
+      // THINK (Plan Next Action)
+      let nextAction = await this.planNextAgentAction(
+        goal,
+        elements,
+        actionHistory,
+        failedElements,
+        screenshotBase64,
+        config.modelProvider
+      );
 
       config.broadcast?.({
           type: 'log', timestamp: new Date().toISOString(),
@@ -319,292 +148,267 @@ export class McpTools {
           data: { role: 'agent-reasoning', thought: nextAction.thought }
       });
 
-      // 4. Execution Loop
-      let actionSuccess = false;
+      // ACT (Execute with State Verification)
       let retryCount = 0;
-      let executionMsg = "";
-      
-      while (retryCount <= 1 && !actionSuccess) {
+      let actionSuccess = false;
+      let actionMessage = '';
+      let stateChanged = false;
+      let result: ExecutionResult | undefined;
+
+      while (retryCount <= maxRetries && !actionSuccess) {
            this.agentCommandBuffer = []; 
-           const result = await this.executeAgentAction(nextAction, elements); 
-           actionSuccess = result.success;
-           executionMsg = result.message;
            
-           if (actionSuccess) {
-               if (this.agentCommandBuffer.length > 0) this.sessionHistory.push(...this.agentCommandBuffer);
-               const target = (nextAction as any).semanticTarget || (nextAction as any).text || '';
-               if (target) {
-                   const lowerTarget = target.toLowerCase().trim();
-                   this.agentContext.burntPhrases.add(lowerTarget);
-                   if (result.success && (nextAction as any).selector) {
-                        const el = elements.find(e => e.cssSelector === (nextAction as any).selector || e.selector === (nextAction as any).selector);
-                        if (el && el.text) this.agentContext.burntPhrases.add(el.text.toLowerCase().trim());
-                   }
+           result = await this.executeAgentAction(nextAction, elements);
+           actionSuccess = result.success;
+           actionMessage = result.message;
+           stateChanged = result.stateChanged ?? false;
+
+           // INTELLIGENT SELF-CORRECTION
+           // If we clicked a "Submit/Login" button but State Didn't Change -> Dead Click
+           if (result.success && nextAction.type === 'click' && !stateChanged) {
+               const target = nextAction.semanticTarget?.toLowerCase() || '';
+               const criticalClick = target.includes('log') || target.includes('sign') || target.includes('search') || target.includes('go') || target.includes('submit');
+               
+               if (criticalClick) {
+                   // Mark as failed so we don't try this specific element again
+                   actionSuccess = false; 
+                   actionMessage = "Click successful but page state did not change (Dead Click). Retrying...";
+                   if (result.failedSelector) failedElements.add(result.failedSelector);
                }
+           }
+
+           if (actionSuccess) {
+               // Commit commands
+               if (this.agentCommandBuffer.length > 0) this.sessionHistory.push(...this.agentCommandBuffer);
            } else {
                retryCount++;
+               // If failed, add selector to blocklist
+               if (result?.failedSelector) failedElements.add(result?.failedSelector);
                await page.waitForTimeout(1000);
            }
       }
 
-      const actionDesc = executionMsg || this.describeAction(nextAction, actionSuccess);
-      this.agentContext.pastActions.push(actionDesc);
+      const actionDesc = this.describeAction(nextAction, actionSuccess);
+      actionHistory.push(actionDesc);
       
-      if (actionSuccess) {
-           config.broadcast?.({ type: 'log', timestamp: new Date().toISOString(), message: `Step ${stepNumber}: ${actionDesc.replace('[SUCCESS] ', '')}` });
-      }
-
       if (nextAction.type === 'finish' && actionSuccess) isFinished = true;
-      
+
       steps.push({ 
-          stepNumber, action: nextAction, success: actionSuccess, message: actionDesc, 
-          urlBefore: observationLite.url, urlAfter: page.url(), stateChanged: actionSuccess, retryCount, 
-          screenshot: screenshotForStep 
+          stepNumber, action: nextAction, success: actionSuccess, message: actionMessage, 
+          urlBefore: '', urlAfter: page.url(), stateChanged, retryCount, 
+          screenshot: screenshotBase64 
       });
     }
 
-    return { success: isFinished, summary: "Task Completed", goal, totalSteps: stepNumber, steps, commands: this.sessionHistory, seleniumCode: "" };
+    return { 
+        success: isFinished, 
+        summary: "Agent Session Ended", 
+        goal, 
+        totalSteps: stepNumber, 
+        steps, 
+        commands: this.sessionHistory, 
+        seleniumCode: await new SeleniumGenerator().generate(this.sessionHistory)
+    };
   }
 
-  private parseAgentActionResponse(responseText: string): AgentAction {
-    let clean = responseText.replace(/```json\s*|\s*```/gi, '').trim();
-    const jsonStr = this.extractBalancedJson(clean);
+  // --- EXECUTE ACTION WITH STATE AWARENESS ---
+  private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<ExecutionResult> {
     
-    if (!jsonStr) {
-       return { type: 'wait', durationMs: 1000, thought: 'AI returned non-JSON response' };
-    }
+    // 1. Capture State BEFORE
+    let fingerprintBefore: StateFingerprint | null = null;
+    try { fingerprintBefore = await this.browser.getFingerprint(); } catch {}
+
+    let result: ExecutionResult = { success: false, message: '' };
+
+    // ... Helper to resolve "el_3" to actual selector ...
+    const resolveSelector = (id?: string, sel?: string): string | undefined => {
+        if (sel) return sel;
+        if (id && id.startsWith('el_')) {
+            const idx = parseInt(id.split('_')[1]);
+            return elements[idx]?.cssSelector || elements[idx]?.selector;
+        }
+        return undefined;
+    };
+
     try {
-      const parsed = JSON.parse(jsonStr);
-      if (parsed.type === 'type' && !parsed.text && parsed.value) parsed.text = parsed.value;
-      if (!parsed.thought) parsed.thought = "Executing action...";
-      return parsed as AgentAction;
-    } catch (e) {
-      return { type: 'wait', durationMs: 1000, thought: 'Malformed AI JSON.' };
+        if (action.type === 'click') {
+            const sel = resolveSelector(action.elementId, action.selector);
+            if (sel) {
+                result = await this.clickExact(sel, action.semanticTarget);
+                result.failedSelector = sel; // store potential failure source
+            } else if (action.semanticTarget) {
+                // Fallback to text click
+                const clickRes = await this.browser.click(`text=${action.semanticTarget}`);
+                result = { success: true, message: `Clicked "${action.semanticTarget}"`, selectors: [clickRes] };
+            } else {
+                result = { success: false, message: "No selector for click" };
+            }
+        } 
+        else if (action.type === 'type') {
+            const sel = resolveSelector(action.elementId, action.selector);
+            if (sel) {
+                await this.browser.type(sel, action.text);
+                this.recordCommand({ action: 'type', target: sel, value: action.text });
+                result = { success: true, message: `Typed "${action.text}"`, failedSelector: sel };
+            } else {
+                result = { success: false, message: "No selector for type" };
+            }
+        }
+        else if (action.type === 'scroll') {
+             await this.browser.scroll(undefined, action.direction);
+             result = { success: true, message: "Scrolled" };
+        }
+        else if (action.type === 'wait') {
+             await new Promise(r => setTimeout(r, action.durationMs));
+             result = { success: true, message: "Waited" };
+        }
+        else if (action.type === 'finish') {
+             result = { success: true, message: action.summary };
+        }
+        else if (action.type === 'navigate') {
+             await this.navigate(action.url);
+             result = { success: true, message: `Navigated to ${action.url}` };
+        }
+    } catch (e: any) {
+        let failedSelector: string | undefined = undefined;
+        if ('selector' in action) {
+            failedSelector = action.selector;
+        }
+        return { success: false, message: e.message, failedSelector };
     }
+
+    // 2. Capture State AFTER & Compare
+    if (result.success && ['click', 'type', 'navigate'].includes(action.type)) {
+        try {
+            const fingerprintAfter = await this.browser.getFingerprint();
+            if (fingerprintBefore && fingerprintAfter) {
+                // Determine if state changed (URL diff OR Content Hash diff)
+                const isDifferent = (fingerprintBefore.contentHash !== fingerprintAfter.contentHash) || 
+                                    (fingerprintBefore.url !== fingerprintAfter.url);
+                result.stateChanged = isDifferent;
+            }
+        } catch {}
+    } else {
+        // Scroll/Wait are considered state changes for flow control purposes
+        result.stateChanged = true; 
+    }
+
+    return result;
   }
 
-  private extractBalancedJson(str: string): string | null {
-    const start = str.indexOf('{');
-    if (start === -1) return null;
-    let balance = 0;
-    for (let i = start; i < str.length; i++) {
-      if (str[i] === '{') balance++;
-      else if (str[i] === '}') balance--;
-      if (balance === 0) return str.substring(start, i + 1);
-    }
-    return null;
-  }
-
-  // --- INTELLIGENT PROMPT ENGINEERING ---
+  // --- ROBUST PLANNING & PARSING (From Reference File) ---
+  
   private async planNextAgentAction(
     goal: string,
     elements: ElementInfo[],
-    actionHistory: string[],
-    burntPhrases: Set<string>, 
-    screenshot: string | undefined,
-    modelProvider: 'gemini' | 'openai' = 'gemini'
+    history: string[],
+    failedElements: Set<string>,
+    screenshot: string,
+    provider: 'gemini' | 'openai' = 'gemini'
   ): Promise<AgentAction> {
-    
-    if (elements.length === 0) {
-        return { type: 'wait', durationMs: 3000, thought: 'No interactive elements found.' };
-    }
+      
+      // Filter out technical noise and FAILED elements
+      const visibleEl = elements.filter(el => 
+          el.visible && 
+          !failedElements.has(el.cssSelector || '') &&
+          !failedElements.has(el.selector || '') && 
+          el.tagName !== 'script'
+      );
 
-    // Filter out "burnt" items
-    const validElements = elements.filter(el => {
-        const text = (el.text || '').toLowerCase().trim();
-        // Exception: Always show login-related fields even if burnt (retries)
-        if (text.includes('user') || text.includes('pass') || text.includes('log') || text.includes('sign')) return true;
-        if (burntPhrases.has(text)) return false;
-        return true;
-    });
+      const simplified = visibleEl.slice(0, 200).map((el, i) => ({
+          id: `el_${i}`, // We map this back later
+          tag: el.tagName,
+          text: (el.text || '').slice(0, 50).replace(/\s+/g, ' '),
+          label: el.ariaLabel || el.placeholder || '',
+          selector: el.cssSelector
+      }));
 
-    const elementList = validElements.slice(0, 200).map((el, idx) => ({
-        id: `el_${idx}`,  
-        tag: el.tagName,
-        text: (el.text || '').slice(0, 60).replace(/\s+/g, ' '),
-        role: el.roleHint,
-        label: (el.ariaLabel || '').slice(0, 50),
-        type: el.attributes?.['type'] 
-    }));
+      const prompt = `
+      SYSTEM: Web Agent. Goal: "${goal}".
+      HISTORY: ${history.slice(-4).join('; ')}
+      FAILED SELECTORS (Do not use): ${JSON.stringify(Array.from(failedElements))}
+      
+      UI ELEMENTS:
+      ${JSON.stringify(simplified)}
 
-    const systemInstructions = `
-SYSTEM: Web Automation Agent.
-GOAL: ${goal}
-HISTORY: ${actionHistory.slice(-5).join('; ')}
+      INSTRUCTIONS:
+      1. Analyze the UI and History.
+      2. If you see a "Login" or "Submit" button and you just typed credentials, CLICK IT.
+      3. If the page hasn't changed after a click, try a different element or strategy.
+      4. RETURN JSON ONLY: { "type": "click"|"type"|"wait"|"finish"|"scroll", "elementId": "el_X", "text"?: "...", "thought": "..." }
+      `;
 
-ELEMENTS (Interactive):
-${JSON.stringify(elementList)}
+      // ... [LLM Call Logic - Gemini/OpenAI - similar to before] ...
+      let responseText = '';
+      if (provider === 'openai' && this.openai) {
+           const completion = await this.openai.chat.completions.create({
+               model: "gpt-4o",
+               messages: [
+                   { role: "system", content: "You are a JSON-only bot." },
+                   { role: "user", content: [
+                       { type: "text", text: prompt },
+                       { type: "image_url", image_url: { url: `data:image/png;base64,${screenshot}` } }
+                   ]}
+               ],
+               response_format: { type: "json_object" }
+           });
+           responseText = completion.choices[0].message.content || '';
+      } else if (this.gemini) {
+           const parts: any[] = [{ text: prompt }];
+           if (screenshot) parts.push({ inlineData: { data: screenshot, mimeType: 'image/png' } });
+           const res = await this.gemini.generateContent({ contents: [{ role: 'user', parts }] });
+           responseText = res.response.text();
+      } else {
+          return { type: 'finish', thought: 'No AI', summary: 'Config Error' };
+      }
 
-INSTRUCTIONS:
-1. **Login Check**: If you just typed a password, you MUST look for a "Login", "Sign In", or "Go" button and CLICK it. Do not wait.
-2. **Missing Elements**: If you cannot find the target (e.g., "Insurance"), return a "scroll" action to find it.
-3. **Credentials**: If the goal has username/password, type them into the inputs.
-4. **Navigation**: If logged in, proceed with the menu steps.
-
-RETURN JSON ONLY: { "type": "click"|"type"|"finish"|"wait"|"scroll", "elementId": "el_X", "text"?: "...", "thought": "..." }
-`;
-
-    let responseText = '';
-
-    // --- GEMINI PROVIDER ---
-    if (modelProvider === 'gemini') {
-        if (!this.gemini) return { type: 'finish', thought: 'Gemini not configured', summary: 'No Gemini Model' };
-        
-        try {
-            // For Gemini, we pass parts. If screenshot exists, we add inline data.
-            const parts: any[] = [{ text: systemInstructions }];
-            if (screenshot) {
-                 parts.push({
-                    inlineData: {
-                        data: screenshot,
-                        mimeType: 'image/png'
-                    }
-                });
-            }
-
-            const result = await this.gemini.generateContent({ 
-                contents: [{ role: 'user', parts }]
-            });
-            responseText = result.response.text();
-        } catch (err) {
-            console.error("Gemini API Error:", err);
-            throw err;
-        }
-    } 
-    // --- OPENAI PROVIDER ---
-    else if (modelProvider === 'openai') {
-        if (!this.openai) return { type: 'finish', thought: 'OpenAI not configured', summary: 'No OpenAI Client' };
-
-        try {
-            const messages: any[] = [
-                { role: "system", content: "You are a web automation assistant. You respond only in JSON." },
-            ];
-
-            const userContent: any[] = [
-                { type: "text", text: systemInstructions }
-            ];
-
-            if (screenshot) {
-                userContent.push({
-                    type: "image_url",
-                    image_url: {
-                        url: `data:image/png;base64,${screenshot}`,
-                        detail: "high"
-                    }
-                });
-            }
-
-            messages.push({ role: "user", content: userContent });
-
-            const completion = await this.openai.chat.completions.create({
-                model: "gpt-5", // Uses GPT-4o for best vision capabilities
-                messages: messages,
-                response_format: { type: "json_object" }, // Enforce JSON
-                max_completion_tokens: 1000
-            });
-
-            responseText = completion.choices[0].message.content || '';
-        } catch (err) {
-            console.error("OpenAI API Error:", err);
-            throw err;
-        }
-    } else {
-        return { type: 'finish', thought: 'Unknown Model Provider', summary: 'Config Error' };
-    }
-
-    // --- PARSE & MAP BACK ---
-    const parsed = this.parseAgentActionResponse(responseText);
-    
-    if ((parsed.type === 'click' || parsed.type === 'type') && parsed.elementId) {
-        const match = parsed.elementId.match(/el_(\d+)/);
-        if (match) {
-            const idx = parseInt(match[1]);
-            const el = validElements[idx];
-            if (el) {
-                parsed.selector = el.cssSelector || el.selector;
-                parsed.semanticTarget = el.text || el.ariaLabel;
-            }
-        }
-    }
-    return parsed;
-  }
-
-  private async executeAgentAction(action: AgentAction, elements: ElementInfo[]): Promise<{success: boolean, message: string}> {
-    
-    if (action.type === 'click') {
-      const selector = action.selector; 
-      const semanticTarget = action.semanticTarget;
-
-      if (selector) return await this.clickExact(selector, semanticTarget || selector);
-      if (semanticTarget) return await this.click(semanticTarget);
-      return { success: false, message: "Missing selector/target for click" };
-    } 
-    else if (action.type === 'type') {
-      const selector = action.selector; 
-      const semanticTarget = action.semanticTarget;
-
-      if (selector) return await this.type(selector, action.text);
-      if (semanticTarget) {
-          const res = await this.click(semanticTarget); 
-          if (res.success && res.selectors?.[0]) {
-               return await this.type(res.selectors[0].cssSelector!, action.text);
+      // Map back el_X to actual selector
+      const action = this.parseAgentActionResponse(responseText);
+      if ((action.type === 'click' || action.type === 'type') && action.elementId) {
+          const idx = parseInt(action.elementId.split('_')[1]);
+          const el = visibleEl[idx];
+          if (el) {
+              action.selector = el.cssSelector || el.selector;
+              action.semanticTarget = el.text || el.ariaLabel;
           }
       }
-      return { success: false, message: "Missing selector for type" };
-    } 
-    else if (action.type === 'navigate') {
-      return this.navigate(action.url);
-    } 
-    else if (action.type === 'scroll') {
-      await this.browser.scroll(action.elementId, action.direction); 
-      return { success: true, message: 'Scrolled' };
-    } 
-    else if (action.type === 'wait') {
-      await new Promise((r) => setTimeout(r, action.durationMs));
-      return { success: true, message: 'Waited' };
-    } 
-    else if (action.type === 'finish') {
-      return { success: true, message: action.summary };
-    }
-    return { success: false, message: "Unknown action type" };
+      return action;
   }
 
-  async clickExact(selector: string, description?: string): Promise<ExecutionResult> {
-    const command: ExecutionCommand = {
-      action: 'click',
-      target: selector,
-      description: description || `Clicked ${selector}`,
-    };
-    try {
-      await this.browser.click(selector);
-      this.recordCommand(command);
-      return { success: true, message: `Clicked ${description || selector}` };
-    } catch (error: any) {
-      return { success: false, message: error.message };
-    }
+  // Robust Parser from Reference File
+  private parseAgentActionResponse(raw: string): AgentAction {
+      let clean = raw.replace(/```json\s*|\s*```/gi, '').trim();
+      // Extract balanced JSON to handle extra chatter
+      const start = clean.indexOf('{');
+      const end = clean.lastIndexOf('}');
+      if (start !== -1 && end !== -1) clean = clean.substring(start, end + 1);
+
+      try {
+          const parsed = JSON.parse(clean);
+          if (!parsed.type && parsed.action) parsed.type = parsed.action; // Compat
+          if (!parsed.thought) parsed.thought = "Executing...";
+          return parsed;
+      } catch {
+          // Fallback regex for common failures
+          return { type: 'wait', durationMs: 2000, thought: 'Failed to parse JSON, waiting.' };
+      }
   }
 
   private describeAction(action: AgentAction, success: boolean): string {
-    const status = success ? 'SUCCESS' : 'FAIL';
-    
-    if (action.type === 'click' || action.type === 'select_option') {
-        const tgt = action.semanticTarget || action.selector || 'element';
-        return `[${status}] Click ${tgt}`;
+      let description = `[${success ? 'OK' : 'FAIL'}] ${action.type}`;
+      if ('semanticTarget' in action && action.semanticTarget) {
+          description += ` ${action.semanticTarget}`;
+      }
+      description += ` - ${action.thought}`;
+      return description;
+  }
+
+  async generateSelenium(commands: ExecutionCommand[]): Promise<ExecutionResult> {
+    try {
+      const seleniumCode = await new SeleniumGenerator().generate(commands);
+      return { success: true, message: 'Selenium code generated', seleniumCode };
+    } catch (e: any) {
+      return { success: false, message: e.message };
     }
-    if (action.type === 'type') {
-        const tgt = action.semanticTarget || action.selector || 'element';
-        return `[${status}] Type "${action.text}" into ${tgt}`;
-    }
-    if (action.type === 'navigate') {
-        return `[${status}] Navigate to ${action.url}`;
-    }
-    if (action.type === 'wait') {
-        return `[${status}] Wait ${action.durationMs}ms`;
-    }
-    if (action.type === 'scroll') {
-        return `[${status}] Scroll ${action.direction}`;
-    }
-    
-    return `[${status}] ${action.type}`;
   }
 }

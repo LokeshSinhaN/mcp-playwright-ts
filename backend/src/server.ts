@@ -162,7 +162,7 @@ export function createServer(port: number, chromePath?: string) {
      const lower = prompt.toLowerCase();
      if (!/cookie/.test(lower)) return null;
      if (!/(accept|allow|agree|ok|close|dismiss|reject|deny)/.test(lower)) return null;
-     const result = await tools.handleCookieBanner(elements);
+     const result = await browser.handleCookieBanner();
      if (result.message.toLowerCase().startsWith('cookie banner dismissed')) {
        return result;
      }
@@ -182,28 +182,7 @@ export function createServer(port: number, chromePath?: string) {
   // --- SINGLE STEP AI HANDLER (Legacy/Fallback) ---
   // Note: This function currently defaults to Gemini. You can upgrade it to support switching
   // if single-step AI is still heavily used.
-  async function handleAiAction(prompt: string, selector?: string): Promise<ExecutionResult> {
-    // Default to Gemini for single-step if available, otherwise fail
-    if (!geminiModel) {
-      return { success: false, message: 'GEMINI_API_KEY is not configured', error: 'Missing GEMINI_API_KEY' };
-    }
-    const model = geminiModel;
-
-    await browser.init();
-    const observation = await tools.observe(true);
-    const elements = observation.selectors ?? [];
-
-    const cookieResult = await maybeHandleCookieFromPrompt(prompt, elements);
-    if (cookieResult) return cookieResult;
-
-    // (Code omitted: Same logic as before for handleAiAction, kept for backward compat)
-    // For brevity, I am keeping this minimal as the core request is about the Agent switching.
-    // In a real full refactor, this logic should also be moved into McpTools.
-    
-    // ... [Original handleAiAction logic would go here] ...
-    return { success: false, message: "Single-step AI temporarily disabled in favor of Agent mode for multi-model support." };
-  }
-
+  
   app.post('/api/execute', async (req, res) => {
     const { action, url, selector, text, commands, prompt, agentConfig } = req.body as {
       action: string;
@@ -236,15 +215,15 @@ export function createServer(port: number, chromePath?: string) {
           break;
         case 'handle_cookie_banner':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'handle_cookie_banner' });
-          result = await tools.handleCookieBanner((await tools.observe()).selectors);
+          result = await tools.handleCookieBanner();
           break;
         case 'extract_selectors':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'extract_selectors' });
-          result = { success: true, message: 'Selectors extracted', ...(await tools.observe()) };
+          result = { ...(await tools.observe()) };
           break;
         case 'observe':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'observe' });
-          result = { success: true, message: 'Page observed', ...(await tools.observe(true)) };
+          result = { ...(await tools.observe()) };
           break;
         case 'ai': {
           if (!prompt) throw new Error('prompt required');
@@ -353,7 +332,7 @@ export function createServer(port: number, chromePath?: string) {
         }
         case 'generate_selenium':
           broadcast({ type: 'action', timestamp: new Date().toISOString(), message: 'generate_selenium' });
-          result = { ...(await tools.generateSelenium(commands)), message: 'Selenium code generated' };
+          result = { ...(await tools.generateSelenium(commands ?? [])), message: 'Selenium code generated' };
           break;
         default:
           result = { success: false, message: `Unknown action: ${action}` };
