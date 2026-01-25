@@ -500,7 +500,7 @@ RETURN JSON ONLY: { "type": "click"|"type"|"finish"|"wait"|"scroll", "elementId"
                 model: "gpt-5", // Uses GPT-4o for best vision capabilities
                 messages: messages,
                 response_format: { type: "json_object" }, // Enforce JSON
-                max_tokens: 1000
+                max_completion_tokens: 1000
             });
 
             responseText = completion.choices[0].message.content || '';
