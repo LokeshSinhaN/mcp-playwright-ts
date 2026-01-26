@@ -269,31 +269,67 @@ export class McpTools {
 
   
 
-            if (!actionSuccess) {
+                        if (!actionSuccess) {
 
-                batchSuccess = false;
+  
 
-                batchMessage = `Batch failed at: ${action.type}. ${result?.message}`;
+                            batchSuccess = false;
 
-            } else {
+  
 
-                // Add successful command to final history
+                            batchMessage = `Batch failed at: ${action.type}. ${result?.message}`;
 
-                if (this.agentCommandBuffer) {
+  
 
-                    this.sessionHistory.push(...this.agentCommandBuffer);
+                         } else {
 
-                    this.agentCommandBuffer = []; // Clear buffer after commit
+  
 
-                }
+                            // FIX: Immediately commit successful commands to the MAIN history
 
-            }
+  
 
-            
+                            // This ensures that even if the agent crashes later, the Selenium code 
 
-            // Fast-forward delay for visual feedback between batch steps
+  
 
-            if (actionsToExecute.length > 1) await page.waitForTimeout(500);
+                            // for steps taken SO FAR is preserved and valid.
+
+  
+
+                            if (this.agentCommandBuffer && this.agentCommandBuffer.length > 0) {
+
+  
+
+                                this.sessionHistory.push(...this.agentCommandBuffer);
+
+  
+
+                                this.agentCommandBuffer = []; 
+
+  
+
+                            }
+
+  
+
+                         }
+
+  
+
+                      
+
+  
+
+                      // FIX: Add visual breathing room between batch steps
+
+  
+
+                      // This allows "patients" menu to fully render before "Patient Master List" is clicked
+
+  
+
+                      if (actionsToExecute.length > 1) await page.waitForTimeout(1000);
 
         }
 
@@ -373,171 +409,343 @@ export class McpTools {
 
   
 
-    // --- EXECUTE ACTION WITH SELECTOR ANCHORING ---
-
-        private async executeAgentAction(action: SingleAgentAction, elements: ElementInfo[]): Promise<ExecutionResult> {
-
-          
-
-          // 1. Resolve "el_X" to the REAL ElementInfo
-
-          let targetElement: ElementInfo | undefined;
-
-          if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
-
-              const idx = parseInt(action.elementId.split('_')[1]);
-
-              targetElement = elements[idx];
-
-          }
-
-      
-
-          // 2. Determine the BEST selector for Playwright & Selenium
-
-          // Priority: ID > TestID > XPath > CSS
-
-          let robustSelector = 'selector' in action ? action.selector : undefined;
-
-      let selectorsForSelenium = { css: '', xpath: '', id: '', text: '' };
+      // --- EXECUTE ACTION WITH ROBUST RECORDING ---
 
   
 
-      if (targetElement) {
-
-          robustSelector = targetElement.cssSelector || targetElement.selector; // Default
-
-          
-
-          // Prepare data for Selenium Generator
-
-          selectorsForSelenium = {
-
-              css: targetElement.cssSelector || '',
-
-              xpath: targetElement.xpath || '',
-
-              id: targetElement.id || '',
-
-              text: targetElement.text || ''
-
-          };
-
-      }
+      private async executeAgentAction(action: SingleAgentAction, elements: ElementInfo[]): Promise<ExecutionResult> {
 
   
 
-      let result: ExecutionResult = { success: false, message: '' };
+        
 
   
 
-      try {
+        // 1. Resolve "el_X" to REAL Element
 
-          if (action.type === 'click') {
+  
 
-              if (robustSelector) {
+        let targetElement: ElementInfo | undefined;
 
-                  // Execute
+  
+
+        if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
+
+  
+
+            const idx = parseInt(action.elementId.split('_')[1]);
+
+  
+
+            targetElement = elements[idx];
+
+  
+
+        }
+
+  
+
+    
+
+  
+
+        // 2. Prepare FULL Selenium Data (Prevent "Skeleton" Code)
+
+  
+
+        // We create a fallback strategy: If no ID/CSS, use Text.
+
+  
+
+        let selectorsForSelenium = { css: '', xpath: '', id: '', text: '' };
+
+  
+
+        let robustSelector = 'selector' in action ? action.selector : undefined;
+
+  
+
+    
+
+  
+
+    
+
+  
+
+        if (targetElement) {
+
+  
+
+            robustSelector = targetElement.cssSelector || targetElement.selector; // Default
+
+  
+
+            selectorsForSelenium = {
+
+  
+
+                css: targetElement.cssSelector || '',
+
+  
+
+                xpath: targetElement.xpath || '',
+
+  
+
+                id: targetElement.id || '',
+
+  
+
+                text: targetElement.text || '' // Ensure text is captured for fallback
+
+  
+
+            };
+
+  
+
+        } else if (action.type === 'click' && action.semanticTarget) {
+
+  
+
+            // Fallback for AI guesses (e.g., "Click Login")
+
+  
+
+            selectorsForSelenium.text = action.semanticTarget;
+
+  
+
+        }
+
+  
+
+    
+
+  
+
+        let result: ExecutionResult = { success: false, message: '' };
+
+  
+
+    
+
+  
+
+        try {
+
+  
+
+            // ... [Action Execution Logic (Click/Type)] ...
+
+  
+
+            
+
+  
+
+            if (action.type === 'click') {
+
+  
+
+                if (robustSelector) {
+
+  
+
+                 // ... inside click block ...
+
+  
 
                   result = await this.clickExact(robustSelector, action.semanticTarget);
 
+  
+
                   
 
-                  // Record for Selenium: Use the CAPTURED selectors
+  
+
+                  // FORCE RECORDING: Even if clickExact internal recording fails, we force it here
+
+  
 
                   this.recordCommand({ 
 
+  
+
                       action: 'click', 
 
-                      target: robustSelector, // Playwright used this
+  
 
-                      selectors: selectorsForSelenium, // Selenium will use this
+                      target: robustSelector,
 
-                      description: `Click ${action.semanticTarget || robustSelector}`
+  
+
+                      // CRITICAL: Pass the full object so SeleniumGenerator doesn't print "WARNING"
+
+  
+
+                      selectors: selectorsForSelenium, 
+
+  
+
+                      description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`
+
+  
 
                   });
 
   
 
-              } else {
-
-                  result = { success: false, message: "No selector for click" };
-
-              }
-
-          } 
-
-                    else if (action.type === 'type') {
-
-                        if (robustSelector) {
-
-                            // Using .type() in BrowserManager which now maps to .fill()
-
-                            await this.browser.type(robustSelector, action.text); 
-
-                            
-
-                            this.recordCommand({ 
-
-                                action: 'type', 
-
-                                target: robustSelector, 
-
-                                value: action.text,
-
-                                selectors: selectorsForSelenium,
-
-                                description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`
-
-                            });
-
-                            
-
-                            result = { success: true, message: `Filled "${action.text}"` };
-
-                        } else {
-
-                            result = { success: false, message: "No selector for type" };
-
-                        }
-
-                    }
-
-          else if (action.type === 'wait') {
-
-               await new Promise(r => setTimeout(r, action.durationMs));
-
-               this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000 });
-
-               result = { success: true, message: "Waited" };
-
-          }
-
-          else if (action.type === 'navigate') {
-
-               await this.navigate(action.url); // recordCommand is handled inside this.navigate
-
-               result = { success: true, message: `Mapsd to ${action.url}` };
-
-          }
-
-          // ... handle other types ...
-
-      } catch (e: any) {
-
-          return { success: false, message: e.message, failedSelector: robustSelector };
-
-      }
+                } else {
 
   
 
-      // 3. Post-Action State Verification
+                     result = { success: false, message: "No selector for click" };
 
-      // (Logic from previous file kept here)
+  
 
-      return result;
+                }
 
-    }
+  
+
+            }
+
+  
+
+            else if (action.type === 'type') {
+
+  
+
+                if (robustSelector) {
+
+  
+
+                 // ... inside type block ...
+
+  
+
+                 await this.browser.type(robustSelector, action.text);
+
+  
+
+                 
+
+  
+
+                 this.recordCommand({ 
+
+  
+
+                     action: 'type', 
+
+  
+
+                     target: robustSelector, 
+
+  
+
+                     value: action.text,
+
+  
+
+                     selectors: selectorsForSelenium,
+
+  
+
+                     description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`
+
+  
+
+                 });
+
+  
+
+                 result = { success: true, message: `Filled "${action.text}"` };
+
+  
+
+                } else {
+
+  
+
+                    result = { success: false, message: "No selector for type" };
+
+  
+
+                }
+
+  
+
+            }
+
+  
+
+            else if (action.type === 'wait') {
+
+  
+
+                   await new Promise(r => setTimeout(r, action.durationMs));
+
+  
+
+                   this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000 });
+
+  
+
+                   result = { success: true, message: "Waited" };
+
+  
+
+            }
+
+  
+
+            else if (action.type === 'navigate') {
+
+  
+
+                   await this.navigate(action.url); // recordCommand is handled inside this.navigate
+
+  
+
+                   result = { success: true, message: `Navigated to ${action.url}` };
+
+  
+
+            }
+
+  
+
+            // ... [Wait/Navigate blocks] ...
+
+  
+
+    
+
+  
+
+        } catch (e: any) {
+
+  
+
+            return { success: false, message: e.message, failedSelector: robustSelector };
+
+  
+
+        }
+
+  
+
+    
+
+  
+
+        return result;
+
+  
+
+      }
 
   
 

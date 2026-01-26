@@ -114,6 +114,42 @@ export class BrowserManager {
     return page.locator(selector).first(); 
   }
 
+  // NEW: Universal Stability Wait (Network + DOM Mutations)
+  async waitForStability(timeout = 2000): Promise<void> {
+      const page = this.getPage();
+      try {
+          // 1. Wait for Network Idle (catch-all for AJAX requests)
+          await page.waitForLoadState('networkidle', { timeout: timeout }).catch(() => {});
+          
+          // 2. Wait for DOM Stability (Animations/Rendering)
+          // Checks if the HTML structure stops changing for at least 200ms
+          await page.evaluate(async () => {
+              return new Promise<void>((resolve) => {
+                  let lastHtml = document.body.innerHTML.length;
+                  let steadyTicks = 0;
+                  const interval = setInterval(() => {
+                      const currentHtml = document.body.innerHTML.length;
+                      if (currentHtml === lastHtml) {
+                          steadyTicks++;
+                      } else {
+                          steadyTicks = 0;
+                          lastHtml = currentHtml;
+                      }
+                      
+                      // If stable for 3 ticks (300ms) or timeout roughly reached
+                      if (steadyTicks >= 3) {
+                          clearInterval(interval);
+                          resolve();
+                      }
+                  }, 100);
+                  setTimeout(() => { clearInterval(interval); resolve(); }, 2000); // Max wait in browser context
+              });
+          });
+      } catch (e) {
+          // Ignore timeouts, just proceed
+      }
+  }
+
   async click(selector: string): Promise<ElementInfo> {
     const page = this.getPage();
     const locator = await this.smartLocate(selector, this.defaultTimeout);
@@ -122,7 +158,7 @@ export class BrowserManager {
 
     await locator.scrollIntoViewIfNeeded().catch(() => {});
 
-    // Capture pre-click info
+    // Capture pre-click info for Selenium
     let info: ElementInfo | undefined;
     try {
       const handle = await locator.elementHandle();
@@ -142,15 +178,10 @@ export class BrowserManager {
         await locator.dispatchEvent('click');
     }
 
-    // --- FIX: WAIT FOR REACTION ---
-    // If we click something, the state usually changes. Wait for it.
-    try {
-       await Promise.race([
-           page.waitForURL(u => u.toString() !== page.url(), { timeout: 3000 }), // URL Change
-           page.waitForEvent('framenavigated', { timeout: 2000 }), // Navigation
-           this.waitForNetworkIdle(1500) // Or just idle
-       ]);
-    } catch {}
+    // --- FIX: UNIVERSAL WAIT FOR UI REACTION ---
+    // This solves the "Preview too early" bug.
+    // It forces the browser to wait until the menu/dropdown actually renders.
+    await this.waitForStability(2500); 
 
     return info || { tagName: 'clicked', attributes: {}, cssSelector: selector };
   }

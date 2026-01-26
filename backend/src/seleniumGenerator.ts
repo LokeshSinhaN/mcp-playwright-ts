@@ -69,59 +69,38 @@ export class SeleniumGenerator {
      * DOM-captured selectors are available.
      */
     const getSelectorCode = (cmd: ExecutionCommand): string => {
-      // 1. Prefer real CSS selector from captured selectors
-      if (cmd.selectors?.css && cmd.selectors.css.trim()) {
-        const css = cmd.selectors.css;
-        return `(By.CSS_SELECTOR, "${css.replace(/"/g, '\\"')}")`;
+      // 1. Prefer real CSS (Best)
+      if (cmd.selectors?.css && cmd.selectors.css.trim().length > 2) {
+        return `(By.CSS_SELECTOR, "${cmd.selectors.css.replace(/"/g, '\\"')}")`;
       }
       
-      // 2. Prefer real XPath from captured selectors
-      if (cmd.selectors?.xpath && cmd.selectors.xpath.trim()) {
-        const xpath = cmd.selectors.xpath;
-        return `(By.XPATH, "${xpath.replace(/"/g, '\\"')}")`;
+      // 2. Prefer real XPath (Robust)
+      if (cmd.selectors?.xpath && cmd.selectors.xpath.trim().length > 2) {
+        return `(By.XPATH, "${cmd.selectors.xpath.replace(/"/g, '\\"')}")`;
       }
       
-      // 3. Prefer ID-based selector if available
+      // 3. Prefer ID (Fast)
       if (cmd.selectors?.id && cmd.selectors.id.trim()) {
         return `(By.ID, "${cmd.selectors.id.replace(/"/g, '\\"')}")`;
       }
       
-      // 4. Use semantic text with robust XPath (when we only have text, not a real selector)
-      // This is better than blindly treating text as CSS
-      if (cmd.selectors?.text && cmd.selectors.text.trim() && !cmd.selectors?.css && !cmd.selectors?.xpath) {
-        const text = cmd.selectors.text.trim();
-        const escaped = text.replace(/'/g, "\\'");
-        // Generate a robust XPath that matches visible text or aria-label
-        return `(By.XPATH, "//*[contains(normalize-space(text()), '${escaped}') or contains(@aria-label, '${escaped}') or @title='${escaped}']")`;
-      }
+      // 4. UNIVERSAL FALLBACK: Text-based XPath
+      // This prevents "Skeleton" code. If we have ANY text hint, we generate a click.
+      const textHint = cmd.selectors?.text || cmd.description?.replace(/^Click\s+/i, '') || cmd.target;
       
-      // 5. Fallback to target field (legacy/semantic)
+      if (textHint && !textHint.includes('el_') && !textHint.includes('xpath=')) {
+          const safeText = textHint.trim().replace(/'/g, "\\'");
+          // Matches text OR aria-label OR title - very high hit rate
+          return `(By.XPATH, "//*[contains(text(), '${safeText}') or contains(@aria-label, '${safeText}') or @title='${safeText}']")`;
+      }
+
+      // 5. Raw Target Fallback
       const target = cmd.target || '';
-      
-      // Handle XPath explicitly
-      if (target.startsWith('xpath=') || target.startsWith('//') || target.startsWith('(//')) {
-        const val = target.replace(/^xpath=/, '');
-        return `(By.XPATH, "${val.replace(/"/g, '\\"')}")`;
+      if (target.startsWith('//') || target.startsWith('xpath=')) {
+          return `(By.XPATH, "${target.replace(/^xpath=/, '').replace(/"/g, '\\"')}")`;
       }
-      
-      // Handle Text pseudo-selector for robust matching
-      if (target.startsWith('text=')) {
-        const val = target.replace(/^text=/, '');
-        return `(By.XPATH, "//*[contains(text(), '${val.replace(/'/g, "\\'")}')]")`;
-      }
-      
-      // Detect if target looks like semantic text (not a valid CSS selector)
-      // Valid CSS patterns: contains [, #, ., >, :, or starts with tag name followed by selector chars
-      const looksLikeValidCss = /^[a-z]+[#.\[:]|^[#.\[]|^[a-z]+$/i.test(target.trim());
-      
-      if (!looksLikeValidCss && target.trim().length > 0) {
-        // Convert semantic text to XPath text contains (last resort)
-        const escaped = target.replace(/'/g, "\\'");
-        console.warn(`[SeleniumGenerator] WARNING: Using semantic text fallback for "${target}". This may be unreliable.`);
-        return `(By.XPATH, "//*[contains(normalize-space(text()), '${escaped}') or contains(@aria-label, '${escaped}')]")`;
-      }
-      
-      // Default to CSS
+
+      // Final fallback (CSS)
       return `(By.CSS_SELECTOR, "${target.replace(/"/g, '\\"')}")`;
     };
     
