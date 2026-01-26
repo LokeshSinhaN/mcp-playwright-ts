@@ -84,28 +84,31 @@ export interface SessionState {
   selectors: Map<string, ElementInfo>;
 }
 
-export type AgentAction =
-  | { type: 'navigate'; url: string; thought: string }
-  | { type: 'click'; elementId?: string; selector?: string; semanticTarget?: string; thought: string }
-  | { type: 'type'; elementId?: string; selector?: string; semanticTarget?: string; text: string; thought: string }
-  | { type: 'select_option'; elementId?: string; selector?: string; semanticTarget?: string; option: string; thought: string }
-  | { type: 'scrape_data'; instruction: string; thought: string }
-  | { type: 'scroll'; direction: 'up' | 'down'; elementId?: string; thought: string }
-  | { type: 'wait'; durationMs: number; thought: string }
-  | { type: 'finish'; thought: string; summary: string };
 
+export type AgentAction = 
+  | SingleAgentAction 
+  | SingleAgentAction[];
+
+export type SingleAgentAction =
+  | { type: 'navigate'; url: string; thought?: string }
+  | { type: 'click'; elementId?: string; selector?: string; semanticTarget?: string; thought?: string }
+  | { type: 'type'; elementId?: string; selector?: string; semanticTarget?: string; text: string; thought?: string }
+  | { type: 'select_option'; elementId?: string; selector?: string; semanticTarget?: string; option: string; thought?: string }
+  | { type: 'scrape_data'; instruction: string; thought?: string }
+  | { type: 'scroll'; direction: 'up' | 'down'; elementId?: string; thought?: string }
+  | { type: 'wait'; durationMs: number; thought?: string }
+  | { type: 'finish'; thought?: string; summary: string };
+
+// Update AgentStepResult to reflect batch execution
 export interface AgentStepResult {
   stepNumber: number;
-  action: AgentAction;
+  actions: SingleAgentAction[]; // Changed from 'action'
   success: boolean;
   message: string;
   urlBefore: string;
   urlAfter: string;
   stateChanged: boolean;
-  recoveryAttempt?: string;
   screenshot?: string;
-  elementInfo?: ElementInfo;
-  error?: string;
   retryCount: number;
 }
 

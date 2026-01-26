@@ -172,7 +172,20 @@ export class BrowserManager {
 
   async type(selector: string, text: string): Promise<void> {
     const page = this.getPage();
-    await page.locator(selector).type(text);
+    try {
+        // Use fill() which implies clear() + type()
+        // This prevents "UserPass" concatenation bugs
+        await page.locator(selector).fill(text); 
+    } catch (e) {
+        // Fallback for non-fillable elements (like complex react divs)
+        await page.locator(selector).click();
+        await page.keyboard.type(text);
+    }
+  }
+
+  // Explicit fill method if needed
+  async fill(selector: string, text: string): Promise<void> {
+      await this.getPage().locator(selector).fill(text);
   }
 
   async handleCookieBanner(): Promise<ExecutionResult> {

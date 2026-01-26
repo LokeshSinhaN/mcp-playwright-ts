@@ -1,4 +1,5 @@
-//
+// selectorExtractor.ts
+
 import { Page, ElementHandle, Frame } from 'playwright';
 import { ElementInfo } from './types';
 
@@ -13,464 +14,183 @@ export class SelectorExtractor {
         try {
             const results = await this.extractFromScope(frame);
             allResults.push(...results);
-        } catch (e) {
-            // Frame might have detached, ignore
+        } catch (e) { /* Frame detached */ }
+    }
+    
+    // De-duplicate based on exact location (x,y)
+    const unique = new Map<string, ElementInfo>();
+    for (const el of allResults) {
+        // Round coordinates to avoid sub-pixel dupes
+        const k = `${Math.round(el.boundingBox?.x || 0)},${Math.round(el.boundingBox?.y || 0)}`;
+        if (!unique.has(k) || (el.text && el.text.length > (unique.get(k)?.text?.length || 0))) {
+            unique.set(k, el);
         }
     }
-    
-    // POST-PROCESSING: Z-Index & Modal Priority
-    // If we find a password field or high z-index element, we flag it.
-    const hasModal = allResults.some(el => el.isFloating || (el.attributes['type'] === 'password'));
-    
-    if (hasModal) {
-        // If a modal/login is present, DE-PRIORITIZE background navigation links
-        // This prevents clicking "Patient Master List" when "Login" is required.
-        allResults = allResults.map(el => {
-            if (el.roleHint === 'link' && !el.isFloating) {
-                // Penalize background links
-                el.visible = false; // Soft hide for the agent
-            }
-            return el;
-        });
-    }
 
-    return allResults;
+    return Array.from(unique.values());
   }
 
   private async extractFromScope(scope: Page | Frame): Promise<ElementInfo[]> {
+    // 1. Expanded Selector list to catch everything
     const handles = await scope.$$(
       [
-        'button', 'a', 'input', 'textarea', 'select',
-        '[role=button]', '[role=link]', '[role="option"]', '[role="search"]',
-        '[onclick]', 'li[onclick]', 'div[onclick]', 'span[onclick]',
-        '[class*="btn" i]', '[class*="button" i]', '[class*="icon" i]',
-        '[style*="cursor: pointer"]', '[style*="cursor:pointer"]',
-        '[tabindex]:not([tabindex="-1"])',
-        // Universal Scroll Containers
-        'ul', 'ol', 'div[style*="overflow"]', 'div[class*="scroll"]',
-        '[role="listbox"]', '[role="menu"]', '.dropdown-menu',
-        '[style*="z-index"]' 
+        'button', 'a', 'input:not([type="hidden"])', 'textarea', 'select',
+        '[role=button]', '[role=link]', '[role="checkbox"]', '[role="switch"]', 
+        '[role="menuitem"]', '[role="option"]',
+        '[onclick]', '[class*="btn" i]', '[class*="button" i]', 
+        '[contenteditable]', '[tabindex]:not([tabindex="-1"])'
       ].join(', ')
     );
 
     const results: ElementInfo[] = [];
-    const seen = new Set<string>();
-
+    
     for (const h of handles) {
+      // Filter non-visible early to save time
+      const isVisible = await h.isVisible();
+      if (!isVisible) continue;
+
       const info = await this.extractFromHandle(h);
-      if (!info) continue;
-
-      const bbox = info.boundingBox || info.rect || { x: 0, y: 0, width: 0, height: 0 };
-      const key = [info.tagName, info.text, `${bbox.x},${bbox.y}`].join('|');
-
-      if (seen.has(key)) continue;
-      seen.add(key);
-      results.push(info);
+      if (info) results.push(info);
     }
     return results;
   }
 
-  async extractForSelector(selector: string): Promise<ElementInfo> {
-    const handle = await this.page.$(selector);
-    if (!handle) throw new Error(`Element not found: ${selector}`);
-    return this.extractFromHandle(handle);
-  }
-
-  async extractFromHandle(handle: ElementHandle): Promise<ElementInfo> {
-    // (Keep your existing extractFromHandle logic exactly as is, it is good)
-    // ... Copy the rest of your existing extractFromHandle method here ...
-    // Just ensure resolveInteractiveHandle and others are preserved.
-    
-    // MINOR TWEAK for extractFromHandle: Ensure we capture "type" for inputs
+  async extractFromHandle(handle: ElementHandle): Promise<ElementInfo | null> {
+    // 2. Strict Input Handling: Do not bubble up if it's already an input
     const interactiveHandle = await this.resolveInteractiveHandle(handle);
+    
     const base = await interactiveHandle.evaluate((el: any) => {
-        const win = el.ownerDocument && el.ownerDocument.defaultView;
         const rect = el.getBoundingClientRect();
-        const style = win ? win.getComputedStyle(el) : null;
+        if (rect.width === 0 || rect.height === 0) return null;
+
+        const getAttr = (name: string) => el.getAttribute(name) || '';
+        const tagName = el.tagName.toLowerCase();
+        const inputType = (tagName === 'input' ? getAttr('type') : '').toLowerCase();
+
+        // Label Resolution Strategy
+        let label = getAttr('aria-label') || getAttr('placeholder') || getAttr('name') || '';
         
-        const zIndex = style ? parseInt(style.zIndex || '0', 10) : 0;
-        const isFloating = zIndex > 100 || (style && (style.position === 'absolute' || style.position === 'fixed'));
-
-        // UNIVERSAL SCROLL DETECTION
-        let isScrollable = style && (
-          (style.overflowY === 'auto' || style.overflowY === 'scroll') ||
-          (style.overflowX === 'auto' || style.overflowX === 'scroll')
-        );
-        
-        const getAttr = (name: string): string =>
-          typeof el.getAttribute === 'function' ? el.getAttribute(name) || '' : '';
-
-        const role = getAttr('role');
-        if (role === 'listbox' || role === 'menu' || role === 'tree') isScrollable = true;
-
-        // UNIVERSAL STATE DETECTION
-        // Standard way websites signal an open dropdown
-        const ariaExpanded = getAttr('aria-expanded');
-        const isExpanded = ariaExpanded === 'true';
-
-        const visible =
-          !!el.offsetParent &&
-          rect.width > 0 &&
-          rect.height > 0 &&
-          (!style || (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'));
-
-        const tagName = (el.tagName || '').toLowerCase();
-        
-        let roleHint: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other' = 'other';
-        if (tagName === 'button') roleHint = 'button';
-        else if (tagName === 'a') roleHint = 'link';
-        else if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') roleHint = 'input';
-        if (role === 'option' || role === 'menuitem') roleHint = 'option';
-        if (role === 'listbox' || role === 'combobox') roleHint = 'listbox';
-
-        const typeAttr = (el.getAttribute('type') || '').toLowerCase(); // Add this line to ensure we catch password fields for the blocker check
-        const placeholder = getAttr('placeholder');
-        const ariaLabel = getAttr('aria-label');
-        const valueAttr = (el as any).value !== undefined ? String((el as any).value) : getAttr('value');
-        const titleAttr = getAttr('title');
-        const dataTestId = getAttr('data-testid');
-        const href = getAttr('href');
-        const isSearchField =
-          tagName === 'input' &&
-          (/search/i.test(typeAttr) || /search/i.test(placeholder) || /search/i.test(ariaLabel));
-
-        // --- UNIVERSAL LABEL DETECTION ("The Eyes") ---
-        // Dynamically find text next to the element to solve ambiguity.
-        const getText = (node: any | null): string => {
-          if (!node || node.nodeType !== 1) return '';
-          return (node.innerText || node.textContent || '').trim();
-        };
-
-        let nearbyLabel = '';
-        
-        // 1. Look Left (Previous Sibling)
-        let sibling = el.previousElementSibling;
-        if (sibling && getText(sibling).length > 1 && getText(sibling).length < 40) {
-            nearbyLabel = getText(sibling);
+        // If no internal label, look for <label> tag
+        if (!label && el.id) {
+            const labelEl = document.querySelector(`label[for="${el.id}"]`);
+            if (labelEl) label = labelEl.textContent?.trim() || '';
         }
-
-        // 2. Look Up (Parent's Previous Sibling - Common in Forms)
-        if (!nearbyLabel && el.parentElement) {
-            const parentSibling = el.parentElement.previousElementSibling;
-            if (parentSibling && getText(parentSibling).length > 1 && getText(parentSibling).length < 40) {
-                nearbyLabel = getText(parentSibling);
-            }
-        }
-
-        // 3. Look at Table Headers (If inside a grid)
-        if (!nearbyLabel) {
-            const td = el.closest('td');
-            if (td && td.previousElementSibling) {
-                nearbyLabel = getText(td.previousElementSibling);
-            }
-        }
-        // ----------------------------------------------
-
-        const viewportHeight = win && win.innerHeight ? win.innerHeight : 900;
-        let region: 'header' | 'main' | 'footer' = 'main';
-        const closestSafe = (selector: string): Element | null => {
-          try {
-            return typeof el.closest === 'function' ? el.closest(selector) : null;
-          } catch {
-            return null;
-          }
-        };
-
-        if (closestSafe('header') || closestSafe('nav')) {
-          region = 'header';
-        } else if (closestSafe('footer')) {
-          region = 'footer';
-        } else if (closestSafe('main')) {
-          region = 'main';
-        } else {
-          if (rect.top < viewportHeight * 0.25) region = 'header';
-          else if (rect.top > viewportHeight * 0.75) region = 'footer';
-          else region = 'main';
-        }
-
-        const rawText = (el.textContent || '').trim();
-        let effectiveText = rawText || (tagName === 'input' ? valueAttr : '') || '';
         
-        // Inject the discovered label into the text for the LLM
-        if (nearbyLabel && !effectiveText.includes(nearbyLabel)) {
-            effectiveText = `${nearbyLabel} ${effectiveText}`;
+        // If still no label, check previous sibling for text (common in simple forms)
+        if (!label && (tagName === 'input' || tagName === 'select')) {
+             let sib = el.previousElementSibling;
+             while(sib && sib.tagName === 'BR') sib = sib.previousElementSibling; // skip breaks
+             if (sib && sib.textContent && sib.textContent.length < 50) {
+                 label = sib.textContent.trim();
+             }
+             // Check parent text if concise
+             if (!label && el.parentElement && el.parentElement.innerText.length < 50) {
+                 label = el.parentElement.innerText.replace(el.value || '', '').trim();
+             }
         }
 
         return {
-            // ... existing returns ...
             tagName,
-            id: el.id || undefined,
-            className: el.className || undefined,
-            text: effectiveText, // Now includes "Insurance: " automatically
-            ariaLabel,
-            placeholder: placeholder || undefined,
-            title: titleAttr || undefined,
-            dataTestId: dataTestId || undefined,
-            href,
-            visible,
-            roleHint,
-            scrollable: isScrollable,
-            isFloating,
-            expanded: isExpanded, // Export state
-            searchField: isSearchField,
-            region,
+            id: el.id,
+            className: el.className,
+            text: el.innerText || el.value || '', // Prefer value for inputs
+            ariaLabel: label,
+            placeholder: getAttr('placeholder'),
+            type: inputType,
+            name: getAttr('name'),
+            role: getAttr('role'),
             boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
-            context: nearbyLabel || undefined,
-            attributes: Array.from(el.attributes).map((a: any) => [a.name, a.value] as const),
-            type: typeAttr // Return type explicitly
+            visible: true
         };
     });
 
+    if (!base) return null;
+
+    // 3. Generate ROBUST Selector (The fix for "UserPass" bug)
     const cssSelector = await this.generateCss(interactiveHandle);
     const xpath = await this.generateXpath(interactiveHandle);
-    const rawAttrs = Object.fromEntries(base.attributes);
-    
-    // Explicitly expose 'type' in attributes for the agent to see
-    if (base.type) rawAttrs['type'] = base.type;
 
     return {
-        // ... existing mapping ...
-        tagName: base.tagName,
-        id: base.id,
-        className: base.className,
-        text: base.text,
-        ariaLabel: base.ariaLabel,
-        placeholder: base.placeholder,
-        title: base.title,
-        dataTestId: base.dataTestId,
-        href: base.href,
+        ...base,
         cssSelector,
-        xpath,
         selector: cssSelector,
-        visible: base.visible,
-        isVisible: base.visible,
-        roleHint: base.roleHint as any,
-        scrollable: base.scrollable,
-        isFloating: base.isFloating,
-        expanded: base.expanded,
-        searchField: base.searchField,
-        region: base.region,
-        boundingBox: base.boundingBox,
-        rect: base.boundingBox,
-        context: base.context,
-        attributes: rawAttrs
+        xpath,
+        attributes: { type: base.type, name: base.name, role: base.role },
+        isVisible: true
     } as any;
   }
 
+  // Prevent generic divs from stealing focus
   private async resolveInteractiveHandle(handle: ElementHandle): Promise<ElementHandle> {
-    const candidateHandle = await handle.evaluateHandle((node: any) => {
-      const isElementNode = (n: any): n is Element => !!n && n.nodeType === 1;
-
-      const isInteractive = (el: any | null): boolean => {
-        if (!isElementNode(el)) return false;
-        const tag = (el.tagName || '').toLowerCase();
-        const role =
-          typeof (el as any).getAttribute === 'function'
-            ? ((el as any).getAttribute('role') || '').toLowerCase()
-            : '';
-        const hasOnClick = typeof (el as any).onclick === 'function';
-        const interactiveTags = ['button', 'a', 'input', 'select', 'textarea'];
-        const interactiveRoles = ['button', 'combobox', 'listbox', 'menuitem', 'checkbox', 'link'];
-        return interactiveTags.includes(tag) || interactiveRoles.includes(role) || hasOnClick;
-      };
-
-      const isPassive = (el: any | null): boolean => {
-        if (!isElementNode(el)) return false;
-        const tag = (el.tagName || '').toLowerCase();
-        return tag === 'span' || tag === 'div' || tag === 'p' || tag === 'i';
-      };
-
-      let current: any = node;
-      if (!isElementNode(current)) {
-        current = (node && (node as any).parentElement) || node;
-      }
-
-      if (!isElementNode(current)) {
-        return node;
-      }
-
-      if (isInteractive(current)) {
-        return current;
-      }
-
-      if (isPassive(current) && typeof (current as any).closest === 'function') {
-        const viaClosest = (current as any).closest(
-          'button, a, input, textarea, select, [role="button"], [role="link"], [onclick]'
-        );
-        if (viaClosest) {
-          return viaClosest;
-        }
-      }
-
-      let ancestor: any | null = (current as any).parentElement;
-      while (ancestor) {
-        if (isInteractive(ancestor)) {
-          return ancestor;
-        }
-        ancestor = (ancestor as any).parentElement;
-      }
-
-      return current;
-    });
-
-    const asElement = candidateHandle.asElement();
-    return asElement ?? handle;
+    return handle.evaluateHandle((el: any) => {
+        const t = el.tagName.toLowerCase();
+        // If it's a form field, IT IS the target. Never bubble up.
+        if (['input', 'select', 'textarea', 'label'].includes(t)) return el;
+        
+        // Otherwise, bubble up to finding clickable parent
+        return el.closest('button, a, [role="button"], [onclick]') || el;
+    }).then(h => h.asElement() || handle);
   }
 
+  // 4. Unique Selector Generation
   private async generateCss(handle: ElementHandle): Promise<string> {
     return handle.evaluate((el: any) => {
-      const escapeCss = (str: string) => {
-        if (typeof (globalThis as any).CSS !== 'undefined' && (globalThis as any).CSS.escape) {
-          return (globalThis as any).CSS.escape(str);
-        }
-        return str.replace(/([:.[\]#])/g, '\\$1');
-      };
+      const escapeCss = (str: string) => CSS.escape(str);
+      
+      // A. ID is king
+      if (el.id) return `#${escapeCss(el.id)}`;
 
-      const getAttr = (name: string): string | null =>
-        typeof el.getAttribute === 'function' ? el.getAttribute(name) : null;
-      const escapeAttr = (value: string) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-
-      if (el.id) {
-        return `#${escapeCss(String(el.id))}`;
+      // B. Unique Name/Placeholder (common in logins)
+      if (el.name) {
+          const nameSel = `${el.tagName.toLowerCase()}[name="${escapeCss(el.name)}"]`;
+          if (document.querySelectorAll(nameSel).length === 1) return nameSel;
+      }
+      if (el.placeholder) {
+          const phSel = `${el.tagName.toLowerCase()}[placeholder="${escapeCss(el.placeholder)}"]`;
+          if (document.querySelectorAll(phSel).length === 1) return phSel;
       }
 
-      const dataTestId = getAttr('data-testid');
-      if (dataTestId) {
-        return `[data-testid="${escapeCss(dataTestId)}"]`;
+      // C. Structural Fallback (Strict nth-of-type)
+      const path: string[] = [];
+      let current = el;
+      while (current && current.nodeType === 1) {
+          let selector = current.tagName.toLowerCase();
+          
+          if (current.id) {
+              selector = `#${escapeCss(current.id)}`;
+              path.unshift(selector);
+              break; 
+          }
+
+          // Use nth-of-type to differentiate "Username input" from "Password input"
+          let sibling = current;
+          let nth = 1;
+          while (sibling = sibling.previousElementSibling) {
+              if (sibling.tagName.toLowerCase() === selector) nth++;
+          }
+          if (nth > 1) selector += `:nth-of-type(${nth})`;
+          
+          path.unshift(selector);
+          current = current.parentElement;
       }
-
-      const nameAttr = getAttr('name');
-      if (nameAttr) {
-          return `${(el.tagName || '').toLowerCase()}[name="${escapeAttr(nameAttr)}"]`;
-      }
-
-      const ariaLabel = getAttr('aria-label');
-      if (ariaLabel) {
-        const role = getAttr('role');
-        const tag = (el.tagName || '').toLowerCase();
-        if (role) {
-          return `[role="${escapeAttr(role)}"][aria-label="${escapeAttr(ariaLabel)}"]`;
-        }
-        return `${tag}[aria-label="${escapeAttr(ariaLabel)}"]`;
-      }
-
-      const parts: string[] = [];
-      let curr: any = el;
-
-      while (curr && curr !== document.body) {
-        let part = (curr.tagName || '').toLowerCase();
-        if (!part) break;
-
-        if (curr.id) {
-          part += `#${escapeCss(String(curr.id))}`;
-          parts.unshift(part);
-          break;
-        }
-
-        const className = curr.className || '';
-        if (typeof className === 'string') {
-          const classes = className
-            .split(/\s+/)
-            .filter(Boolean)
-            .filter((c: string) => /^[a-zA-Z0-9_-]+$/.test(c))
-            .slice(0, 2)
-            .map((c: string) => `.${c}`);
-          if (classes.length) part += classes.join('');
-        }
-
-        const parent = curr.parentElement;
-        if (parent) {
-          const siblings = Array.from(parent.children);
-          const index = siblings.indexOf(curr) + 1;
-          if (index > 0) part += `:nth-child(${index})`;
-        }
-
-        parts.unshift(part);
-        curr = parent;
-      }
-
-      return parts.join(' > ');
+      return path.join(' > ');
     });
   }
 
   private async generateXpath(handle: ElementHandle): Promise<string> {
-    return handle.evaluate((el: any) => {
-      const segments: string[] = [];
-      let node: any = el;
-      while (node && node.nodeType === 1) {
-        let index = 1;
-        let sibling = node.previousElementSibling;
-        while (sibling) {
-          if (sibling.tagName === node.tagName) index++;
-          sibling = sibling.previousElementSibling;
-        }
-
-        const tag = node.tagName.toLowerCase();
-        segments.unshift(`${tag}[${index}]`);
-        node = node.parentElement;
-      }
-
-      return '/' + segments.join('/');
-    });
-  }
-
-  async findCandidates(query: string): Promise<ElementInfo[]> {
-    const all = await this.extractAllInteractive();
-    const lowerQuery = query.toLowerCase().trim();
-    if (!lowerQuery) return [];
-
-    const scored = all
-      .map((info) => ({ info, score: this.scoreCandidate(info, lowerQuery) }))
-      .filter(({ score }) => score > 0)
-      .sort((a, b) => b.score - a.score);
-
-    return scored.map((s) => s.info);
-  }
-
-  scoreForQuery(info: ElementInfo, query: string): number {
-    const lowerQuery = query.toLowerCase().trim();
-    if (!lowerQuery) return 0;
-    return this.scoreCandidate(info, lowerQuery);
-  }
-
-  private scoreCandidate(info: ElementInfo, lowerQuery: string): number {
-    let score = 0;
-    const text = (info.text || '').toLowerCase();
-    const label = (info.ariaLabel || '').toLowerCase();
-    const id = (info.id || '').toLowerCase();
-    const className = (info.className || '').toLowerCase();
-    const terms = lowerQuery.split(/\s+/).filter(Boolean);
-
-    const hasExact =
-      text === lowerQuery ||
-      label === lowerQuery ||
-      terms.some((t) => t.length > 1 && (text === t || label === t));
-    if (hasExact) {
-      score += 100;
-    }
-
-    const hasPartial =
-      text.includes(lowerQuery) ||
-      label.includes(lowerQuery) ||
-      terms.some((t) => t.length > 1 && (text.includes(t) || label.includes(t)));
-    if (hasPartial) {
-      score += 50;
-    }
-
-    const queryHasIcon = lowerQuery.includes('icon');
-    const queryHasSearch = lowerQuery.includes('search');
-
-    if (queryHasIcon && (id.includes('icon') || className.includes('icon'))) {
-      score += 25;
-    }
-    if (queryHasSearch && (id.includes('search') || className.includes('search'))) {
-      score += 25;
-    }
-
-    if (info.isVisible !== false) score += 5;
-    if (info.region === 'header') score += 5;
-    if (info.searchField && queryHasSearch) score += 10;
-
-    return score;
+      // Standard robust xpath generation
+      return handle.evaluate((el: any) => {
+          if (el.id) return `//*[@id="${el.id}"]`;
+          const parts = [];
+          while (el && el.nodeType === 1) {
+              let idx = 1;
+              for (let sib = el.previousSibling; sib; sib = sib.previousSibling) {
+                  if (sib.nodeType === 1 && sib.tagName === el.tagName) idx++;
+              }
+              parts.unshift(`${el.tagName.toLowerCase()}[${idx}]`);
+              el = el.parentNode;
+          }
+          return '/' + parts.join('/');
+      });
   }
 }
