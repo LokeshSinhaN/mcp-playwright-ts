@@ -19,23 +19,31 @@ export class SelectorExtractor {
     }
     
     // POST-PROCESSING: Z-Index & Modal Priority
-    // If we find a password field or high z-index element, we flag it.
     const hasModal = allResults.some(el => el.isFloating || (el.attributes['type'] === 'password'));
     
     if (hasModal) {
         // If a modal/login is present, DE-PRIORITIZE background navigation links
-        // This prevents clicking "Patient Master List" when "Login" is required.
         allResults = allResults.map(el => {
             if (el.roleHint === 'link' && !el.isFloating) {
-                // Penalize background links
                 el.visible = false; // Soft hide for the agent
+            }
+            return el;
+        });
+    } else {
+        // BOOST navigation links in header when NO modal is present
+        allResults = allResults.map(el => {
+            if (el.roleHint === 'link' && el.region === 'header') {
+                // Add a visual priority marker for the LLM
+                if (el.text && !el.text.startsWith('[NAV]')) {
+                    el.text = `[NAV] ${el.text}`;
+                }
             }
             return el;
         });
     }
 
     return allResults;
-  }
+}
 
   private async extractFromScope(scope: Page | Frame): Promise<ElementInfo[]> {
     const handles = await scope.$$(
@@ -473,4 +481,36 @@ export class SelectorExtractor {
 
     return score;
   }
+
+async detectSuccessIndicators(): Promise<{ hasSuccess: boolean; message?: string }> {
+    const page = this.page;
+    
+    const successPatterns = [
+        'success', 'completed', 'exported', 'downloaded', 'saved',
+        'done', 'finished', 'submitted', 'confirmed'
+    ];
+    
+    const indicators = await page.evaluate((patterns) => {
+        const bodyText = document.body.innerText.toLowerCase();
+        const found = patterns.filter(p => bodyText.includes(p));
+        
+        // Check for success-colored elements
+        const greenElements = Array.from(document.querySelectorAll('*')).filter(el => {
+            const style = window.getComputedStyle(el);
+            const color = style.color || style.backgroundColor;
+            return color.includes('green') || color.includes('rgb(0, 128, 0)');
+        });
+        
+        return {
+            hasSuccess: found.length > 0 || greenElements.length > 0,
+            matchedPatterns: found,
+            greenCount: greenElements.length
+        };
+    }, successPatterns);
+    
+    return {
+        hasSuccess: indicators.hasSuccess,
+        message: indicators.matchedPatterns?.join(', ')
+    };
+}
 }

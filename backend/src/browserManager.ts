@@ -122,7 +122,9 @@ export class BrowserManager {
 
     await locator.scrollIntoViewIfNeeded().catch(() => {});
 
-    // Capture pre-click info
+    // Capture BEFORE state
+    const beforeFingerprint = await this.getFingerprint();
+    
     let info: ElementInfo | undefined;
     try {
       const handle = await locator.elementHandle();
@@ -132,7 +134,6 @@ export class BrowserManager {
       }
     } catch {}
 
-    // Intelligent Click Strategy
     try { await locator.hover({ timeout: 1000, force: true }); } catch {}
 
     try {
@@ -142,17 +143,26 @@ export class BrowserManager {
         await locator.dispatchEvent('click');
     }
 
-    // --- FIX: WAIT FOR REACTION ---
-    // If we click something, the state usually changes. Wait for it.
+    // IMPROVED: Wait for ANY of these changes with better timeouts
+    let stateChanged = false;
     try {
        await Promise.race([
-           page.waitForURL(u => u.toString() !== page.url(), { timeout: 3000 }), // URL Change
-           page.waitForEvent('framenavigated', { timeout: 2000 }), // Navigation
-           this.waitForNetworkIdle(1500) // Or just idle
+           page.waitForURL(u => u.toString() !== page.url(), { timeout: 2000 }),
+           page.waitForLoadState('domcontentloaded', { timeout: 2000 }),
+           page.waitForResponse(response => response.ok(), { timeout: 2000 }),
+           this.waitForNetworkIdle(1500)
        ]);
-    } catch {}
+       stateChanged = true;
+    } catch {
+        // No navigation/network - check content change
+        await page.waitForTimeout(500);
+        const afterFingerprint = await this.getFingerprint();
+        stateChanged = beforeFingerprint.contentHash !== afterFingerprint.contentHash;
+    }
 
-    return info || { tagName: 'clicked', attributes: {}, cssSelector: selector };
+    const result = info || { tagName: 'clicked', attributes: {}, cssSelector: selector };
+    (result as any).stateChanged = stateChanged; // Attach state info
+    return result;
   }
 
   async scroll(selector: string | undefined, direction: 'up' | 'down'): Promise<void> {
