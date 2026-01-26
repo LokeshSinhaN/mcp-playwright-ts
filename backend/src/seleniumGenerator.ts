@@ -54,152 +54,125 @@ export class SeleniumGenerator {
       `    wait = WebDriverWait(driver, 15)`,
       '    try:'
     ];
-
-    const body: string[] = [];
     
-    /**
-     * Helper to determine selector strategy dynamically.
-     * PRIORITY ORDER (production-ready, no hallucination):
-     *   1. cmd.selectors.css (real selector captured from DOM)
-     *   2. cmd.selectors.xpath (real XPath captured from DOM)
-     *   3. cmd.selectors.id (element ID for #id selector)
-     *   4. cmd.target (fallback - only if it looks like a valid selector)
-     * 
-     * This ensures we NEVER use hallucinated/guessed selectors when real
-     * DOM-captured selectors are available.
-     */
+    // We will build the body into a list first, then clean it.
+    const rawBodyLines: string[] = [];
+
     const getSelectorCode = (cmd: ExecutionCommand): string => {
-      // 1. Prefer real CSS (Best)
+       // 1. Prefer real CSS (Best for unique IDs)
       if (cmd.selectors?.css && cmd.selectors.css.trim().length > 2) {
         return `(By.CSS_SELECTOR, "${cmd.selectors.css.replace(/"/g, '\\"')}")`;
       }
       
-      // 2. Prefer real XPath (Robust)
+      // 2. Prefer real XPath (Robust for structure)
       if (cmd.selectors?.xpath && cmd.selectors.xpath.trim().length > 2) {
         return `(By.XPATH, "${cmd.selectors.xpath.replace(/"/g, '\\"')}")`;
       }
       
-      // 3. Prefer ID (Fast)
+      // 3. Prefer ID (Fastest)
       if (cmd.selectors?.id && cmd.selectors.id.trim()) {
         return `(By.ID, "${cmd.selectors.id.replace(/"/g, '\\"')}")`;
       }
       
       // 4. UNIVERSAL FALLBACK: Text-based XPath
-      // This prevents "Skeleton" code. If we have ANY text hint, we generate a click.
+      // FIX: Ensure we don't treat CSS selectors (starting with # or .) as visible text.
+      // This prevents the bug: contains(text(), "#ctl00_...")
       const textHint = cmd.selectors?.text || cmd.description?.replace(/^Click\s+/i, '') || cmd.target;
       
-      if (textHint && !textHint.includes('el_') && !textHint.includes('xpath=')) {
+      const isLikelySelector = textHint && (
+          textHint.trim().startsWith('#') || 
+          textHint.trim().startsWith('.') || 
+          textHint.includes('>') ||
+          textHint.includes('ctl00') 
+      );
+
+      if (textHint && !textHint.includes('el_') && !textHint.includes('xpath=') && !isLikelySelector) {
           const safeText = textHint.trim().replace(/'/g, "\\'");
-          // Matches text OR aria-label OR title - very high hit rate
+          // Matches text OR aria-label OR title
           return `(By.XPATH, "//*[contains(text(), '${safeText}') or contains(@aria-label, '${safeText}') or @title='${safeText}']")`;
       }
 
-      // 5. Raw Target Fallback
+      // 5. Raw Target Fallback (Valid CSS/XPath)
       const target = cmd.target || '';
       if (target.startsWith('//') || target.startsWith('xpath=')) {
           return `(By.XPATH, "${target.replace(/^xpath=/, '').replace(/"/g, '\\"')}")`;
       }
 
-      // Final fallback (CSS)
+      // Default to CSS for everything else (IDs, classes)
       return `(By.CSS_SELECTOR, "${target.replace(/"/g, '\\"')}")`;
-    };
-    
-    /**
-     * Legacy wrapper for backward compatibility when only a string target is available.
-     * Creates a minimal ExecutionCommand to pass through the priority logic.
-     */
-    const getSelectorCodeFromTarget = (target: string): string => {
-      return getSelectorCode({ action: 'click', target } as ExecutionCommand);
     };
 
     for (const cmd of commands) {
-      if (cmd.description) {
-        body.push(`        # ${cmd.description.replace(/\n/g, ' ')}`);
+      // SKIP INVALID COMMANDS
+      if (['click', 'type'].includes(cmd.action) && 
+          !cmd.selectors?.css && !cmd.selectors?.xpath && !cmd.selectors?.id && !cmd.target) {
+          continue; 
       }
 
-      const target = cmd.target || '';
-      // Use the new priority-based selector resolver that prefers real DOM selectors
+      // COMMENT GENERATION
+      if (cmd.description && !cmd.description.startsWith('Start at')) {
+        rawBodyLines.push(`        # ${cmd.description.replace(/\n/g, ' ')}`);
+      }
+
       const selectorCode = getSelectorCode(cmd);
 
       switch (cmd.action.toLowerCase()) {
         case 'navigate':
         case 'goto':
-          body.push(`        driver.get("${target}")`);
+          rawBodyLines.push(`        driver.get("${cmd.target}")`);
+          rawBodyLines.push(`        time.sleep(2)`); 
           break;
 
         case 'click':
-          // Validate we have a usable selector before generating code
-          if (!cmd.selectors?.css && !cmd.selectors?.xpath && !cmd.selectors?.id && !target) {
-            body.push(`        # WARNING: No valid selector captured for this click action`);
-            body.push(`        # Original intent: ${cmd.description || 'unknown'}`);
-          } else {
-            body.push(
+            rawBodyLines.push(
               `        elem = wait.until(EC.element_to_be_clickable(${selectorCode}))`,
-              '        safe_click(driver, elem)'
+              '        safe_click(driver, elem)',
+              '        time.sleep(1)'
             );
-          }
           break;
 
         case 'type':
-          if (!cmd.selectors?.css && !cmd.selectors?.xpath && !cmd.selectors?.id && !target) {
-            body.push(`        # WARNING: No valid selector captured for this type action`);
-          } else {
-            body.push(
+            rawBodyLines.push(
               `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
               `        elem.clear()`,
-              `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`
+              `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`,
+              '        time.sleep(0.5)'
             );
-          }
           break;
         
-        case 'select_option': {
-          // select_option should have been recorded as 2 click commands during execution.
-          // If we still get a select_option here, it means the dropdown helper used
-          // keyboard selection and we don't have a real selector.
-          // Generate a robust fallback using aria-label or text matching.
-          const optionValue = cmd.value || '';
-          const escapedOption = optionValue.replace(/'/g, "\\'");
-          body.push(
-             `        # Dropdown option selection (fallback - prefer recording as 2 clicks)`,
-             `        # Looking for option: "${optionValue}"`,
-             `        elem = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[@role='option' or @role='menuitem' or @role='listitem'][contains(normalize-space(.), '${escapedOption}')] | //li[contains(normalize-space(.), '${escapedOption}')] | //*[contains(@aria-label, '${escapedOption}')]")))`  ,
-             '        safe_click(driver, elem)'
-          );
-          break;
-        }
-
-        case 'scrape':
-        case 'examine':
-        case 'scrape_data': {
-          const intent = (cmd.description || '').toLowerCase();
-          if (intent.includes('link') || intent.includes('href') || intent.includes('url')) {
-            body.push(
-              '        print("\\n--- Scraped Links ---")',
-              '        links = driver.find_elements(By.TAG_NAME, "a")',
-              '        for link in links:',
-              '            href = link.get_attribute("href")',
-              '            if href and href.startswith("http"):',
-              '                print(href)',
-              '        print("---------------------")'
-            );
-          } else {
-            body.push(
-              '        print("\\n--- Scraped Text ---")',
-              '        print(driver.find_element(By.TAG_NAME, "body").text[:2000])',
-              '        print("... (truncated) ...")'
-            );
-          }
-          break;
-        }
-
         case 'wait':
-          body.push(`        time.sleep(${cmd.waitTime ?? 1})`);
+          // FIX: Handle NaN or undefined wait times
+          const t = (cmd.waitTime && !isNaN(cmd.waitTime)) ? cmd.waitTime : 1;
+          rawBodyLines.push(`        time.sleep(${t})`);
           break;
-
-        default:
-          body.push(`        # Action "${cmd.action}" not fully implemented in generator`);
       }
-      body.push('        time.sleep(1)');
+    }
+
+    // INTELLIGENT CODE CLEANUP (Deduplication)
+    // We remove consecutive identical blocks to fix the "Click Reports 3x" issue
+    const cleanBody: string[] = [];
+    let lastBlockSignature = '';
+
+    for (let i = 0; i < rawBodyLines.length; i++) {
+        const line = rawBodyLines[i];
+        
+        // Identify the start of a block (usually "elem = ...")
+        if (line.trim().startsWith('elem =')) {
+            // Construct a "signature" of this action block (next 3 lines usually)
+            const signature = line + (rawBodyLines[i+1] || '') + (rawBodyLines[i+2] || '');
+            
+            if (signature === lastBlockSignature) {
+                // Duplicate block detected! Skip the lines associated with it.
+                // We skip lines until we hit a sleep or comment
+                while(i < rawBodyLines.length && !rawBodyLines[i].includes('time.sleep')) {
+                    i++;
+                }
+                continue; 
+            }
+            lastBlockSignature = signature;
+        }
+        
+        cleanBody.push(line);
     }
 
     const footer = [
@@ -210,7 +183,6 @@ export class SeleniumGenerator {
       "if __name__ == '__main__':",
       `    ${testName}()`
     ];
-
-    return [...header, ...body, ...footer].join('\n');
+    return [...header, ...cleanBody, ...footer].join('\n');
   }
 }
