@@ -95,317 +95,145 @@ export class McpTools {
   // =================== INTELLIGENT AGENT LOGIC ===============================
   // ===========================================================================
 
-    async runAutonomousAgent(goal: string, config: AgentConfig = {}): Promise<AgentSessionResult> {
+  async runAutonomousAgent(goal: string, config: AgentConfig = {}): Promise<AgentSessionResult> {
+    const maxSteps = config.maxSteps ?? 30;
 
-      const maxSteps = config.maxSteps ?? 30;
+    // FIX 1: DO NOT WIPE HISTORY HERE
+    // We want to keep the history of previous actions (like Login) 
+    // so they appear in the final Selenium script.
+    // this.sessionHistory = [];  <-- REMOVED
 
-      this.sessionHistory = []; 
+    const steps: AgentStepResult[] = [];
+    const failedElements: Set<string> = new Set();
+    const actionHistory: string[] = [];
 
-      const steps: AgentStepResult[] = [];
+    await this.browser.init();
+    const page = this.browser.getPage();
 
-      const failedElements: Set<string> = new Set();
+    // 1. Context Awareness (Navigation)
+    const urlInGoal = this.extractUrlFromPrompt(goal);
+    if (urlInGoal) {
+        const currentUrl = page.url();
+        if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
+             await this.navigate(urlInGoal);
+             actionHistory.push(`[SUCCESS] Navigated to ${urlInGoal}`);
+             await page.waitForTimeout(1000);
+        }
+    }
 
-      const actionHistory: string[] = [];
+    let stepNumber = 0;
+    let isFinished = false;
 
-  
+    while (stepNumber < maxSteps && !isFinished) {
+      stepNumber++;
 
-      await this.browser.init();
+      // OBSERVE
+      const extractor = new SelectorExtractor(page);
+      const elements = await extractor.extractAllInteractive();
+      const screenshotObj = await this.browser.screenshot();
+      const screenshotBase64 = screenshotObj.replace('data:image/png;base64,', '');
 
-      const page = this.browser.getPage();
+      // THINK
+      let nextActionsBatch = await this.planNextAgentAction(
+        goal,
+        elements,
+        actionHistory,
+        failedElements,
+        screenshotBase64,
+        config.modelProvider
+      );
 
-  
+      const actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
+      
+      const firstAction = actionsToExecute[0];
+      const thought = firstAction.thought || "Executing batch...";
+      
+      config.broadcast?.({
+          type: 'log', timestamp: new Date().toISOString(),
+          message: `ai_plan: ${thought} (${actionsToExecute.length} steps)`,
+          data: { role: 'agent-reasoning', thought }
+      });
 
-      // 1. Auto-Navigation (Context Understanding)
+      // ACT
+      let batchSuccess = true;
+      let batchMessage = '';
+      let stateChanged = false;
+      this.agentCommandBuffer = []; 
 
-      const urlInGoal = this.extractUrlFromPrompt(goal);
+      for (const action of actionsToExecute) {
+          if (!batchSuccess) break;
 
-      if (urlInGoal) {
+          let retryCount = 0;
+          let actionSuccess = false;
+          let result: ExecutionResult | undefined;
 
-          const currentUrl = page.url();
+          while (retryCount <= 1 && !actionSuccess) {
+               result = await this.executeAgentAction(action, elements);
+               actionSuccess = result.success;
 
-          if (currentUrl === 'about:blank' || !currentUrl.includes(this.extractDomain(urlInGoal))) {
+               if (result.stateChanged) stateChanged = true;
 
-               await this.navigate(urlInGoal);
-
-               actionHistory.push(`[SUCCESS] Navigated to ${urlInGoal}`);
-
-               await page.waitForTimeout(1000);
-
+               if (actionSuccess) {
+                   // Record logic is inside executeAgentAction -> recordCommand
+               } else {
+                   retryCount++;
+                   if (result?.failedSelector) failedElements.add(result.failedSelector);
+                   await page.waitForTimeout(500);
+               }
           }
 
+          if (!actionSuccess) {
+              batchSuccess = false;
+              batchMessage = `Batch failed at: ${action.type}. ${result?.message}`;
+          } else {
+              // FIX 2: COMMIT BUFFER IMMEDIATELY
+              // Save to permanent history immediately after success
+              if (this.agentCommandBuffer && this.agentCommandBuffer.length > 0) {
+                  this.sessionHistory.push(...this.agentCommandBuffer);
+                  this.agentCommandBuffer = []; 
+              }
+          }
+          
+          // Visual pacing
+          if (actionsToExecute.length > 1) await page.waitForTimeout(500);
       }
 
-  
-
-      let stepNumber = 0;
-
-      let isFinished = false;
-
-  
-
-      while (stepNumber < maxSteps && !isFinished) {
-
-        stepNumber++;
-
-  
-
-        // OBSERVE: Get valid DOM elements
-
-        const extractor = new SelectorExtractor(page);
-
-        const elements = await extractor.extractAllInteractive();
-
-        const screenshotObj = await this.browser.screenshot();
-
-        const screenshotBase64 = screenshotObj.replace('data:image/png;base64,', '');
-
-  
-
-        // THINK: Plan a BATCH of actions
-
-        // We now expect a list of actions (e.g. Fill User -> Fill Pass -> Click Login)
-
-        let nextActionsBatch = await this.planNextAgentAction(
-
-          goal,
-
-          elements,
-
-          actionHistory,
-
-          failedElements,
-
-          screenshotBase64,
-
-          config.modelProvider
-
-        );
-
-  
-
-        // Normalize to array
-
-        const actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
-
-        
-
-        const firstAction = actionsToExecute[0];
-
-        const thought = firstAction.thought || "Executing batch...";
-
-        
-
-        config.broadcast?.({
-
-            type: 'log', timestamp: new Date().toISOString(),
-
-            message: `ai_plan: ${thought} (${actionsToExecute.length} steps)`,
-
-            data: { role: 'agent-reasoning', thought }
-
-        });
-
-  
-
-        // ACT: Execute Batch Locally
-
-        let batchSuccess = true;
-
-        let batchMessage = '';
-
-        let stateChanged = false;
-
-        this.agentCommandBuffer = []; // Buffer for the whole batch
-
-  
-
-        for (const action of actionsToExecute) {
-
-            // If previous step failed, stop the batch
-
-            if (!batchSuccess) break;
-
-  
-
-            let retryCount = 0;
-
-            let actionSuccess = false;
-
-            let result: ExecutionResult | undefined;
-
-  
-
-            while (retryCount <= 1 && !actionSuccess) {
-
-                 // Execute single atomic action
-
-                 result = await this.executeAgentAction(action, elements);
-
-                 actionSuccess = result.success;
-
-  
-
-                 if (result.stateChanged) stateChanged = true;
-
-  
-
-                 if (actionSuccess) {
-
-                     // CRITICAL: Record the EXACT selector used, not the AI's "el_X"
-
-                     // executeAgentAction handles the recording into this.agentCommandBuffer
-
-                 } else {
-
-                     retryCount++;
-
-                     if (result?.failedSelector) failedElements.add(result.failedSelector);
-
-                     await page.waitForTimeout(500);
-
-                 }
-
-            }
-
-  
-
-                        if (!actionSuccess) {
-
-  
-
-                            batchSuccess = false;
-
-  
-
-                            batchMessage = `Batch failed at: ${action.type}. ${result?.message}`;
-
-  
-
-                         } else {
-
-  
-
-                            // FIX: Immediately commit successful commands to the MAIN history
-
-  
-
-                            // This ensures that even if the agent crashes later, the Selenium code 
-
-  
-
-                            // for steps taken SO FAR is preserved and valid.
-
-  
-
-                            if (this.agentCommandBuffer && this.agentCommandBuffer.length > 0) {
-
-  
-
-                                this.sessionHistory.push(...this.agentCommandBuffer);
-
-  
-
-                                this.agentCommandBuffer = []; 
-
-  
-
-                            }
-
-  
-
-                         }
-
-  
-
-                      
-
-  
-
-                      // FIX: Add visual breathing room between batch steps
-
-  
-
-                      // This allows "patients" menu to fully render before "Patient Master List" is clicked
-
-  
-
-                      if (actionsToExecute.length > 1) await page.waitForTimeout(1000);
-
-        }
-
-  
-
-        if (batchSuccess) batchMessage = "Batch executed successfully";
-
-  
-
-        const actionDesc = `[${batchSuccess ? 'OK' : 'FAIL'}] Batch: ${actionsToExecute.map(a => a.type).join('->')}`;
-
-        actionHistory.push(actionDesc);
-
-        
-
-        // Check finish condition
-
-        if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
-
-  
-
-        steps.push({ 
-
-            stepNumber, 
-
-            actions: actionsToExecute, // Updated to store array
-
-            success: batchSuccess, 
-
-            message: batchMessage, 
-
-            urlBefore: '', 
-
-            urlAfter: page.url(), 
-
-            stateChanged, 
-
-            retryCount: 0,
-
-            screenshot: screenshotBase64 
-
-        });
-
-        
-
-        // If the page state didn't change after a batch of clicks (e.g. dead login button), wait a bit or retry
-
-        if (!stateChanged && batchSuccess && actionsToExecute.some(a => a.type === 'click')) {
-
-            await page.waitForTimeout(2000); // Give slow apps time
-
-        }
-
+      if (batchSuccess) batchMessage = "Batch executed successfully";
+      const actionDesc = `[${batchSuccess ? 'OK' : 'FAIL'}] Batch: ${actionsToExecute.map(a => a.type).join('->')}`;
+      actionHistory.push(actionDesc);
+      
+      if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
+
+      steps.push({ 
+          stepNumber, 
+          actions: actionsToExecute,
+          success: batchSuccess, 
+          message: batchMessage, 
+          urlBefore: '', 
+          urlAfter: page.url(), 
+          stateChanged, 
+          retryCount: 0,
+          screenshot: screenshotBase64 
+      });
+      
+      // FIX 3: FORCED STABILIZATION
+      // Critical for "Patients" dropdown. We wait for the UI to settle 
+      // BEFORE the loop restarts and takes the next screenshot.
+      if (batchSuccess && !isFinished) {
+          await this.browser.waitForStability(2000); 
       }
-
-  
-
-      return { 
-
-          success: isFinished, 
-
-          summary: "Agent Session Ended", 
-
-          goal, 
-
-          totalSteps: stepNumber, 
-
-          steps, 
-
-          commands: this.sessionHistory, 
-
-          seleniumCode: await new SeleniumGenerator().generate(this.sessionHistory)
-
-      };
-
     }
+
+    return { 
+        success: isFinished, 
+        summary: "Agent Session Ended", 
+        goal, 
+        totalSteps: stepNumber, 
+        steps, 
+        commands: this.sessionHistory, 
+        seleniumCode: await new SeleniumGenerator().generate(this.sessionHistory)
+    };
+  }
 
   
 
@@ -414,338 +242,73 @@ export class McpTools {
   
 
       private async executeAgentAction(action: SingleAgentAction, elements: ElementInfo[]): Promise<ExecutionResult> {
+    // Resolve Element
+    let targetElement: ElementInfo | undefined;
+    if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
+        const idx = parseInt(action.elementId.split('_')[1]);
+        targetElement = elements[idx];
+    }
 
-  
-
-        
-
-  
-
-        // 1. Resolve "el_X" to REAL Element
-
-  
-
-        let targetElement: ElementInfo | undefined;
-
-  
-
-        if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
-
-  
-
-            const idx = parseInt(action.elementId.split('_')[1]);
-
-  
-
-            targetElement = elements[idx];
-
-  
-
-        }
-
-  
-
+    let robustSelector = 'selector' in action ? action.selector : undefined;
     
-
-  
-
-        // 2. Prepare FULL Selenium Data (Prevent "Skeleton" Code)
-
-  
-
-        // We create a fallback strategy: If no ID/CSS, use Text.
-
-  
-
-        let selectorsForSelenium = { css: '', xpath: '', id: '', text: '' };
-
-  
-
-        let robustSelector = 'selector' in action ? action.selector : undefined;
-
-  
-
-    
-
-  
-
-    
-
-  
-
-        if (targetElement) {
-
-  
-
-            robustSelector = targetElement.cssSelector || targetElement.selector; // Default
-
-  
-
-            selectorsForSelenium = {
-
-  
-
-                css: targetElement.cssSelector || '',
-
-  
-
-                xpath: targetElement.xpath || '',
-
-  
-
-                id: targetElement.id || '',
-
-  
-
-                text: targetElement.text || '' // Ensure text is captured for fallback
-
-  
-
-            };
-
-  
-
-        } else if (action.type === 'click' && action.semanticTarget) {
-
-  
-
-            // Fallback for AI guesses (e.g., "Click Login")
-
-  
-
-            selectorsForSelenium.text = action.semanticTarget;
-
-  
-
-        }
-
-  
-
-    
-
-  
-
-        let result: ExecutionResult = { success: false, message: '' };
-
-  
-
-    
-
-  
-
-        try {
-
-  
-
-            // ... [Action Execution Logic (Click/Type)] ...
-
-  
-
-            
-
-  
-
-            if (action.type === 'click') {
-
-  
-
-                if (robustSelector) {
-
-  
-
-                 // ... inside click block ...
-
-  
-
-                  result = await this.clickExact(robustSelector, action.semanticTarget);
-
-  
-
-                  
-
-  
-
-                  // FORCE RECORDING: Even if clickExact internal recording fails, we force it here
-
-  
-
-                  this.recordCommand({ 
-
-  
-
-                      action: 'click', 
-
-  
-
-                      target: robustSelector,
-
-  
-
-                      // CRITICAL: Pass the full object so SeleniumGenerator doesn't print "WARNING"
-
-  
-
-                      selectors: selectorsForSelenium, 
-
-  
-
-                      description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`
-
-  
-
-                  });
-
-  
-
-                } else {
-
-  
-
-                     result = { success: false, message: "No selector for click" };
-
-  
-
-                }
-
-  
-
-            }
-
-  
-
-            else if (action.type === 'type') {
-
-  
-
-                if (robustSelector) {
-
-  
-
-                 // ... inside type block ...
-
-  
-
-                 await this.browser.type(robustSelector, action.text);
-
-  
-
-                 
-
-  
-
+    // Prepare Full Selenium Data
+    let selectorsForSelenium = { css: '', xpath: '', id: '', text: '' };
+    if (targetElement) {
+        robustSelector = targetElement.cssSelector || targetElement.selector;
+        selectorsForSelenium = {
+            css: targetElement.cssSelector || '',
+            xpath: targetElement.xpath || '',
+            id: targetElement.id || '',
+            text: targetElement.text || ''
+        };
+    } else if (action.type === 'click' && action.semanticTarget) {
+        selectorsForSelenium.text = action.semanticTarget;
+    }
+
+    let result: ExecutionResult = { success: false, message: '' };
+
+    try {
+        if (action.type === 'click') {
+            if (robustSelector) {
+                 result = await this.clickExact(robustSelector, action.semanticTarget);
+                 // Record with FULL DATA
                  this.recordCommand({ 
-
-  
-
-                     action: 'type', 
-
-  
-
-                     target: robustSelector, 
-
-  
-
-                     value: action.text,
-
-  
-
-                     selectors: selectorsForSelenium,
-
-  
-
-                     description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`
-
-  
-
+                     action: 'click', 
+                     target: robustSelector,
+                     selectors: selectorsForSelenium, 
+                     description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`
                  });
-
-  
-
-                 result = { success: true, message: `Filled "${action.text}"` };
-
-  
-
-                } else {
-
-  
-
-                    result = { success: false, message: "No selector for type" };
-
-  
-
-                }
-
-  
-
+            } else {
+                 result = { success: false, message: "No selector for click" };
             }
-
-  
-
-            else if (action.type === 'wait') {
-
-  
-
-                   await new Promise(r => setTimeout(r, action.durationMs));
-
-  
-
-                   this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000 });
-
-  
-
-                   result = { success: true, message: "Waited" };
-
-  
-
-            }
-
-  
-
-            else if (action.type === 'navigate') {
-
-  
-
-                   await this.navigate(action.url); // recordCommand is handled inside this.navigate
-
-  
-
-                   result = { success: true, message: `Navigated to ${action.url}` };
-
-  
-
-            }
-
-  
-
-            // ... [Wait/Navigate blocks] ...
-
-  
-
-    
-
-  
-
-        } catch (e: any) {
-
-  
-
-            return { success: false, message: e.message, failedSelector: robustSelector };
-
-  
-
         }
-
-  
-
-    
-
-  
-
-        return result;
-
-  
-
-      }
+        else if (action.type === 'type') {
+            if (robustSelector) {
+                 await this.browser.type(robustSelector, action.text);
+                 this.recordCommand({ 
+                     action: 'type', 
+                     target: robustSelector, 
+                     value: action.text,
+                     selectors: selectorsForSelenium,
+                     description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`
+                 });
+                 result = { success: true, message: `Filled "${action.text}"` };
+            }
+        }
+        else if (action.type === 'wait') {
+               await new Promise(r => setTimeout(r, action.durationMs));
+               this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000 });
+               result = { success: true, message: "Waited" };
+        }
+        else if (action.type === 'navigate') {
+               await this.navigate(action.url);
+               result = { success: true, message: `Navigated to ${action.url}` };
+        }
+    } catch (e: any) {
+        return { success: false, message: e.message, failedSelector: robustSelector };
+    }
+    return result;
+  }
 
   
 
@@ -1003,7 +566,16 @@ export class McpTools {
 
   async generateSelenium(commands: ExecutionCommand[]): Promise<ExecutionResult> {
     try {
-      const seleniumCode = await new SeleniumGenerator().generate(commands);
+      // If the frontend sends empty commands (common bug), use the server's persistent history
+      const commandsToUse = (commands && commands.length > 0) 
+                            ? commands 
+                            : this.sessionHistory;
+
+      if (commandsToUse.length === 0) {
+          return { success: false, message: 'No actions recorded to generate code from.' };
+      }
+
+      const seleniumCode = await new SeleniumGenerator().generate(commandsToUse);
       return { success: true, message: 'Selenium code generated', seleniumCode };
     } catch (e: any) {
       return { success: false, message: e.message };
