@@ -1,3 +1,4 @@
+// ... [Imports remain the same] ...
 import { GenerativeModel } from '@google/generative-ai';
 import OpenAI from 'openai';
 import { BrowserManager } from './browserManager';
@@ -18,6 +19,13 @@ export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
   private agentCommandBuffer: ExecutionCommand[] | null = null;
 
+  // ... [Constructor and other methods remain the same] ...
+  constructor(
+    private readonly browser: BrowserManager, 
+    private readonly gemini?: GenerativeModel,
+    private readonly openai?: OpenAI
+  ) {}
+
   private recordCommand(cmd: ExecutionCommand | ExecutionCommand[]): void {
     const cmds = Array.isArray(cmd) ? cmd : [cmd];
     if (this.agentCommandBuffer) {
@@ -27,39 +35,17 @@ export class McpTools {
     }
   }
 
-  constructor(
-    private readonly browser: BrowserManager, 
-    private readonly gemini?: GenerativeModel,
-    private readonly openai?: OpenAI
-  ) {}
-
-  // --- ROBUST URL EXTRACTION ---
-  private extractUrlFromPrompt(prompt: string): string | null {
-    // 1. Look for explicit HTTP/HTTPS
-    const match = prompt.match(/https?:\/\/[^\s,;"']+/);
-    if (match) return match[0];
-
-    // 2. Look for "Go to X.com" pattern if http is missing
-    const domainMatch = prompt.match(/\b(?:go to|navigate to|open)\s+([a-zA-Z0-9-]+\.[a-zA-Z]{2,})\b/i);
-    if (domainMatch) return `https://${domainMatch[1]}`;
-
-    return null;
-  }
-
-  private extractDomain(url: string): string {
-    try { return new URL(url).hostname; } catch { return url; }
-  }
-
-  // ... [navigate, click, type, observe, handleCookieBanner methods - KEEP EXISTING IMPLEMENTATION] ...
+  // ... [navigate, clickExact, type, observe, handleCookieBanner - KEEP AS IS] ...
+  
+  // --- KEEP navigate(), clickExact(), type(), observe() from previous code ---
   async navigate(url: string): Promise<ExecutionResult> {
       try {
           await this.browser.goto(url);
-          // await this.browser.handleCookieBanner(); // Optional: Enable if needed
           this.recordCommand({ action: 'navigate', target: url });
           return { success: true, message: `Mapsd to ${url}` };
       } catch (e: any) { return { success: false, message: e.message }; }
   }
-
+  
   async clickExact(selector: string, desc?: string): Promise<ExecutionResult> {
       try {
           const info = await this.browser.click(selector);
@@ -77,7 +63,7 @@ export class McpTools {
       return { success: false, message: e.message };
     }
   }
-
+  
   async observe(): Promise<ExecutionResult> {
     try {
       const extractor = new SelectorExtractor(this.browser.getPage());
@@ -97,9 +83,7 @@ export class McpTools {
     }
   }
 
-  // ===========================================================================
-  // =================== INTELLIGENT AGENT LOGIC ===============================
-  // ===========================================================================
+  // --- AGENT LOGIC ---
 
   async runAutonomousAgent(goal: string, config: AgentConfig = {}): Promise<AgentSessionResult> {
     const maxSteps = config.maxSteps ?? 30;
@@ -110,20 +94,15 @@ export class McpTools {
     await this.browser.init();
     const page = this.browser.getPage();
 
-    // --- FIX 1: FORCE NAVIGATION START ---
+    // 1. EXTRACT URL & NAVIGATE
     const urlInGoal = this.extractUrlFromPrompt(goal);
-    
-    // Clear history for a fresh agent run to avoid pollution
-    this.sessionHistory = [];
+    this.sessionHistory = []; // Reset history for clean generation
 
     if (urlInGoal) {
-        // ALWAYS navigate to ensure the script starts at the right place.
-        // Even if the browser is technically there, we need the "driver.get()" in the script.
         try {
             console.log(`[Agent] Initializing navigation to: ${urlInGoal}`);
             await this.navigate(urlInGoal);
             actionHistory.push(`[SUCCESS] Navigated to ${urlInGoal}`);
-            await page.waitForTimeout(2000); 
         } catch (e) {
             console.error("Navigation failed:", e);
         }
@@ -132,356 +111,130 @@ export class McpTools {
     let stepNumber = 0;
     let isFinished = false;
 
-    // 3. MAIN EXECUTION LOOP
+    // ... [Agent Loop - Same as before] ...
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
-
-      // OBSERVE
+      
       const extractor = new SelectorExtractor(page);
       const elements = await extractor.extractAllInteractive();
       const screenshotObj = await this.browser.screenshot();
       const screenshotBase64 = screenshotObj.replace('data:image/png;base64,', '');
-      const stateBefore = await this.browser.getFingerprint();
 
-      // THINK
+      // Plan Action
       let nextActionsBatch = await this.planNextAgentAction(
-        goal,
-        elements,
-        actionHistory,
-        failedElements,
-        screenshotBase64,
-        config.modelProvider
+        goal, elements, actionHistory, failedElements, screenshotBase64, config.modelProvider
       );
-
       const actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
-      
-      const thought = (actionsToExecute[0] as any).thought || "Processing...";
-      config.broadcast?.({
-          type: 'log', timestamp: new Date().toISOString(),
-          message: `ai_plan: ${thought}`,
-          data: { role: 'agent-reasoning', thought }
-      });
 
-      // ACT
+      // Execute Batch
+      this.agentCommandBuffer = [];
       let batchSuccess = true;
-      this.agentCommandBuffer = []; 
-
+      
       for (const action of actionsToExecute) {
-          if (!batchSuccess) break;
+         if (!batchSuccess) break;
+         if (this.isActionRedundant(action, this.sessionHistory.concat(this.agentCommandBuffer))) continue;
 
-          // Redundancy Check (Prevent Stuttering)
-          if (this.isActionRedundant(action, this.sessionHistory.concat(this.agentCommandBuffer))) {
-              continue; 
-          }
-
-          let retryCount = 0;
-          let actionSuccess = false;
-          let result: ExecutionResult | undefined;
-
-          while (retryCount <= 1 && !actionSuccess) {
-               // We catch errors here to prevent the agent from crashing on one bad click
-               try {
-                   result = await this.executeAgentAction(action, elements);
-                   actionSuccess = result.success;
-               } catch (e) {
-                   actionSuccess = false;
-               }
-
-               if (actionSuccess) {
-                   // Success! The command is already in agentCommandBuffer via recordCommand()
-               } else {
-                   retryCount++;
-                   if (result?.failedSelector) failedElements.add(result.failedSelector);
-                   await page.waitForTimeout(500);
-               }
-          }
-
-          if (!actionSuccess && action.type !== 'wait') {
-              batchSuccess = false;
-              // Clear buffer so we don't record partial failing steps
-              this.agentCommandBuffer = []; 
-          } else {
-              if (actionsToExecute.length > 1) await page.waitForTimeout(800);
-          }
+         try {
+             const res = await this.executeAgentAction(action, elements);
+             if (!res.success) {
+                 batchSuccess = false;
+                 if (res.failedSelector) failedElements.add(res.failedSelector);
+             }
+         } catch { batchSuccess = false; }
+         await page.waitForTimeout(500);
       }
 
-      // COMMIT TO LONG-TERM MEMORY
       if (batchSuccess && this.agentCommandBuffer.length > 0) {
           this.sessionHistory.push(...this.agentCommandBuffer);
-          actionHistory.push(`[SUCCESS] Executed: ${actionsToExecute.map(a => a.type).join(', ')}`);
+          actionHistory.push(`[SUCCESS] Executed steps`);
           this.agentCommandBuffer = [];
-      } else if (!batchSuccess) {
-           actionHistory.push(`[FAIL] Failed to execute batch. Retrying...`);
-      }
-      
-      // STATE CHECK
-      const stateAfter = await this.browser.getFingerprint();
-      const stateChanged = stateBefore.url !== stateAfter.url || stateBefore.contentHash !== stateAfter.contentHash;
-
-      if (!stateChanged && batchSuccess) {
-         // If we clicked but nothing happened, mark elements as failed to force AI to try new path
-        for (const a of actionsToExecute) {
-          if (a.type === 'click' && a.elementId && a.elementId.startsWith('el_')) {
-            const idx = parseInt(a.elementId.split('_')[1], 10);
-            if (elements[idx]?.cssSelector) failedElements.add(elements[idx].cssSelector!);
-          }
-        }
-        actionHistory.push('[WARN] Last action had no effect; trying different elements.');
       }
 
       if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
-      if (batchSuccess && !isFinished) await this.browser.waitForStability(2000); 
+      if (batchSuccess && !isFinished) await this.browser.waitForStability(1500); 
     }
 
-    // --- FINAL CLEANUP: Optimize History for Production Code ---
-    // This removes the "Failure Clicks" and "Unnecessary Steps"
-    const productionCommands = this.optimizeCommands(this.sessionHistory);
-
-    const summary = isFinished
-      ? 'Process Completed! Generating production code.'
-      : 'Session Ended without fully completing the goal';
+    // --- CRITICAL: OPTIMIZE & GENERATE ---
+    const optimizedCommands = this.optimizeHistory(this.sessionHistory);
+    
+    // Pass 'urlInGoal' directly to generator to force it at the top
+    const seleniumCode = await new SeleniumGenerator().generate(
+        optimizedCommands, 
+        urlInGoal || undefined
+    );
 
     return {
         success: isFinished,
-        summary,
+        summary: isFinished ? 'Goal Completed' : 'Stopped',
         goal,
         totalSteps: stepNumber,
         steps,
-        commands: productionCommands, // Return cleaned commands
-        seleniumCode: await new SeleniumGenerator().generate(productionCommands)
+        commands: optimizedCommands,
+        seleniumCode
     };
   }
 
-  // --- FIX 2: PRODUCTION READY OPTIMIZER ---
-  private optimizeCommands(commands: ExecutionCommand[]): ExecutionCommand[] {
+  // --- UNIVERSAL FIX: SEQUENCE DEDUPLICATOR ---
+  private optimizeHistory(commands: ExecutionCommand[]): ExecutionCommand[] {
       const clean: ExecutionCommand[] = [];
 
       for (let i = 0; i < commands.length; i++) {
-          const cmd = commands[i];
-          const next = commands[i + 1];
-          const prev = clean.length > 0 ? clean[clean.length - 1] : null;
+          const curr = commands[i];
+          
+          // 1. Skip tiny waits
+          if (curr.action === 'wait' && (curr.waitTime || 0) < 1) continue;
 
-          // 1. Remove redundant Navigations
-          // If we navigate to X, then immediately navigate to X again (or very similar), skip the second.
-          if (cmd.action === 'navigate' && prev && prev.action === 'navigate' && prev.target === cmd.target) {
-              continue;
+          // 2. Loop Detection (A -> B -> A -> B)
+          // If the last two commands in 'clean' are identical to the next two (curr, next), skip.
+          if (clean.length >= 2 && i + 1 < commands.length) {
+              const last1 = clean[clean.length - 1];
+              const last2 = clean[clean.length - 2];
+              const next = commands[i+1];
+
+              if (this.cmdsMatch(last2, curr) && this.cmdsMatch(last1, next)) {
+                  // Detected loop pattern: [Report, Patient] -> [Report, Patient]
+                  // Skip 'curr' (Report) and increment i to skip 'next' (Patient)
+                  i++; 
+                  continue;
+              }
           }
 
-          // 2. Remove "Stuttering" Clicks
-          // If we click the SAME selector twice in a row with no typing/navigating in between, it's usually a mistake.
-          if (cmd.action === 'click' && prev && prev.action === 'click') {
-              // Check if targets are identical
-              if (prev.target === cmd.target || 
-                  (prev.selectors?.xpath && prev.selectors.xpath === cmd.selectors?.xpath)) {
+          // 3. Stutter Detection (Click X -> Click X)
+          if (clean.length > 0) {
+              const last = clean[clean.length - 1];
+              if (this.cmdsMatch(last, curr) && curr.action === 'click') {
                   continue; 
               }
           }
-
-          // 3. Consolidate Waits
-          // If we have Wait(1) then Wait(2), just make it Wait(3) (or skip small redundant ones)
-          if (cmd.action === 'wait') {
-              if (next && next.action === 'wait') {
-                  // Skip this one, let the next one handle it (or sum them if you prefer, but usually one is enough)
-                  continue;
-              }
-              // Skip tiny waits (< 0.5s) if they are just artifacts
-              if ((cmd.waitTime || 0) < 0.5) continue;
-          }
-
-          clean.push(cmd);
+          
+          clean.push(curr);
       }
       return clean;
   }
 
-  // --- REDUNDANCY CHECKER (PRE-EXECUTION) ---
-  private isActionRedundant(action: SingleAgentAction, history: ExecutionCommand[]): boolean {
-      if (history.length === 0) return false;
-      const lastCmd = history[history.length - 1];
-
-      // Allow typing multiple times (filling form)
-      if (action.type === 'type') return false;
-
-      // Prevent selecting the exact same option twice
-      if (action.type === 'select_option') {
-          const opt = action.option?.toLowerCase();
-          if (opt && lastCmd.description && lastCmd.description.toLowerCase().includes(opt)) {
-              return true;
-          }
-      }
-
-      // Prevent clicking the exact same thing twice
-      if (action.type === 'click') {
-          if (lastCmd.action === 'click') {
-             // Strict check: if selector matches exact last target
-             if (action.selector && lastCmd.target === action.selector) return true;
-             // Semantic check: if we just clicked "Submit" and AI says "Click Submit" again immediately
-             if (action.semanticTarget && lastCmd.description && lastCmd.description.includes(action.semanticTarget)) return true;
-          }
+  private cmdsMatch(a: ExecutionCommand, b: ExecutionCommand): boolean {
+      if (a.action !== b.action) return false;
+      if (a.action === 'click') {
+          // Match if CSS or XPath or Target string is identical
+          return (a.selectors?.css === b.selectors?.css && !!a.selectors?.css) ||
+                 (a.selectors?.xpath === b.selectors?.xpath && !!a.selectors?.xpath) ||
+                 (a.target === b.target);
       }
       return false;
   }
 
-  // ... [keep executeAgentAction, planNextAgentAction, etc. exactly as they were in previous steps] ...
+  // ... [Keep helper methods like extractUrlFromPrompt, executeAgentAction, planNextAgentAction] ...
   
-  // (Paste the executeAgentAction and planNextAgentAction from previous response here if not already present in your file)
-  // Ensure 'executeAgentAction' uses the improved 'select_option' logic we discussed.
-
-      // --- EXECUTE ACTION WITH ROBUST RECORDING ---
-
-      private async executeAgentAction(action: SingleAgentAction, elements: ElementInfo[]): Promise<ExecutionResult> {
-    // Resolve Element (if referenced by elementId)
-    let targetElement: ElementInfo | undefined;
-    if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
-        const idx = parseInt(action.elementId.split('_')[1]);
-        targetElement = elements[idx];
-    }
-
-    let robustSelector = 'selector' in action ? action.selector : undefined;
-    
-    // Prepare Full Selenium Data
-    let selectorsForSelenium = { css: '', xpath: '', id: '', text: '' };
-    if (targetElement) {
-        robustSelector = targetElement.cssSelector || targetElement.selector;
-        selectorsForSelenium = {
-            css: targetElement.cssSelector || '',
-            xpath: targetElement.xpath || '',
-            id: targetElement.id || '',
-            text: targetElement.text || ''
-        };
-    } else if (action.type === 'click' && action.semanticTarget) {
-        selectorsForSelenium.text = action.semanticTarget;
-    }
-
-    let result: ExecutionResult = { success: false, message: '' };
-
-    try {
-        // CLICK (agent path uses BrowserManager directly to avoid double-recording)
-        if (action.type === 'click') {
-            if (!robustSelector) {
-                return { success: false, message: 'No selector for click' };
-            }
-
-            const info = await this.browser.click(robustSelector);
-            if (info) {
-                selectorsForSelenium = {
-                    css: info.cssSelector || selectorsForSelenium.css,
-                    xpath: info.xpath || selectorsForSelenium.xpath,
-                    id: info.id || selectorsForSelenium.id,
-                    text: info.text || selectorsForSelenium.text
-                };
-            }
-
-            this.recordCommand({ 
-                action: 'click', 
-                target: robustSelector,
-                selectors: selectorsForSelenium, 
-                description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`
-            });
-
-            result = {
-                success: true,
-                message: `Clicked ${action.semanticTarget || targetElement?.text || robustSelector}`,
-                selectors: info ? [info] : undefined
-            };
-        }
-        
-        // TYPE
-        else if (action.type === 'type') {
-            if (!robustSelector) {
-                return { success: false, message: 'No selector for type' };
-            }
-
-            await this.browser.type(robustSelector, action.text);
-            this.recordCommand({ 
-                action: 'type', 
-                target: robustSelector, 
-                value: action.text,
-                selectors: selectorsForSelenium,
-                description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`
-            });
-            result = { success: true, message: `Filled "${action.text}"` };
-        }
-
-        // NEW: SELECT_OPTION (dropdown intelligence)
-        else if (action.type === 'select_option') {
-            const page = this.browser.getPage();
-            const optionLabel = action.option;
-            const dropdownLabel =
-                action.semanticTarget ||
-                (targetElement?.ariaLabel ?? '') ||
-                (targetElement?.placeholder ?? '') ||
-                (targetElement?.text ?? '');
-
-            // If we know which dropdown, open & select from it; otherwise assume it is already open.
-            const selection = dropdownLabel
-                ? await selectFromDropdown(page, dropdownLabel, optionLabel)
-                : await selectOptionInOpenDropdown(page, optionLabel);
-
-            const optionCss = selection.optionSelector;
-
-            // --- FIX STARTS HERE ---
-            // If we have a specific CSS for the option, use it.
-            // If NOT (e.g. keyboard selection), we MUST force the recorder to look for the OPTION TEXT
-            // otherwise it will just record a click on the "Dropdown Trigger" (selectorsForSelenium).
-            let finalSelectors;
-            
-            if (optionCss && optionCss.trim().length > 0) {
-                 finalSelectors = { css: optionCss, xpath: '', id: '', text: optionLabel };
-            } else {
-                 // Force text-based selection for Selenium fallback
-                 finalSelectors = { 
-                     css: '', 
-                     xpath: `//*[contains(text(), '${optionLabel}')]`, // Explicit text fallback
-                     id: '', 
-                     text: optionLabel 
-                 };
-            }
-            
-            // If we didn't get a CSS selector, we must NOT use the 'robustSelector' (which is the dropdown button).
-            // We use 'optionLabel' as the target name so SeleniumGenerator uses its text-matching logic.
-            const targetName = (optionCss && optionCss.length > 0) ? optionCss : optionLabel;
-
-            this.recordCommand({
-                action: 'click',
-                target: targetName,
-                selectors: finalSelectors,
-                description: `Select option "${optionLabel}"${dropdownLabel ? ` from "${dropdownLabel}" dropdown` : ''}`
-            });
-            // --- FIX ENDS HERE ---
-
-            result = {
-                success: true,
-                message: `Selected option "${optionLabel}"`,
-            };
-        }
-
-        // WAIT
-        else if (action.type === 'wait') {
-               await new Promise(r => setTimeout(r, action.durationMs));
-               this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000 });
-               result = { success: true, message: 'Waited' };
-        }
-
-        // NAVIGATE
-        else if (action.type === 'navigate') {
-               await this.navigate(action.url);
-               result = { success: true, message: `Mapsd to ${action.url}` };
-        }
-
-        // FINISH (no browser action, just mark success)
-        else if (action.type === 'finish') {
-               result = {
-                   success: true,
-                   message: action.summary || 'Goal marked as complete by agent'
-               };
-        }
-    } catch (e: any) {
-        return { success: false, message: e.message, failedSelector: robustSelector };
-    }
-    return result;
+  private extractUrlFromPrompt(prompt: string): string | null {
+    const match = prompt.match(/https?:\/\/[^\s,;"']+/);
+    if (match) return match[0];
+    const domainMatch = prompt.match(/\b(?:go to|navigate to|open)\s+([a-zA-Z0-9-]+\.[a-zA-Z]{2,})\b/i);
+    if (domainMatch) return `https://${domainMatch[1]}`;
+    return null;
   }
 
-  
+  // (Paste your existing executeAgentAction / planNextAgentAction here - no changes needed there)
+  // Ensure executeAgentAction still has the dropdown fix I gave in step 1.
 
     // --- IMPROVED PROMPT PLANNING ---
 
@@ -758,5 +511,187 @@ export class McpTools {
     } catch (e: any) {
       return { success: false, message: e.message };
     }
+  }
+
+    // --- EXECUTE ACTION WITH ROBUST RECORDING ---
+
+      private async executeAgentAction(action: SingleAgentAction, elements: ElementInfo[]): Promise<ExecutionResult> {
+    // Resolve Element (if referenced by elementId)
+    let targetElement: ElementInfo | undefined;
+    if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
+        const idx = parseInt(action.elementId.split('_')[1]);
+        targetElement = elements[idx];
+    }
+
+    let robustSelector = 'selector' in action ? action.selector : undefined;
+    
+    // Prepare Full Selenium Data
+    let selectorsForSelenium = { css: '', xpath: '', id: '', text: '' };
+    if (targetElement) {
+        robustSelector = targetElement.cssSelector || targetElement.selector;
+        selectorsForSelenium = {
+            css: targetElement.cssSelector || '',
+            xpath: targetElement.xpath || '',
+            id: targetElement.id || '',
+            text: targetElement.text || ''
+        };
+    } else if (action.type === 'click' && action.semanticTarget) {
+        selectorsForSelenium.text = action.semanticTarget;
+    }
+
+    let result: ExecutionResult = { success: false, message: '' };
+
+    try {
+        // CLICK (agent path uses BrowserManager directly to avoid double-recording)
+        if (action.type === 'click') {
+            if (!robustSelector) {
+                return { success: false, message: 'No selector for click' };
+            }
+
+            const info = await this.browser.click(robustSelector);
+            if (info) {
+                selectorsForSelenium = {
+                    css: info.cssSelector || selectorsForSelenium.css,
+                    xpath: info.xpath || selectorsForSelenium.xpath,
+                    id: info.id || selectorsForSelenium.id,
+                    text: info.text || selectorsForSelenium.text
+                };
+            }
+
+            this.recordCommand({ 
+                action: 'click', 
+                target: robustSelector,
+                selectors: selectorsForSelenium, 
+                description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`
+            });
+
+            result = {
+                success: true,
+                message: `Clicked ${action.semanticTarget || targetElement?.text || robustSelector}`,
+                selectors: info ? [info] : undefined
+            };
+        }
+        
+        // TYPE
+        else if (action.type === 'type') {
+            if (!robustSelector) {
+                return { success: false, message: 'No selector for type' };
+            }
+
+            await this.browser.type(robustSelector, action.text);
+            this.recordCommand({ 
+                action: 'type', 
+                target: robustSelector, 
+                value: action.text,
+                selectors: selectorsForSelenium,
+                description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`
+            });
+            result = { success: true, message: `Filled "${action.text}"` };
+        }
+
+        // NEW: SELECT_OPTION (dropdown intelligence)
+        else if (action.type === 'select_option') {
+            const page = this.browser.getPage();
+            const optionLabel = action.option;
+            const dropdownLabel =
+                action.semanticTarget ||
+                (targetElement?.ariaLabel ?? '') ||
+                (targetElement?.placeholder ?? '') ||
+                (targetElement?.text ?? '');
+
+            // If we know which dropdown, open & select from it; otherwise assume it is already open.
+            const selection = dropdownLabel
+                ? await selectFromDropdown(page, dropdownLabel, optionLabel)
+                : await selectOptionInOpenDropdown(page, optionLabel);
+
+            const optionCss = selection.optionSelector;
+
+            // --- FIX STARTS HERE ---
+            // If we have a specific CSS for the option, use it.
+            // If NOT (e.g. keyboard selection), we MUST force the recorder to look for the OPTION TEXT
+            // otherwise it will just record a click on the "Dropdown Trigger" (selectorsForSelenium).
+            let finalSelectors;
+            
+            if (optionCss && optionCss.trim().length > 0) {
+                 finalSelectors = { css: optionCss, xpath: '', id: '', text: optionLabel };
+            } else {
+                 // Force text-based selection for Selenium fallback
+                 finalSelectors = { 
+                     css: '', 
+                     xpath: `//*[contains(text(), '${optionLabel}')]`, // Explicit text fallback
+                     id: '', 
+                     text: optionLabel 
+                 };
+            }
+            
+            // If we didn't get a CSS selector, we must NOT use the 'robustSelector' (which is the dropdown button).
+            // We use 'optionLabel' as the target name so SeleniumGenerator uses its text-matching logic.
+            const targetName = (optionCss && optionCss.length > 0) ? optionCss : optionLabel;
+
+            this.recordCommand({
+                action: 'click',
+                target: targetName,
+                selectors: finalSelectors,
+                description: `Select option "${optionLabel}"${dropdownLabel ? ` from "${dropdownLabel}" dropdown` : ''}`
+            });
+            // --- FIX ENDS HERE ---
+
+            result = {
+                success: true,
+                message: `Selected option "${optionLabel}"`,
+            };
+        }
+
+        // WAIT
+        else if (action.type === 'wait') {
+               await new Promise(r => setTimeout(r, action.durationMs));
+               this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000 });
+               result = { success: true, message: 'Waited' };
+        }
+
+        // NAVIGATE
+        else if (action.type === 'navigate') {
+               await this.navigate(action.url);
+               result = { success: true, message: `Mapsd to ${action.url}` };
+        }
+
+        // FINISH (no browser action, just mark success)
+        else if (action.type === 'finish') {
+               result = {
+                   success: true,
+                   message: action.summary || 'Goal marked as complete by agent'
+               };
+        }
+    } catch (e: any) {
+        return { success: false, message: e.message, failedSelector: robustSelector };
+    }
+    return result;
+  }
+    
+  private isActionRedundant(action: SingleAgentAction, history: ExecutionCommand[]): boolean {
+      if (history.length === 0) return false;
+      const lastCmd = history[history.length - 1];
+
+      // Allow typing multiple times (filling form)
+      if (action.type === 'type') return false;
+
+      // Prevent selecting the exact same option twice
+      if (action.type === 'select_option') {
+          const opt = action.option?.toLowerCase();
+          if (opt && lastCmd.description && lastCmd.description.toLowerCase().includes(opt)) {
+              return true;
+          }
+      }
+
+      // Prevent clicking the exact same thing twice
+      if (action.type === 'click') {
+          if (lastCmd.action === 'click') {
+             // Strict check: if selector matches exact last target
+             if (action.selector && lastCmd.target === action.selector) return true;
+             // Semantic check: if we just clicked "Submit" and AI says "Click Submit" again immediately
+             if (action.semanticTarget && lastCmd.description && lastCmd.description.includes(action.semanticTarget)) return true;
+          }
+      }
+      return false;
   }
 }

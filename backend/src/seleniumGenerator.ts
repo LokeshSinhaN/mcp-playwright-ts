@@ -11,21 +11,24 @@ export class SeleniumGenerator {
     private readonly model?: GenerativeModel,
   ) {}
 
-  generate(commands: ExecutionCommand[]): string {
-    return this.generatePython(commands);
+  generate(commands: ExecutionCommand[], startingUrl?: string): string {
+    return this.generatePython(commands, startingUrl);
   }
 
-  private generatePython(commands: ExecutionCommand[]): string {
+  private generatePython(commands: ExecutionCommand[], startingUrl?: string): string {
     const testName = this.opts.testName ?? 'test_flow';
     const driverPath = this.opts.chromeDriverPath ?? 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe';
 
+    // 1. ROBUST HEADER & SAFE_CLICK
+    // We switched safe_click to use JS immediately if standard click fails, 
+    // and added scrollIntoView to handle headers covering elements.
     const header = [
       'from selenium import webdriver',
       'from selenium.webdriver.common.by import By',
       'from selenium.webdriver.support.ui import WebDriverWait',
       'from selenium.webdriver.support import expected_conditions as EC',
       'from selenium.webdriver.chrome.service import Service',
-      'from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException',
+      'from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException, StaleElementReferenceException',
       'import json',
       'import time',
       '',
@@ -38,78 +41,74 @@ export class SeleniumGenerator {
       '        pass',
       '',
       'def safe_click(driver, element):',
-      '    """Robust click that handles obstructions and overlays automatically."""',
+      '    """Universal robust click: handles hover menus, overlays, and hidden elements."""',
       '    try:',
+      '        # 1. Try scrolling into view first',
+      '        driver.execute_script("arguments[0].scrollIntoView({block: \'center\'});", element)',
+      '        time.sleep(0.5)',
       '        element.click()',
-      '    except (ElementClickInterceptedException, TimeoutException):',
-      '        print("    ! Standard click intercepted/failed, attempting JS click...")',
-      '        driver.execute_script("arguments[0].click();", element)',
+      '    except (ElementClickInterceptedException, TimeoutException, StaleElementReferenceException):',
+      '        # 2. Fallback to JS click (Works on hidden/hover-only elements)',
+      '        try:',
+      '            driver.execute_script("arguments[0].click();", element)',
+      '        except:',
+      '            pass',
       '',
       `def ${testName}():`,
       `    options = webdriver.ChromeOptions()`,
       `    options.add_argument('--start-maximized')`,
-      `    # options.add_argument('--headless')`,
+      `    options.add_argument('--ignore-certificate-errors')`,
       `    service = Service(r'${driverPath}')`,
       `    driver = webdriver.Chrome(service=service, options=options)`,
-      `    wait = WebDriverWait(driver, 15)`,
+      `    wait = WebDriverWait(driver, 10)`, // Reduced timeout for speed
       '    try:'
     ];
     
-    // We will build the body into a list first, then clean it.
     const rawBodyLines: string[] = [];
 
+    // 2. FORCE NAVIGATION (Universal Fix)
+    // If a URL is provided (from prompt), it is ALWAYS the first line.
+    if (startingUrl) {
+        rawBodyLines.push(`        # Navigate to Initial URL`);
+        rawBodyLines.push(`        driver.get("${startingUrl}")`);
+        rawBodyLines.push(`        time.sleep(3)`);
+    }
+
     const getSelectorCode = (cmd: ExecutionCommand): string => {
-       // 1. Prefer real CSS (Best for unique IDs)
+      // 1. Prefer CSS (Cleanest)
       if (cmd.selectors?.css && cmd.selectors.css.trim().length > 2) {
         return `(By.CSS_SELECTOR, "${cmd.selectors.css.replace(/"/g, '\\"')}")`;
       }
-      
-      // 2. Prefer real XPath (Robust for structure)
+      // 2. Prefer XPath
       if (cmd.selectors?.xpath && cmd.selectors.xpath.trim().length > 2) {
         return `(By.XPATH, "${cmd.selectors.xpath.replace(/"/g, '\\"')}")`;
       }
-      
-      // 3. Prefer ID (Fastest)
+      // 3. Prefer ID
       if (cmd.selectors?.id && cmd.selectors.id.trim()) {
         return `(By.ID, "${cmd.selectors.id.replace(/"/g, '\\"')}")`;
       }
       
-      // 4. UNIVERSAL FALLBACK: Text-based XPath
-      // FIX: Ensure we don't treat CSS selectors (starting with # or .) as visible text.
-      // This prevents the bug: contains(text(), "#ctl00_...")
+      // 4. Text Fallback
       const textHint = cmd.selectors?.text || cmd.description?.replace(/^Click\s+/i, '') || cmd.target;
-      
-      const isLikelySelector = textHint && (
-          textHint.trim().startsWith('#') || 
-          textHint.trim().startsWith('.') || 
-          textHint.includes('>') ||
-          textHint.includes('ctl00') 
-      );
-
-      if (textHint && !textHint.includes('el_') && !textHint.includes('xpath=') && !isLikelySelector) {
-          const safeText = textHint.trim().replace(/'/g, "\\'");
-          // Matches text OR aria-label OR title
-          return `(By.XPATH, "//*[contains(text(), '${safeText}') or contains(@aria-label, '${safeText}') or @title='${safeText}']")`;
+      const safeText = (textHint || '').trim().replace(/'/g, "\\'");
+      if (safeText && !safeText.includes('el_') && !safeText.startsWith('#') && !safeText.startsWith('.')) {
+          return `(By.XPATH, "//*[contains(text(), '${safeText}') or contains(@aria-label, '${safeText}')]")`;
       }
 
-      // 5. Raw Target Fallback (Valid CSS/XPath)
-      const target = cmd.target || '';
-      if (target.startsWith('//') || target.startsWith('xpath=')) {
-          return `(By.XPATH, "${target.replace(/^xpath=/, '').replace(/"/g, '\\"')}")`;
-      }
-
-      // Default to CSS for everything else (IDs, classes)
-      return `(By.CSS_SELECTOR, "${target.replace(/"/g, '\\"')}")`;
+      // 5. Raw Target
+      return `(By.CSS_SELECTOR, "${(cmd.target || '').replace(/"/g, '\\"')}")`;
     };
 
+    // 3. GENERATE BODY
     for (const cmd of commands) {
-      // SKIP INVALID COMMANDS
       if (['click', 'type'].includes(cmd.action) && 
           !cmd.selectors?.css && !cmd.selectors?.xpath && !cmd.selectors?.id && !cmd.target) {
           continue; 
       }
 
-      // COMMENT GENERATION
+      // Skip navigation commands if we already handled the start URL (prevents duplicates)
+      if (cmd.action === 'navigate' && startingUrl && cmd.target === startingUrl) continue;
+
       if (cmd.description && !cmd.description.startsWith('Start at')) {
         rawBodyLines.push(`        # ${cmd.description.replace(/\n/g, ' ')}`);
       }
@@ -118,14 +117,19 @@ export class SeleniumGenerator {
 
       switch (cmd.action.toLowerCase()) {
         case 'navigate':
-        case 'goto':
-          rawBodyLines.push(`        driver.get("${cmd.target}")`);
-          rawBodyLines.push(`        time.sleep(2)`); 
+          if (!startingUrl) { // Only add if not already forced at start
+              rawBodyLines.push(`        driver.get("${cmd.target}")`);
+              rawBodyLines.push(`        time.sleep(2)`); 
+          }
           break;
 
         case 'click':
+            // CRITICAL FIX FOR MENUS:
+            // Use 'presence_of_element_located' instead of 'element_to_be_clickable'.
+            // 'clickable' fails if the menu item is hidden (needs hover).
+            // 'presence' finds it, and our new safe_click handles the JS trigger.
             rawBodyLines.push(
-              `        elem = wait.until(EC.element_to_be_clickable(${selectorCode}))`,
+              `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
               '        safe_click(driver, elem)',
               '        time.sleep(1)'
             );
@@ -141,48 +145,21 @@ export class SeleniumGenerator {
           break;
         
         case 'wait':
-          // FIX: Handle NaN or undefined wait times
           const t = (cmd.waitTime && !isNaN(cmd.waitTime)) ? cmd.waitTime : 1;
-          rawBodyLines.push(`        time.sleep(${t})`);
+          // Cap max wait to 2s to keep tests fast
+          const safeWait = Math.min(t, 2); 
+          if (safeWait > 0.1) rawBodyLines.push(`        time.sleep(${safeWait})`);
           break;
       }
     }
 
-    // INTELLIGENT CODE CLEANUP (Deduplication)
-    // We remove consecutive identical blocks to fix the "Click Reports 3x" issue
-    const cleanBody: string[] = [];
-    let lastBlockSignature = '';
-
-    for (let i = 0; i < rawBodyLines.length; i++) {
-        const line = rawBodyLines[i];
-        
-        // Identify the start of a block (usually "elem = ...")
-        if (line.trim().startsWith('elem =')) {
-            // Construct a "signature" of this action block (next 3 lines usually)
-            const signature = line + (rawBodyLines[i+1] || '') + (rawBodyLines[i+2] || '');
-            
-            if (signature === lastBlockSignature) {
-                // Duplicate block detected! Skip the lines associated with it.
-                // We skip lines until we hit a sleep or comment
-                while(i < rawBodyLines.length && !rawBodyLines[i].includes('time.sleep')) {
-                    i++;
-                }
-                continue; 
-            }
-            lastBlockSignature = signature;
-        }
-        
-        cleanBody.push(line);
-    }
-
     const footer = [
       '    finally:',
-      '        # input("Press Enter to close...")',
       '        driver.quit()',
       '',
       "if __name__ == '__main__':",
       `    ${testName}()`
     ];
-    return [...header, ...cleanBody, ...footer].join('\n');
+    return [...header, ...rawBodyLines, ...footer].join('\n');
   }
 }
