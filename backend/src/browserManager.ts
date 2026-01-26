@@ -178,10 +178,14 @@ export class BrowserManager {
         await locator.dispatchEvent('click');
     }
 
-    // --- FIX: UNIVERSAL WAIT FOR UI REACTION ---
-    // This solves the "Preview too early" bug.
-    // It forces the browser to wait until the menu/dropdown actually renders.
-    await this.waitForStability(2500); 
+    // --- FIX: SMART WAIT INSTEAD OF HARD WAIT ---
+    // OLD: await this.waitForStability(2500);  <-- REMOVE THIS
+
+    // NEW: Only wait briefly for network, or rely on the next action's auto-wait.
+    // A 2.5s wait is too aggressive for simple UI interactions like opening a menu.
+    try {
+       await this.page?.waitForLoadState('networkidle', { timeout: 500 }).catch(() => {});
+    } catch {} 
 
     return info || { tagName: 'clicked', attributes: {}, cssSelector: selector };
   }
