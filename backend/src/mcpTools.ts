@@ -332,7 +332,12 @@ export class McpTools {
 
   
 
-                    name: el.attributes['name']
+                    name: el.attributes['name'],
+
+
+
+
+                    checked: el.checked
 
   
 
@@ -380,10 +385,9 @@ export class McpTools {
 
   
 
-            2. **For menu paths in the GOAL like "Reports -> Patients -> Patient Master List",
-               treat each label as a distinct target and, once you have clicked an earlier
-               label ("Reports", then "Patients"), prioritize clicking the FINAL label
-               ("Patient Master List") instead of re-clicking earlier ones.**
+            2. **For hierarchical navigation paths in the GOAL (indicated by arrows like "A -> B -> C"),
+               treat each level as a distinct target. Once you have navigated to an intermediate level,
+               focus on reaching the final destination without unnecessarily backtracking to earlier levels.**
 
   
 
@@ -397,13 +401,24 @@ export class McpTools {
 
                - Username usually has type='text'
 
-  
+  - Password usually has type='password'
 
-               - Password usually has type='password'
 
-  
 
-            5. RETURN JSON ONLY. Format: 
+
+5. **CHECKBOXES**: For checkboxes (type='checkbox'), check the 'checked' field. Only click to uncheck if 'checked' is true. Do not click if already unchecked.
+
+
+
+
+
+6. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
+
+
+
+
+
+7. RETURN JSON ONLY. Format:
 
   
 
@@ -417,13 +432,17 @@ export class McpTools {
 
                  { "type": "type", "elementId": "el_2", "text": "myPass", "thought": "Typing pass" },
 
-  
+  { "type": "click", "elementId": "el_3", "thought": "Login" },
 
-                 { "type": "click", "elementId": "el_3", "thought": "Login" }
 
-  
 
-               ]
+
+  { "type": "finish", "thought": "Task completed", "summary": "Logged in successfully" }
+
+
+
+
+]
 
   
 

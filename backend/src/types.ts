@@ -29,7 +29,7 @@ export interface ElementInfo {
   visible?: boolean;
   isVisible?: boolean;
   roleHint?: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other';
-  scrollable?: boolean; 
+  scrollable?: boolean;
   isFloating?: boolean;
   searchField?: boolean;
   region?: 'header' | 'main' | 'footer' | 'sidebar';
@@ -37,6 +37,7 @@ export interface ElementInfo {
   rect?: { x: number; y: number; width: number; height: number };
   context?: string;
   expanded?: boolean;
+  checked?: boolean;
   attributes: Record<string, string | undefined>;
 }
 

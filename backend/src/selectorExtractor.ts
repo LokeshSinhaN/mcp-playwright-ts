@@ -99,6 +99,7 @@ export class SelectorExtractor {
             type: inputType,
             name: getAttr('name'),
             role: getAttr('role'),
+            checked: (tagName === 'input' && inputType === 'checkbox') ? el.checked : undefined,
             boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
             visible: true
         };
