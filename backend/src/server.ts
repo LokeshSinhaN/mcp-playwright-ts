@@ -3,11 +3,16 @@ import http from 'http';
 import cors from 'cors';
 import WebSocket, { WebSocketServer } from 'ws';
 import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
-import OpenAI from 'openai'; // NEW
+import OpenAI from 'openai';
+import multer from 'multer';
+import { PDFParse } from 'pdf-parse';
 import { BrowserManager } from './browserManager';
 import { McpTools } from './mcpTools';
 import { ExecutionResult, WebSocketMessage, ExecutionCommand, ElementInfo, AgentSessionResult, AgentConfig } from './types';
 import { parseDropdownInstruction } from './dropdownUtils';
+
+// Configure Multer for memory storage (files are processed in RAM)
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Minimal conversation turn type if you later add real AI calls.
 interface ConversationTurn {
@@ -179,10 +184,29 @@ export function createServer(port: number, chromePath?: string) {
     }
   }
 
-  // --- SINGLE STEP AI HANDLER (Legacy/Fallback) ---
-  // Note: This function currently defaults to Gemini. You can upgrade it to support switching
-  // if single-step AI is still heavily used.
-  
+  // --- PDF PARSING ENDPOINT ---
+  app.post('/api/parse-pdf', upload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) {
+        throw new Error('No file uploaded');
+      }
+      
+      const buffer = req.file.buffer;
+      const parser = new PDFParse({ data: buffer });
+      const data = await parser.getText();
+      await parser.destroy();
+
+      // Clean up the text slightly
+      const text = data.text.trim();
+      
+      res.json({ success: true, text });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ success: false, error: msg });
+    }
+  });
+
+  // --- ACTION HANDLER ---
   app.post('/api/execute', async (req, res) => {
     const { action, url, selector, text, commands, prompt, agentConfig } = req.body as {
       action: string;
@@ -265,9 +289,7 @@ export function createServer(port: number, chromePath?: string) {
               }
             };
           } else {
-            // Fallback to legacy single step (Gemini only for now)
-            // Or force agent mode for single step too?
-            // For now, let's treat "ai" action as Agent mode for consistency with multi-model support.
+            // Fallback to legacy single step
              const config: AgentConfig = {
               maxSteps: 5, // Short horizon for single step
               broadcast,

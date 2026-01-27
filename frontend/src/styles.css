@@ -315,8 +315,36 @@ body {
   font-size: 0.82rem;
 }
 
+.chat-attach-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0.38rem 0.4rem;
+  font-size: 1.1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.2s;
+}
+
+.chat-attach-btn:hover {
+  color: var(--accent);
+}
+
+.chat-attach-btn.loading {
+  animation: pulse 1s infinite;
+  pointer-events: none;
+}
+
 .chat-send-btn:hover {
   filter: brightness(1.05);
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.5; }
+  100% { opacity: 1; }
 }
 
 .chat-hint {
