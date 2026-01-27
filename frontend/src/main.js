@@ -15,6 +15,8 @@ const copySeleniumCodeBtn = document.getElementById('copy-selenium-code-btn');
 const wsStatusDot = document.getElementById('ws-status-dot');
 const wsStatusText = document.getElementById('ws-status-text');
 const modelSelect = document.getElementById('model-provider-select');
+const uploadPdfBtn = document.getElementById('upload-pdf-btn');
+const pdfInput = document.getElementById('pdf-upload-input');
 function setWsStatus(state, label) {
     if (!wsStatusDot || !wsStatusText)
         return;
@@ -62,6 +64,8 @@ function appendLog(p) {
         data.role ||
         (p.type === 'log' && typeof data.stepNumber === 'number' ? 'agent-step' : undefined) ||
         (p.type === 'action' ? 'action' : undefined) ||
+        (p.type === 'thought' ? 'ai-thought' : undefined) ||
+        (p.type === 'action_taken' ? 'ai-action' : undefined) ||
         'system';
     entry.className = `chat-entry ${p.type} role-${inferredRole}`;
     const ts = document.createElement('span');
@@ -88,7 +92,7 @@ function appendLog(p) {
     chatLog.scrollTop = chatLog.scrollHeight;
 }
 wsClient.on((p) => {
-    if (p.type === 'log' || p.type === 'action' || p.type === 'success') {
+    if (p.type === 'log' || p.type === 'action' || p.type === 'success' || p.type === 'thought' || p.type === 'action_taken') {
         setWsStatus('connected', 'Connected');
     }
     else if (p.type === 'error') {
@@ -103,6 +107,54 @@ wsClient.on((p) => {
     appendLog(p);
 });
 wsClient.connect();
+// --- PDF UPLOAD LOGIC ---
+if (uploadPdfBtn && pdfInput) {
+    uploadPdfBtn.addEventListener('click', () => {
+        pdfInput.click();
+    });
+    pdfInput.addEventListener('change', async () => {
+        if (!pdfInput.files || pdfInput.files.length === 0)
+            return;
+        const file = pdfInput.files[0];
+        const formData = new FormData();
+        formData.append('file', file);
+        // Visual feedback
+        uploadPdfBtn.classList.add('loading');
+        const originalText = uploadPdfBtn.innerHTML;
+        uploadPdfBtn.innerHTML = '...';
+        try {
+            appendLog({ type: 'info', message: `Uploading and parsing ${file.name}...`, role: 'system' });
+            const response = await fetch('http://localhost:5000/api/parse-pdf', {
+                method: 'POST',
+                body: formData
+            });
+            const result = await response.json();
+            if (result.success && result.text) {
+                // Append parsed text to the current prompt
+                const currentVal = promptInput.value;
+                const separator = currentVal.trim() ? '\n\n' : '';
+                // Add a context wrapper around the content
+                promptInput.value = `${currentVal}${separator}Content from ${file.name}:\n"""\n${result.text}\n"""\n`;
+                // Scroll to bottom of textarea
+                promptInput.scrollTop = promptInput.scrollHeight;
+                promptInput.focus();
+                appendLog({ type: 'success', message: `PDF parsed successfully (${result.text.length} chars added to prompt).`, role: 'system' });
+            }
+            else {
+                throw new Error(result.error || 'Unknown parsing error');
+            }
+        }
+        catch (err) {
+            appendLog({ type: 'error', message: `Failed to parse PDF: ${err.message}` });
+        }
+        finally {
+            // Reset button and input
+            uploadPdfBtn.classList.remove('loading');
+            uploadPdfBtn.innerHTML = originalText;
+            pdfInput.value = ''; // Allow re-uploading same file
+        }
+    });
+}
 chatForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = promptInput.value.trim();

@@ -114,17 +114,36 @@ export class McpTools {
     // ... [Agent Loop - Same as before] ...
     while (stepNumber < maxSteps && !isFinished) {
       stepNumber++;
-      
+
       const extractor = new SelectorExtractor(page);
       const elements = await extractor.extractAllInteractive();
       const screenshotObj = await this.browser.screenshot();
       const screenshotBase64 = screenshotObj.replace('data:image/png;base64,', '');
+
+      // Broadcast AI thinking
+      if (config.broadcast) {
+        config.broadcast({
+          type: 'thought',
+          timestamp: new Date().toISOString(),
+          message: `AI is analyzing the current page state and planning next actions...`
+        });
+      }
 
       // Plan Action
       let nextActionsBatch = await this.planNextAgentAction(
         goal, elements, actionHistory, failedElements, screenshotBase64, config.modelProvider
       );
       const actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
+
+      // Broadcast the AI's thoughts
+      if (config.broadcast) {
+        const thoughts = actionsToExecute.map(a => a.thought || 'No thought provided').join('; ');
+        config.broadcast({
+          type: 'thought',
+          timestamp: new Date().toISOString(),
+          message: `AI thought: ${thoughts}`
+        });
+      }
 
       // Execute Batch
       this.agentCommandBuffer = [];
@@ -148,6 +167,27 @@ export class McpTools {
           this.sessionHistory.push(...this.agentCommandBuffer);
           actionHistory.push(`[SUCCESS] Executed steps`);
           this.agentCommandBuffer = [];
+
+          // Broadcast actions taken
+          if (config.broadcast) {
+            const actionDescriptions = actionsToExecute.map(a => {
+              switch (a.type) {
+                case 'click': return `Clicked ${a.elementId || a.semanticTarget || 'element'}`;
+                case 'type': return `Typed "${a.text}" into ${a.elementId || a.semanticTarget || 'element'}`;
+                case 'navigate': return `Navigated to ${a.url}`;
+                case 'select_option': return `Selected "${a.option}" from ${a.elementId || a.semanticTarget || 'dropdown'}`;
+                case 'scrape_data': return `Scraped data: ${a.instruction}`;
+                case 'scroll': return `Scrolled ${a.direction} on ${a.elementId || 'page'}`;
+                case 'wait': return `Waited ${a.durationMs}ms`;
+                case 'finish': return 'Completed task';
+              }
+            }).join('; ');
+            config.broadcast({
+              type: 'action_taken',
+              timestamp: new Date().toISOString(),
+              message: `Actions taken: ${actionDescriptions}`
+            });
+          }
       }
 
       if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
