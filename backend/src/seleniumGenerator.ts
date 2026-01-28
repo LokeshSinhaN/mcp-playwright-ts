@@ -15,16 +15,53 @@ export class SeleniumGenerator {
     return this.generatePython(commands, startingUrl);
   }
 
+  private optimizeCommands(commands: ExecutionCommand[]): ExecutionCommand[] {
+    const optimized: ExecutionCommand[] = [];
+    for (let i = 0; i < commands.length; i++) {
+      const cmd = commands[i];
+      const nextCmd = commands[i + 1];
+
+      // Skip click if followed by type on the same selector (for dropdowns)
+      if (cmd.action === 'click' && nextCmd && nextCmd.action === 'type' &&
+          this.getSelectorKey(cmd) === this.getSelectorKey(nextCmd)) {
+        continue;
+      }
+
+      // Deduplicate consecutive identical commands
+      const last = optimized[optimized.length - 1];
+      if (last && this.commandsEqual(cmd, last)) {
+        continue;
+      }
+
+      optimized.push(cmd);
+    }
+    return optimized;
+  }
+
+  private getSelectorKey(cmd: ExecutionCommand): string {
+    return cmd.selectors?.css || cmd.selectors?.xpath || cmd.selectors?.id || cmd.target || '';
+  }
+
+  private commandsEqual(a: ExecutionCommand, b: ExecutionCommand): boolean {
+    return a.action === b.action &&
+           this.getSelectorKey(a) === this.getSelectorKey(b) &&
+           a.value === b.value;
+  }
+
   private generatePython(commands: ExecutionCommand[], startingUrl?: string): string {
     const testName = this.opts.testName ?? 'test_flow';
     const driverPath = this.opts.chromeDriverPath ?? 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe';
 
+    // Deduplicate and optimize commands
+    const optimizedCommands = this.optimizeCommands(commands);
+
     // 1. ROBUST HEADER & SAFE_CLICK
-    // We switched safe_click to use JS immediately if standard click fails, 
+    // We switched safe_click to use JS immediately if standard click fails,
     // and added scrollIntoView to handle headers covering elements.
     const header = [
       'from selenium import webdriver',
       'from selenium.webdriver.common.by import By',
+      'from selenium.webdriver.common.keys import Keys',
       'from selenium.webdriver.support.ui import WebDriverWait',
       'from selenium.webdriver.support import expected_conditions as EC',
       'from selenium.webdriver.chrome.service import Service',
@@ -63,7 +100,7 @@ export class SeleniumGenerator {
       `    wait = WebDriverWait(driver, 10)`, // Reduced timeout for speed
       '    try:'
     ];
-    
+
     const rawBodyLines: string[] = [];
 
     // 2. FORCE NAVIGATION (Universal Fix)
@@ -100,7 +137,7 @@ export class SeleniumGenerator {
     };
 
     // 3. GENERATE BODY
-    for (const cmd of commands) {
+    for (const cmd of optimizedCommands) {
       if (['click', 'type'].includes(cmd.action) && 
           !cmd.selectors?.css && !cmd.selectors?.xpath && !cmd.selectors?.id && !cmd.target) {
           continue; 
@@ -138,10 +175,16 @@ export class SeleniumGenerator {
         case 'type':
             rawBodyLines.push(
               `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
-              `        elem.clear()`,
+              `        try:`,
+              `            elem.clear()`,
+              `        except:`,
+              `            pass`,
               `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`,
               '        time.sleep(0.5)'
             );
+            if (cmd.selectors?.css?.includes('DDL')) {
+              rawBodyLines.push(`        elem.send_keys(Keys.ENTER)`);
+            }
           break;
         
         case 'wait':

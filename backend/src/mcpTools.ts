@@ -120,8 +120,8 @@ export class McpTools {
       const screenshotObj = await this.browser.screenshot();
       const screenshotBase64 = screenshotObj.replace('data:image/png;base64,', '');
 
-      // Broadcast AI thinking
-      if (config.broadcast) {
+      // Broadcast AI thinking (only if screenshot succeeded)
+      if (config.broadcast && screenshotBase64) {
         config.broadcast({
           type: 'thought',
           timestamp: new Date().toISOString(),
@@ -129,14 +129,29 @@ export class McpTools {
         });
       }
 
-      // Plan Action
-      let nextActionsBatch = await this.planNextAgentAction(
-        goal, elements, actionHistory, failedElements, screenshotBase64, config.modelProvider
-      );
+      // Plan Action with timeout and screenshot check
+      const planningTimeout = 30000; // 30 seconds timeout for AI planning
+      let nextActionsBatch;
+      try {
+        // Skip planning if screenshot failed
+        if (!screenshotBase64) {
+          nextActionsBatch = [{ type: 'wait', durationMs: 1000, thought: 'Screenshot failed, waiting' } as SingleAgentAction];
+        } else {
+          nextActionsBatch = await Promise.race([
+            this.planNextAgentAction(goal, elements, actionHistory, failedElements, screenshotBase64, config.modelProvider),
+            new Promise<SingleAgentAction[]>((_, reject) =>
+              setTimeout(() => reject(new Error('AI planning timed out')), planningTimeout)
+            )
+          ]);
+        }
+      } catch (error) {
+        console.error('Planning timeout:', error);
+        nextActionsBatch = [{ type: 'wait', durationMs: 2000, thought: 'Planning timed out, waiting' } as SingleAgentAction];
+      }
       const actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
 
       // Broadcast the AI's thoughts
-      if (config.broadcast) {
+      if (config.broadcast && actionsToExecute.length > 0) {
         const thoughts = actionsToExecute.map(a => a.thought || 'No thought provided').join('; ');
         config.broadcast({
           type: 'thought',
@@ -145,13 +160,13 @@ export class McpTools {
         });
       }
 
-      // Execute Batch
+      // Execute Batch with dynamic wait times
       this.agentCommandBuffer = [];
       let batchSuccess = true;
-      
+
       for (const action of actionsToExecute) {
          if (!batchSuccess) break;
-         if (this.isActionRedundant(action, this.sessionHistory.concat(this.agentCommandBuffer))) continue;
+         if (this.isActionRedundant(action as SingleAgentAction, this.sessionHistory.concat(this.agentCommandBuffer))) continue;
 
          try {
              const res = await this.executeAgentAction(action, elements);
@@ -160,7 +175,10 @@ export class McpTools {
                  if (res.failedSelector) failedElements.add(res.failedSelector);
              }
          } catch { batchSuccess = false; }
-         await page.waitForTimeout(500);
+
+         // Dynamic wait: shorter for fast actions, longer if screenshot is slow
+         const waitTime = action.type === 'click' || action.type === 'type' ? 300 : 800;
+         await page.waitForTimeout(waitTime);
       }
 
       if (batchSuccess && this.agentCommandBuffer.length > 0) {
@@ -172,14 +190,29 @@ export class McpTools {
           if (config.broadcast) {
             const actionDescriptions = actionsToExecute.map(a => {
               switch (a.type) {
-                case 'click': return `Clicked ${a.elementId || a.semanticTarget || 'element'}`;
-                case 'type': return `Typed "${a.text}" into ${a.elementId || a.semanticTarget || 'element'}`;
-                case 'navigate': return `Navigated to ${a.url}`;
-                case 'select_option': return `Selected "${a.option}" from ${a.elementId || a.semanticTarget || 'dropdown'}`;
-                case 'scrape_data': return `Scraped data: ${a.instruction}`;
-                case 'scroll': return `Scrolled ${a.direction} on ${a.elementId || 'page'}`;
-                case 'wait': return `Waited ${a.durationMs}ms`;
+                case 'click':
+                  const clickAction = a as { type: 'click'; elementId?: string; semanticTarget?: string };
+                  return `Clicked ${clickAction.elementId || clickAction.semanticTarget || 'element'}`;
+                case 'type':
+                  const typeAction = a as { type: 'type'; text: string; elementId?: string; semanticTarget?: string };
+                  return `Typed "${typeAction.text}" into ${typeAction.elementId || typeAction.semanticTarget || 'element'}`;
+                case 'navigate':
+                  const navAction = a as { type: 'navigate'; url: string };
+                  return `Navigated to ${navAction.url}`;
+                case 'select_option':
+                  const selectAction = a as { type: 'select_option'; option: string; elementId?: string; semanticTarget?: string };
+                  return `Selected "${selectAction.option}" from ${selectAction.elementId || selectAction.semanticTarget || 'dropdown'}`;
+                case 'scrape_data':
+                  const scrapeAction = a as { type: 'scrape_data'; instruction: string };
+                  return `Scraped data: ${scrapeAction.instruction}`;
+                case 'scroll':
+                  const scrollAction = a as { type: 'scroll'; direction: string; elementId?: string };
+                  return `Scrolled ${scrollAction.direction} on ${scrollAction.elementId || 'page'}`;
+                case 'wait':
+                  const waitAction = a as { type: 'wait'; durationMs: number };
+                  return `Waited ${waitAction.durationMs}ms`;
                 case 'finish': return 'Completed task';
+                default: return 'Unknown action';
               }
             }).join('; ');
             config.broadcast({
@@ -191,7 +224,11 @@ export class McpTools {
       }
 
       if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
-      if (batchSuccess && !isFinished) await this.browser.waitForStability(1500); 
+      if (batchSuccess && !isFinished) {
+        // Dynamic stability wait based on page load
+        const stabilityWait = elements.length > 50 ? 2000 : 1000;
+        await this.browser.waitForStability(stabilityWait);
+      }
     }
 
     // --- CRITICAL: OPTIMIZE & GENERATE ---
@@ -296,10 +333,8 @@ export class McpTools {
 
         
 
-        const visibleEl = elements.filter(el => 
-
+        const visibleEl = elements.filter(el =>
             el.visible && !failedElements.has(el.cssSelector || '')
-
         );
 
   
@@ -391,11 +426,15 @@ export class McpTools {
 
   
 
-            3. **BATCHING**: Return an ARRAY of actions for forms (e.g. Login).
+            3. **SEQUENTIAL STEPS**: If the GOAL contains numbered steps (e.g., 1., 2., 3.), execute them strictly in order, one at a time. Do not skip or combine steps. Identify the next uncompleted step based on HISTORY and execute only that step.
+
+   
+
+            4. **BATCHING**: Return an ARRAY of actions for forms (e.g. Login). For sequential steps, batch only within a single step if it requires multiple actions.
 
   
 
-            4. **DISTINCTION**: Look at 'label', 'placeholder', and 'type' to distinguish Username vs Password. 
+            5. **DISTINCTION**: Look at 'label', 'placeholder', and 'type' to distinguish Username vs Password.
 
   
 
@@ -406,19 +445,19 @@ export class McpTools {
 
 
 
-5. **CHECKBOXES**: For checkboxes (type='checkbox'), check the 'checked' field. Only click to uncheck if 'checked' is true. Do not click if already unchecked.
+6. **CHECKBOXES**: For checkboxes (type='checkbox'), check the 'checked' field. Only click to uncheck if 'checked' is true. Do not click if already unchecked.
 
 
 
 
 
-6. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
+7. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
 
 
 
 
 
-7. RETURN JSON ONLY. Format:
+8. RETURN JSON ONLY. Format:
 
   
 

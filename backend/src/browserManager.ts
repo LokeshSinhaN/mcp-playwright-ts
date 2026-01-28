@@ -234,8 +234,35 @@ export class BrowserManager {
   async screenshot(): Promise<string> {
       const page = this.getPage();
       if (page.isClosed()) return '';
-      const buf = await page.screenshot({ fullPage: false, timeout: 3000, animations: 'disabled', caret: 'hide' });
-      return `data:image/png;base64,${buf.toString('base64')}`;
+      try {
+          // Pre-screenshot optimizations
+          await page.evaluate(() => {
+              // Disable problematic CSS that can cause delays
+              const style = document.createElement('style');
+              style.textContent = `
+                  * {
+                      -webkit-font-smoothing: none !important;
+                      font-smooth: never !important;
+                      text-rendering: optimizeSpeed !important;
+                  }
+                  @font-face { font-display: swap; }
+              `;
+              document.head.appendChild(style);
+          }).catch(() => {});
+
+          const buf = await page.screenshot({
+              fullPage: false,
+              timeout: 1500, // Reduced timeout
+              animations: 'disabled',
+              caret: 'hide',
+              scale: 'css',
+              omitBackground: true // Faster without background
+          });
+          return `data:image/png;base64,${buf.toString('base64')}`;
+      } catch (error) {
+          console.warn('Screenshot failed, returning empty:', error);
+          return '';
+      }
   }
 
   async goto(url: string) {
