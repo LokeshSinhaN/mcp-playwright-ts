@@ -35,6 +35,11 @@ export class McpTools {
     }
   }
 
+  private extractStepsFromGoal(goal: string): string[] {
+    const lines = goal.split('\n');
+    return lines.filter(line => /^\d+\./.test(line.trim())).map(line => line.trim());
+  }
+
   // ... [navigate, clickExact, type, observe, handleCookieBanner - KEEP AS IS] ...
   
   // --- KEEP navigate(), clickExact(), type(), observe() from previous code ---
@@ -86,10 +91,12 @@ export class McpTools {
   // --- AGENT LOGIC ---
 
   async runAutonomousAgent(goal: string, config: AgentConfig = {}): Promise<AgentSessionResult> {
-    const maxSteps = config.maxSteps ?? 30;
-    const steps: AgentStepResult[] = [];
-    const failedElements: Set<string> = new Set();
-    const actionHistory: string[] = []; 
+  const maxSteps = config.maxSteps ?? 30;
+  const steps: AgentStepResult[] = [];
+  const failedElements: Set<string> = new Set();
+  const actionHistory: string[] = [];
+  let errorSummary: string | undefined;
+  let currentStep = 0; // Track current completed step for strict sequencing
 
     await this.browser.init();
     const page = this.browser.getPage();
@@ -146,7 +153,21 @@ export class McpTools {
         }
       } catch (error) {
         console.error('Planning timeout:', error);
-        nextActionsBatch = [{ type: 'wait', durationMs: 2000, thought: 'Planning timed out, waiting' } as SingleAgentAction];
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (errorMessage.includes('503') || errorMessage.includes('Service Unavailable') || errorMessage.includes('overloaded')) {
+          errorSummary = `AI service unavailable: ${errorMessage}`;
+          isFinished = true;
+          if (config.broadcast) {
+            config.broadcast({
+              type: 'thought',
+              timestamp: new Date().toISOString(),
+              message: `Error: ${errorSummary}`
+            });
+          }
+          break; // Exit the loop immediately
+        } else {
+          nextActionsBatch = [{ type: 'wait', durationMs: 2000, thought: 'Planning timed out, waiting' } as SingleAgentAction];
+        }
       }
       const actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
 
@@ -225,6 +246,10 @@ export class McpTools {
 
       if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
       if (batchSuccess && !isFinished) {
+        // Increment currentStep only if we completed a step towards the goal
+        if (actionsToExecute.some(a => a.type !== 'wait')) {
+          currentStep++;
+        }
         // Dynamic stability wait based on page load
         const stabilityWait = elements.length > 50 ? 2000 : 1000;
         await this.browser.waitForStability(stabilityWait);
@@ -253,41 +278,53 @@ export class McpTools {
 
   // --- UNIVERSAL FIX: SEQUENCE DEDUPLICATOR ---
   private optimizeHistory(commands: ExecutionCommand[]): ExecutionCommand[] {
-      const clean: ExecutionCommand[] = [];
+       const clean: ExecutionCommand[] = [];
 
-      for (let i = 0; i < commands.length; i++) {
-          const curr = commands[i];
-          
-          // 1. Skip tiny waits
-          if (curr.action === 'wait' && (curr.waitTime || 0) < 1) continue;
+       for (let i = 0; i < commands.length; i++) {
+           const curr = commands[i];
 
-          // 2. Loop Detection (A -> B -> A -> B)
-          // If the last two commands in 'clean' are identical to the next two (curr, next), skip.
-          if (clean.length >= 2 && i + 1 < commands.length) {
-              const last1 = clean[clean.length - 1];
-              const last2 = clean[clean.length - 2];
-              const next = commands[i+1];
+           // 1. Skip tiny waits
+           if (curr.action === 'wait' && (curr.waitTime || 0) < 1) continue;
 
-              if (this.cmdsMatch(last2, curr) && this.cmdsMatch(last1, next)) {
-                  // Detected loop pattern: [Report, Patient] -> [Report, Patient]
-                  // Skip 'curr' (Report) and increment i to skip 'next' (Patient)
-                  i++; 
-                  continue;
-              }
-          }
+           // 2. Loop Detection (A -> B -> A -> B)
+           // If the last two commands in 'clean' are identical to the next two (curr, next), skip.
+           if (clean.length >= 2 && i + 1 < commands.length) {
+               const last1 = clean[clean.length - 1];
+               const last2 = clean[clean.length - 2];
+               const next = commands[i+1];
 
-          // 3. Stutter Detection (Click X -> Click X)
-          if (clean.length > 0) {
-              const last = clean[clean.length - 1];
-              if (this.cmdsMatch(last, curr) && curr.action === 'click') {
-                  continue; 
-              }
-          }
-          
-          clean.push(curr);
-      }
-      return clean;
-  }
+               if (this.cmdsMatch(last2, curr) && this.cmdsMatch(last1, next)) {
+                   // Detected loop pattern: [Report, Patient] -> [Report, Patient]
+                   // Skip 'curr' (Report) and increment i to skip 'next' (Patient)
+                   i++;
+                   continue;
+               }
+           }
+
+           // 3. Stutter Detection (Click X -> Click X)
+           if (clean.length > 0) {
+               const last = clean[clean.length - 1];
+               if (this.cmdsMatch(last, curr) && curr.action === 'click') {
+                   continue;
+               }
+           }
+
+           // 4. Dropdown Toggle Loop Detection (Open Dropdown -> Check State -> Open Dropdown -> Check State)
+           // Detect repetitive dropdown opening without progress
+           if (clean.length >= 3 && curr.action === 'click' && curr.description?.includes('dropdown')) {
+               const lastThree = clean.slice(-3);
+               const isDropdownLoop = lastThree.every(cmd =>
+                   cmd.action === 'click' && cmd.description?.includes('dropdown')
+               );
+               if (isDropdownLoop) {
+                   continue; // Skip this redundant dropdown click
+               }
+           }
+
+           clean.push(curr);
+       }
+       return clean;
+   }
 
   private cmdsMatch(a: ExecutionCommand, b: ExecutionCommand): boolean {
       if (a.action !== b.action) return false;
@@ -317,19 +354,21 @@ export class McpTools {
 
         private async planNextAgentAction(
 
-          goal: string,
+         goal: string,
 
-          elements: ElementInfo[],
+         elements: ElementInfo[],
 
-          history: string[],
+         history: string[],
 
-          failedElements: Set<string>,
+         failedElements: Set<string>,
 
-          screenshot: string,
+         screenshot: string,
 
-          provider: 'gemini' | 'openai' = 'gemini'
+         provider: 'gemini' | 'openai' = 'gemini',
 
-        ): Promise<SingleAgentAction | SingleAgentAction[]> {
+         currentStep: number = 0
+
+       ): Promise<SingleAgentAction | SingleAgentAction[]> {
 
         
 
@@ -426,7 +465,7 @@ export class McpTools {
 
   
 
-            3. **SEQUENTIAL STEPS**: If the GOAL contains numbered steps (e.g., 1., 2., 3.), execute them strictly in order, one at a time. Do not skip or combine steps. Identify the next uncompleted step based on HISTORY and execute only that step.
+            3. **SEQUENTIAL STEPS**: If the GOAL contains numbered steps (e.g., 1., 2., 3.), execute them strictly in order, one at a time. Do not skip or combine steps. Identify the next uncompleted step based on HISTORY and execute only that step. Current completed steps: ${currentStep}. Focus only on the next step (${currentStep + 1}).
 
    
 
@@ -788,6 +827,11 @@ export class McpTools {
              if (action.selector && lastCmd.target === action.selector) return true;
              // Semantic check: if we just clicked "Submit" and AI says "Click Submit" again immediately
              if (action.semanticTarget && lastCmd.description && lastCmd.description.includes(action.semanticTarget)) return true;
+             // Prevent repetitive dropdown opening
+             if (action.semanticTarget && action.semanticTarget.toLowerCase().includes('dropdown') &&
+                 lastCmd.description && lastCmd.description.toLowerCase().includes('dropdown')) {
+                 return true;
+             }
           }
       }
       return false;
