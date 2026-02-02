@@ -13,7 +13,7 @@ import {
   AgentSessionResult,
   AgentConfig
 } from './types';
-import { selectFromDropdown, selectOptionInOpenDropdown } from './dropdownUtils';
+import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent } from './dropdownUtils';
 
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
@@ -108,6 +108,10 @@ export class McpTools {
         }
     }
 
+    // Pre-parse any dropdown instructions from the goal text so we can fall back to a deterministic action
+    const dropdownIntent: DropdownIntent | null = parseDropdownInstruction(goal);
+    let dropdownSatisfied = false;
+
     let stepNumber = 0;
     let isFinished = false;
 
@@ -133,7 +137,36 @@ export class McpTools {
       let nextActionsBatch = await this.planNextAgentAction(
         goal, elements, actionHistory, failedElements, screenshotBase64, config.modelProvider
       );
-      const actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
+      let actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
+
+      // --- DROPDOWN FAILSAFE -------------------------------------------------
+      // In cases like logs-1 where the LLM wants to "finish" early because it cannot
+      // see the dropdown element in the extracted list, we synthesize a deterministic
+      // select_option action based purely on the textual instructions.
+      if (dropdownIntent && !dropdownSatisfied) {
+        const wantsToFinishOnly =
+          actionsToExecute.length === 1 && actionsToExecute[0].type === 'finish';
+
+        const hasExplicitDropdownAction = actionsToExecute.some(a =>
+          a.type === 'select_option' ||
+          (a.type === 'click' && a.semanticTarget && /drop\s*down/i.test(a.semanticTarget)) ||
+          (a.type === 'type' && a.semanticTarget && /drop\s*down/i.test(a.semanticTarget))
+        );
+
+        if (wantsToFinishOnly && !hasExplicitDropdownAction) {
+          const optionLabel = dropdownIntent.optionLabel;
+          const dropdownLabel = dropdownIntent.kind === 'open-and-select'
+            ? dropdownIntent.dropdownLabel
+            : undefined;
+
+          actionsToExecute = [{
+            type: 'select_option',
+            semanticTarget: dropdownLabel,
+            option: optionLabel,
+            thought: `Selecting dropdown option "${optionLabel}" based on goal instructions before finishing.`
+          }];
+        }
+      }
 
       // Broadcast the AI's thoughts
       if (config.broadcast) {
@@ -167,6 +200,16 @@ export class McpTools {
           this.sessionHistory.push(...this.agentCommandBuffer);
           actionHistory.push(`[SUCCESS] Executed steps`);
           this.agentCommandBuffer = [];
+
+          // If we just recorded a command that selected the desired dropdown option,
+          // mark the dropdown intent as satisfied so we do not keep forcing it.
+          if (dropdownIntent && !dropdownSatisfied) {
+            const opt = dropdownIntent.optionLabel.toLowerCase();
+            dropdownSatisfied = this.sessionHistory.some(cmd =>
+              (cmd.description && cmd.description.toLowerCase().includes(opt)) ||
+              (cmd.selectors?.text && cmd.selectors.text.toLowerCase().includes(opt))
+            );
+          }
 
           // Broadcast actions taken
           if (config.broadcast) {
