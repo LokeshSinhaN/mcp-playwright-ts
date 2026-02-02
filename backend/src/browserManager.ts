@@ -8,6 +8,8 @@ export class BrowserManager {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private screenshotStreamer: NodeJS.Timeout | null = null;
+  // Cache the last good screenshot so transient failures don't break the agent/stream
+  private lastScreenshot: string | null = null;
   private readonly config: BrowserConfig;
   private readonly state: SessionState = {
     isOpen: false,
@@ -233,9 +235,34 @@ export class BrowserManager {
   
   async screenshot(): Promise<string> {
       const page = this.getPage();
-      if (page.isClosed()) return '';
-      const buf = await page.screenshot({ fullPage: false, timeout: 3000, animations: 'disabled', caret: 'hide' });
-      return `data:image/png;base64,${buf.toString('base64')}`;
+      if (page.isClosed()) return this.lastScreenshot ?? '';
+
+      const screenshotTimeout = Math.min(this.config.timeoutMs, 30000); // safety cap
+
+      // Try twice before giving up; never throw so callers/agent keep running
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+              const buf = await page.screenshot({
+                  fullPage: false,
+                  timeout: screenshotTimeout,
+                  animations: 'disabled',
+                  caret: 'hide'
+              });
+              const data = `data:image/png;base64,${buf.toString('base64')}`;
+              this.lastScreenshot = data;
+              return data;
+          } catch (err) {
+              lastError = err;
+              // Small delay before retry; swallow error to avoid aborting the flow
+              try {
+                  await page.waitForTimeout(500);
+              } catch {}
+          }
+      }
+
+      console.warn('Screenshot failed, reusing last known image (if any).', lastError);
+      return this.lastScreenshot ?? '';
   }
 
   async goto(url: string) {
