@@ -28,7 +28,7 @@ export class SeleniumGenerator {
       'from selenium.webdriver.support.ui import WebDriverWait',
       'from selenium.webdriver.support import expected_conditions as EC',
       'from selenium.webdriver.chrome.service import Service',
-      'from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException, StaleElementReferenceException',
+      'from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException, StaleElementReferenceException, InvalidElementStateException',
       'import json',
       'import time',
       '',
@@ -53,6 +53,14 @@ export class SeleniumGenerator {
       '            driver.execute_script("arguments[0].click();", element)',
       '        except:',
       '            pass',
+      '',
+      'def safe_clear(element):',
+      '    """Safely clear element content, handling invalid element state exceptions."""',
+      '    try:',
+      '        element.clear()',
+      '    except (InvalidElementStateException, StaleElementReferenceException):',
+      '        # Element is read-only, disabled, or not an input field - skip clearing',
+      '        pass',
       '',
       `def ${testName}():`,
       `    options = webdriver.ChromeOptions()`,
@@ -138,7 +146,7 @@ export class SeleniumGenerator {
         case 'type':
             rawBodyLines.push(
               `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
-              `        elem.clear()`,
+              `        safe_clear(elem)`,
               `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`,
               '        time.sleep(0.5)'
             );
