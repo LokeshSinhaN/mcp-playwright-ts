@@ -6,6 +6,32 @@ import { ElementInfo } from './types';
 export class SelectorExtractor {
   constructor(private readonly page: Page) {}
 
+  // Dynamic element prioritization based on action context to prevent misclicks
+  async extractWithActionPrioritization(actionType: 'click' | 'type' | 'select_option'): Promise<ElementInfo[]> {
+    const allElements = await this.extractAllInteractive();
+
+    // For 'type' actions, prioritize input/textarea elements over select/dropdown elements
+    if (actionType === 'type') {
+      const inputs = allElements.filter(el => el.tagName === 'input' || el.tagName === 'textarea');
+      const others = allElements.filter(el => el.tagName !== 'input' && el.tagName !== 'textarea');
+
+      // Return inputs first, then other elements to ensure typing goes to input fields
+      return [...inputs, ...others];
+    }
+
+    // For 'select_option' actions, prioritize select elements and dropdown triggers
+    if (actionType === 'select_option') {
+      const selects = allElements.filter(el => el.tagName === 'select' || el.roleHint === 'listbox');
+      const others = allElements.filter(el => el.tagName !== 'select' && el.roleHint !== 'listbox');
+
+      // Return select elements first for dropdown operations
+      return [...selects, ...others];
+    }
+
+    // For 'click' actions, use default ordering
+    return allElements;
+  }
+
   async extractAllInteractive(): Promise<ElementInfo[]> {
     const frames = [this.page, ...this.page.frames().filter(f => f !== this.page.mainFrame())];
     let allResults: ElementInfo[] = [];
@@ -27,7 +53,25 @@ export class SelectorExtractor {
         }
     }
 
-    return Array.from(unique.values());
+    const uniqueElements = Array.from(unique.values());
+
+    // Dynamic prioritization: Sort elements to prioritize inputs over selects/dropdowns for better execution flow
+    // This ensures accurate clicks by putting actionable inputs first in the JSON list
+    return uniqueElements.sort((a, b) => {
+        // Prioritize input/textarea elements over select elements
+        const aIsInput = a.tagName === 'input' || a.tagName === 'textarea';
+        const bIsInput = b.tagName === 'input' || b.tagName === 'textarea';
+        const aIsSelect = a.tagName === 'select' || a.roleHint === 'listbox';
+        const bIsSelect = b.tagName === 'select' || b.roleHint === 'listbox';
+
+        if (aIsInput && !bIsInput) return -1; // a (input) comes first
+        if (!aIsInput && bIsInput) return 1;  // b (input) comes first
+        if (aIsSelect && !bIsSelect) return 1; // a (select) comes after inputs
+        if (!aIsSelect && bIsSelect) return -1; // b (select) comes after inputs
+
+        // For same type, maintain original order
+        return 0;
+    });
   }
 
   private async extractFromScope(scope: Page | Frame): Promise<ElementInfo[]> {
@@ -67,15 +111,15 @@ export class SelectorExtractor {
         const tagName = el.tagName.toLowerCase();
         const inputType = (tagName === 'input' ? getAttr('type') : '').toLowerCase();
 
-        // Label Resolution Strategy
+        // Enhanced Label Resolution Strategy for better input identification
         let label = getAttr('aria-label') || getAttr('placeholder') || getAttr('name') || '';
-        
+
         // If no internal label, look for <label> tag
         if (!label && el.id) {
             const labelEl = document.querySelector(`label[for="${el.id}"]`);
             if (labelEl) label = labelEl.textContent?.trim() || '';
         }
-        
+
         // If still no label, check previous sibling for text (common in simple forms)
         if (!label && (tagName === 'input' || tagName === 'select')) {
              let sib = el.previousElementSibling;
@@ -89,6 +133,34 @@ export class SelectorExtractor {
              }
         }
 
+        // Additional heuristic: Check for nearby text elements that might indicate the field purpose
+        if (!label && (tagName === 'input' || tagName === 'select')) {
+            // Look for text in adjacent elements or parent containers
+            const nearbyTexts = [];
+            let parent = el.parentElement;
+            while (parent && nearbyTexts.length < 3) {
+                const siblings = Array.from(parent.children);
+                for (const sibling of siblings) {
+                    if (sibling !== el && (sibling as Element).textContent && (sibling as Element).textContent!.trim().length > 0 && (sibling as Element).textContent!.trim().length < 30) {
+                        nearbyTexts.push((sibling as Element).textContent!.trim());
+                    }
+                }
+                parent = parent.parentElement;
+            }
+            // Use the most relevant nearby text as label
+            if (nearbyTexts.length > 0) {
+                label = nearbyTexts.find(text => text.toLowerCase().includes('date') || text.toLowerCase().includes('start') || text.toLowerCase().includes('end')) || nearbyTexts[0];
+            }
+        }
+
+        // Dynamic role hint assignment for better element classification
+        let roleHint: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other' = 'other';
+        if (tagName === 'input' || tagName === 'textarea') roleHint = 'input';
+        else if (tagName === 'select' || getAttr('role') === 'listbox') roleHint = 'listbox';
+        else if (tagName === 'button' || getAttr('role') === 'button') roleHint = 'button';
+        else if (tagName === 'a') roleHint = 'link';
+        else if (tagName === 'option') roleHint = 'option';
+
         return {
             tagName,
             id: el.id,
@@ -99,6 +171,7 @@ export class SelectorExtractor {
             type: inputType,
             name: getAttr('name'),
             role: getAttr('role'),
+            roleHint,
             checked: (tagName === 'input' && inputType === 'checkbox') ? el.checked : undefined,
             boundingBox: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
             visible: true
@@ -164,10 +237,10 @@ export class SelectorExtractor {
           }
 
           // Use nth-of-type to differentiate "Username input" from "Password input"
-          let sibling = current;
+          let sibling: Element | null = current;
           let nth = 1;
-          while (sibling = sibling.previousElementSibling) {
-              if (sibling.tagName.toLowerCase() === selector) nth++;
+          while (sibling && (sibling = sibling.previousElementSibling)) {
+              if ((sibling as Element).tagName.toLowerCase() === selector) nth++;
           }
           if (nth > 1) selector += `:nth-of-type(${nth})`;
           
