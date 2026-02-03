@@ -18,10 +18,11 @@ import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstructio
 export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
   private agentCommandBuffer: ExecutionCommand[] | null = null;
+  private processedItems: Set<string> = new Set(); // Track processed items for state awareness
 
   // ... [Constructor and other methods remain the same] ...
   constructor(
-    private readonly browser: BrowserManager, 
+    private readonly browser: BrowserManager,
     private readonly gemini?: GenerativeModel,
     private readonly openai?: OpenAI
   ) {}
@@ -97,6 +98,7 @@ export class McpTools {
     // 1. EXTRACT URL & NAVIGATE
     const urlInGoal = this.extractUrlFromPrompt(goal);
     this.sessionHistory = []; // Reset history for clean generation
+    this.processedItems.clear(); // Reset processed items for new session
 
     if (urlInGoal) {
         try {
@@ -392,58 +394,57 @@ export class McpTools {
 
   
 
+                const processedItemsList = Array.from(this.processedItems).join(', ');
+
                 const prompt = `
 
-  
+
 
             SYSTEM: You are an expert RPA Agent. Goal: "${goal}".
 
-  
+
 
             HISTORY: ${history.slice(-5).join('; ')}
 
-  
 
-            
 
-  
+            PROCESSED ITEMS: ${processedItemsList || 'None'}
+
+
 
             UI ELEMENTS:
 
-  
+
 
             ${JSON.stringify(simplified)}
 
-  
 
-        
 
-  
+
 
             INSTRUCTIONS:
 
-  
 
-            1. Analyze the UI to find the next logical step(s).
 
-  
+            1. Analyze the UI to find the next logical step(s). Avoid repeating actions on already processed items.
+
+
 
             2. **For hierarchical navigation paths in the GOAL (indicated by arrows like "A -> B -> C"),
                treat each level as a distinct target. Once you have navigated to an intermediate level,
                focus on reaching the final destination without unnecessarily backtracking to earlier levels.**
 
-  
+
 
             3. **BATCHING**: Return an ARRAY of actions for forms (e.g. Login).
 
-  
 
-            4. **DISTINCTION**: Look at 'label', 'placeholder', and 'type' to distinguish Username vs Password. 
 
-  
+            4. **DISTINCTION**: Look at 'label', 'placeholder', and 'type' to distinguish Username vs Password.
+
+
 
                - Username usually has type='text'
-
   - Password usually has type='password'
 
 
@@ -455,23 +456,29 @@ export class McpTools {
 
 
 
-6. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
+6. **STATE AWARENESS**: Do not click on or interact with items that are listed in PROCESSED ITEMS. If all relevant items on the page have been processed, navigate back or finish the task.
 
 
 
 
 
-7. RETURN JSON ONLY. Format:
+7. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
 
-  
+
+
+
+
+8. RETURN JSON ONLY. Format:
+
+
 
                [
 
-  
+
 
                  { "type": "type", "elementId": "el_1", "text": "myUser", "thought": "Typing user" },
 
-  
+
 
                  { "type": "type", "elementId": "el_2", "text": "myPass", "thought": "Typing pass" },
 
@@ -487,7 +494,7 @@ export class McpTools {
 
 ]
 
-  
+
 
             `;
 
@@ -660,10 +667,16 @@ export class McpTools {
                 };
             }
 
-            this.recordCommand({ 
-                action: 'click', 
+            // Mark item as processed for state awareness
+            const itemIdentifier = action.semanticTarget || targetElement?.text || info?.text || robustSelector;
+            if (itemIdentifier) {
+                this.processedItems.add(itemIdentifier);
+            }
+
+            this.recordCommand({
+                action: 'click',
                 target: robustSelector,
-                selectors: selectorsForSelenium, 
+                selectors: selectorsForSelenium,
                 description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`
             });
 

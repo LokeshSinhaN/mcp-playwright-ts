@@ -94,15 +94,8 @@ async function selectOptionByStrategies(page: Page, optionText: string): Promise
     } catch {} // eslint-disable-line no-empty
   }
 
-  // --- STRATEGY 3: Keyboard (Fallback) ---
-  // If we can't find it visually, assume it's a "Filter" type dropdown.
-  try {
-    await page.keyboard.type(text);
-    await page.waitForTimeout(200); // Short wait for UI filter to update
-    await page.keyboard.press('Enter');
-    return { method: 'keyboard' };
-  } catch {} // eslint-disable-line no-empty
-  return { method: 'keyboard' };
+  // If visual strategies fail, return a failure indication or throw an error
+  throw new Error(`Unable to select option "${text}" using visual strategies`);
 }
 
 export async function selectFromDropdown(
@@ -112,7 +105,17 @@ export async function selectFromDropdown(
 ): Promise<DropdownSelectionResult> {
   const triggerLocator = await resolveTrigger(page, trigger);
 
-  // 1. Check for NATIVE <select> (Instant check)
+  // 1. Try Keyboard (Type + Enter) - Highest Priority
+  // Assume it's a filter dropdown and try typing the option text directly.
+  try {
+    await triggerLocator.click({ timeout: 1000 }); // Ensure focus
+    await page.keyboard.type(optionText);
+    await page.waitForTimeout(200); // Short wait for UI filter to update
+    await page.keyboard.press('Enter');
+    return { method: 'keyboard' };
+  } catch {} // eslint-disable-line no-empty
+
+  // 2. Check for NATIVE <select> (Second Priority)
   // We use evaluate to check tag name to avoid round-trip overhead if not needed.
   const isNative = await triggerLocator.evaluate((el) => el.tagName.toLowerCase() === 'select').catch(() => false);
 
@@ -121,7 +124,7 @@ export async function selectFromDropdown(
     return { method: 'native-select' };
   }
 
-  // 2. Open Dropdown
+  // 3. Open Dropdown and Try Visual Selection (Third Priority)
   // Try to click. If it fails, assume it might be a hover menu or already open.
   try {
     await triggerLocator.click({ timeout: 2000 });
@@ -129,7 +132,7 @@ export async function selectFromDropdown(
     console.log('Could not click trigger, attempting to select directly...');
   }
 
-  // 3. Select Option (Optimized)
+  // Select Option (Optimized)
   // We removed the hard wait here. Playwright locators auto-wait.
   return await selectOptionByStrategies(page, optionText);
 }
