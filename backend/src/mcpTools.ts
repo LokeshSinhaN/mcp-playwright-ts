@@ -262,14 +262,23 @@ export class McpTools {
   // --- UNIVERSAL FIX: SEQUENCE DEDUPLICATOR ---
   private optimizeHistory(commands: ExecutionCommand[]): ExecutionCommand[] {
       const clean: ExecutionCommand[] = [];
+      const seenCommands = new Set<string>();
 
       for (let i = 0; i < commands.length; i++) {
           const curr = commands[i];
-          
+
           // 1. Skip tiny waits
           if (curr.action === 'wait' && (curr.waitTime || 0) < 1) continue;
 
-          // 2. Loop Detection (A -> B -> A -> B)
+          // 2. Enhanced Duplicate Detection - Focus on core action properties
+          // Create a unique key based on action type, target, and value only (ignore description variations)
+          const commandKey = `${curr.action}-${curr.target || ''}-${curr.value || ''}`;
+          if (seenCommands.has(commandKey)) {
+              continue; // Skip if we've seen this core action before
+          }
+          seenCommands.add(commandKey);
+
+          // 3. Loop Detection (A -> B -> A -> B)
           // If the last two commands in 'clean' are identical to the next two (curr, next), skip.
           if (clean.length >= 2 && i + 1 < commands.length) {
               const last1 = clean[clean.length - 1];
@@ -279,19 +288,19 @@ export class McpTools {
               if (this.cmdsMatch(last2, curr) && this.cmdsMatch(last1, next)) {
                   // Detected loop pattern: [Report, Patient] -> [Report, Patient]
                   // Skip 'curr' (Report) and increment i to skip 'next' (Patient)
-                  i++; 
+                  i++;
                   continue;
               }
           }
 
-          // 3. Stutter Detection (Click X -> Click X)
+          // 4. Stutter Detection (Click X -> Click X)
           if (clean.length > 0) {
               const last = clean[clean.length - 1];
               if (this.cmdsMatch(last, curr) && curr.action === 'click') {
-                  continue; 
+                  continue;
               }
           }
-          
+
           clean.push(curr);
       }
       return clean;
