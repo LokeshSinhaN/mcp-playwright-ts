@@ -20,11 +20,12 @@ export class SeleniumGenerator {
     const driverPath = this.opts.chromeDriverPath ?? 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe';
 
     // 1. ROBUST HEADER & SAFE_CLICK
-    // We switched safe_click to use JS immediately if standard click fails, 
+    // We switched safe_click to use JS immediately if standard click fails,
     // and added scrollIntoView to handle headers covering elements.
     const header = [
       'from selenium import webdriver',
       'from selenium.webdriver.common.by import By',
+      'from selenium.webdriver.common.keys import Keys',
       'from selenium.webdriver.support.ui import WebDriverWait',
       'from selenium.webdriver.support import expected_conditions as EC',
       'from selenium.webdriver.chrome.service import Service',
@@ -107,11 +108,13 @@ export class SeleniumGenerator {
       return `(By.CSS_SELECTOR, "${(cmd.target || '').replace(/"/g, '\\"')}")`;
     };
 
-    // 3. GENERATE BODY
+    // 3. GENERATE BODY - Ensure navigation comes first
+    let hasNavigation = false;
+
     for (const cmd of commands) {
-      if (['click', 'type'].includes(cmd.action) && 
+      if (['click', 'type'].includes(cmd.action) &&
           !cmd.selectors?.css && !cmd.selectors?.xpath && !cmd.selectors?.id && !cmd.target) {
-          continue; 
+          continue;
       }
 
       // Skip navigation commands if we already handled the start URL (prevents duplicates)
@@ -127,7 +130,8 @@ export class SeleniumGenerator {
         case 'navigate':
           if (!startingUrl) { // Only add if not already forced at start
               rawBodyLines.push(`        driver.get("${cmd.target}")`);
-              rawBodyLines.push(`        time.sleep(2)`); 
+              rawBodyLines.push(`        time.sleep(2)`);
+              hasNavigation = true;
           }
           break;
 
@@ -144,21 +148,44 @@ export class SeleniumGenerator {
           break;
 
         case 'type':
-            rawBodyLines.push(
-              `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
-              `        safe_clear(elem)`,
-              `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`,
-              '        time.sleep(0.5)'
-            );
+            // Special handling for dropdown selections - generate multiple attempts like working demo.py
+            if (cmd.description && cmd.description.toLowerCase().includes('dropdown')) {
+              // Generate 3 type attempts for dropdown selections (matching working demo.py pattern)
+              for (let i = 0; i < 3; i++) {
+                rawBodyLines.push(
+                  `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
+                  `        safe_clear(elem)`,
+                  `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`,
+                  '        time.sleep(0.5)'
+                );
+              }
+            } else {
+              rawBodyLines.push(
+                `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
+                `        safe_clear(elem)`,
+                `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`,
+                '        time.sleep(0.5)'
+              );
+            }
           break;
-        
+
         case 'wait':
           const t = (cmd.waitTime && !isNaN(cmd.waitTime)) ? cmd.waitTime : 1;
           // Cap max wait to 2s to keep tests fast
-          const safeWait = Math.min(t, 2); 
+          const safeWait = Math.min(t, 2);
           if (safeWait > 0.1) rawBodyLines.push(`        time.sleep(${safeWait})`);
           break;
       }
+    }
+
+    // If no navigation was added and we have a starting URL, add it at the beginning
+    if (!hasNavigation && startingUrl) {
+      const navLines = [
+        `        # Navigate to Initial URL`,
+        `        driver.get("${startingUrl}")`,
+        `        time.sleep(3)`
+      ];
+      rawBodyLines.unshift(...navLines);
     }
 
     const footer = [
