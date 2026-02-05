@@ -105,17 +105,7 @@ export async function selectFromDropdown(
 ): Promise<DropdownSelectionResult> {
   const triggerLocator = await resolveTrigger(page, trigger);
 
-  // 1. Try Keyboard (Type + Enter) - Highest Priority
-  // Assume it's a filter dropdown and try typing the option text directly.
-  try {
-    await triggerLocator.click({ timeout: 1000 }); // Ensure focus
-    await page.keyboard.type(optionText);
-    await page.waitForTimeout(200); // Short wait for UI filter to update
-    await page.keyboard.press('Enter');
-    return { method: 'keyboard' };
-  } catch {} // eslint-disable-line no-empty
-
-  // 2. Check for NATIVE <select> (Second Priority)
+  // 1. Check for NATIVE <select> (Highest Priority for simplicity)
   // We use evaluate to check tag name to avoid round-trip overhead if not needed.
   const isNative = await triggerLocator.evaluate((el) => el.tagName.toLowerCase() === 'select').catch(() => false);
 
@@ -124,16 +114,29 @@ export async function selectFromDropdown(
     return { method: 'native-select' };
   }
 
-  // 3. Open Dropdown and Try Visual Selection (Third Priority)
-  // Try to click. If it fails, assume it might be a hover menu or already open.
+  // 2. For custom dropdowns: Always click to open first, then check if options appear
+  // This ensures we follow the instruction to click the dropdown before selecting
   try {
     await triggerLocator.click({ timeout: 2000 });
-  } catch { // eslint-disable-line no-empty
-    console.log('Could not click trigger, attempting to select directly...');
+    // Wait for dropdown options to become visible (dynamic check)
+    const dropdownOpened = await page.locator('[role="listbox"], [role="menu"], .dropdown-menu, .popover, .MuiPopover-root, .ant-select-dropdown').first().waitFor({ state: 'visible', timeout: 3000 }).catch(() => false);
+    if (!dropdownOpened) {
+      throw new Error('Dropdown did not open after click');
+    }
+  } catch (error) {
+    console.log('Could not open dropdown by clicking trigger:', error instanceof Error ? error.message : String(error));
+    // If click fails, try keyboard method as fallback (for filterable inputs)
+    try {
+      await triggerLocator.click({ timeout: 1000 }); // Ensure focus
+      await page.keyboard.type(optionText);
+      await page.waitForTimeout(200); // Short wait for UI filter to update
+      await page.keyboard.press('Enter');
+      return { method: 'keyboard' };
+    } catch {} // eslint-disable-line no-empty
+    throw new Error('Unable to interact with dropdown');
   }
 
-  // Select Option (Optimized)
-  // We removed the hard wait here. Playwright locators auto-wait.
+  // 3. Select Option from open dropdown
   return await selectOptionByStrategies(page, optionText);
 }
 
