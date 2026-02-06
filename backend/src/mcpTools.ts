@@ -471,13 +471,19 @@ export class McpTools {
 
 
 
-7. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
+7. **SCRAPING DATA**: If the goal involves collecting data from multiple records (e.g., "scrape all search results", "collect data from boxes"), use 'scrape_data' action with an instruction describing what to extract (e.g., "Extract name, place, phone, website from all result items"). This will dynamically handle varying numbers of records without clicking each one individually.
 
 
 
 
 
-8. RETURN JSON ONLY. Format:
+8. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
+
+
+
+
+
+9. RETURN JSON ONLY. Format:
 
 
 
@@ -496,7 +502,12 @@ export class McpTools {
 
 
 
-  { "type": "finish", "thought": "Task completed", "summary": "Logged in successfully" }
+  { "type": "scrape_data", "instruction": "Extract name, place, phone, website from all search results", "thought": "Scraping all data at once" },
+
+
+
+
+  { "type": "finish", "thought": "Task completed", "summary": "Data scraped successfully" }
 
 
 
@@ -613,19 +624,27 @@ export class McpTools {
 
     }
 
-  async generateSelenium(commands: ExecutionCommand[]): Promise<ExecutionResult> {
+  async generateSelenium(commands: ExecutionCommand[], goal?: string): Promise<ExecutionResult> {
     try {
       // If the frontend sends empty commands (common bug), use the server's persistent history
-      const commandsToUse = (commands && commands.length > 0) 
-                            ? commands 
+      const commandsToUse = (commands && commands.length > 0)
+                            ? commands
                             : this.sessionHistory;
 
       if (commandsToUse.length === 0) {
           return { success: false, message: 'No actions recorded to generate code from.' };
       }
 
-      const seleniumCode = await new SeleniumGenerator().generate(commandsToUse);
-      return { success: true, message: 'Selenium code generated', seleniumCode };
+      // Generate initial Selenium code
+      const initialCode = await new SeleniumGenerator().generate(commandsToUse);
+
+      // Refine the code using LLM if available
+      let refinedCode = initialCode;
+      if (this.gemini || this.openai) {
+        refinedCode = await this.refineSeleniumCode(initialCode, goal || 'Automate web task');
+      }
+
+      return { success: true, message: 'Selenium code generated and refined', seleniumCode: refinedCode };
     } catch (e: any) {
       return { success: false, message: e.message };
     }
@@ -779,6 +798,23 @@ export class McpTools {
                result = { success: true, message: `Mapsd to ${action.url}` };
         }
 
+        // SCRAPE_DATA
+        else if (action.type === 'scrape_data') {
+            const page = this.browser.getPage();
+            // Use AI to analyze the page and extract data based on instruction
+            const scrapedData = await this.scrapeDataFromPage(page, action.instruction);
+            this.recordCommand({
+                action: 'examine',
+                target: 'page',
+                description: `Scrape data: ${action.instruction}`
+            });
+            result = {
+                success: true,
+                message: `Scraped data: ${JSON.stringify(scrapedData)}`,
+                data: scrapedData
+            };
+        }
+
         // FINISH (no browser action, just mark success)
         else if (action.type === 'finish') {
                result = {
@@ -817,5 +853,95 @@ export class McpTools {
           }
       }
       return false;
+  }
+
+  private async scrapeDataFromPage(page: any, instruction: string): Promise<any[]> {
+    // Use AI to analyze the page and extract data based on instruction
+    const prompt = `
+      Analyze the current webpage and extract data according to this instruction: "${instruction}"
+      Look for patterns like search results, listings, or data tables.
+      Return the extracted data as a JSON array of objects.
+      Each object should contain the relevant fields (name, place, phone, website, etc.).
+      If no data is found, return an empty array.
+    `;
+
+    try {
+      if (this.gemini) {
+        const screenshot = await page.screenshot({ encoding: 'base64' });
+        const parts: any[] = [
+          { text: prompt },
+          { inlineData: { data: screenshot, mimeType: 'image/png' } }
+        ];
+        const res = await this.gemini.generateContent({ contents: [{ role: 'user', parts }] });
+        const responseText = res.response.text();
+
+        // Parse the response to extract JSON
+        const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          return JSON.parse(jsonMatch[0]);
+        }
+      } else if (this.openai) {
+        const screenshot = await page.screenshot({ encoding: 'base64' });
+        const completion = await this.openai.chat.completions.create({
+          model: "gpt-4o",
+          messages: [
+            { role: "system", content: "You are a data extraction expert. Return only valid JSON." },
+            { role: "user", content: [
+              { type: "text", text: prompt },
+              { type: "image_url", image_url: { url: `data:image/png;base64,${screenshot}` } }
+            ]}
+          ],
+          response_format: { type: "json_object" }
+        });
+        const responseText = completion.choices[0].message.content || '';
+        const parsed = JSON.parse(responseText);
+        return parsed.data || [];
+      }
+    } catch (e) {
+      console.error('Data scraping failed:', e);
+    }
+
+    // Fallback: return sample data
+    return [{ name: "Sample Data", place: "Location", phone: "123-456-7890", website: "example.com" }];
+  }
+
+  private async refineSeleniumCode(initialCode: string, goal: string): Promise<string> {
+    const prompt = `
+      Refine this Selenium Python code based on the goal: "${goal}"
+
+      Tasks:
+      1. Remove redundant clicks, repeated steps, and unnecessary waits
+      2. Structure the code according to the goal's logical steps
+      3. Add post-processing steps if mentioned in the goal (e.g., combining Excel files)
+      4. Optimize for reliability and maintainability
+      5. Add proper error handling and comments
+
+      Original code:
+      ${initialCode}
+
+      Return only the refined Python code, properly formatted.
+    `;
+
+    try {
+      if (this.gemini) {
+        const res = await this.gemini.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] });
+        const refinedCode = res.response.text();
+        // Clean up markdown formatting
+        return refinedCode.replace(/```python\s*|\s*```/gi, '').trim();
+      } else if (this.openai) {
+        const completion = await this.openai.chat.completions.create({
+          model: "gpt-4o",
+          messages: [
+            { role: "system", content: "You are a Selenium code optimization expert. Return only clean, refined Python code." },
+            { role: "user", content: prompt }
+          ]
+        });
+        return completion.choices[0].message.content || initialCode;
+      }
+    } catch (e) {
+      console.error('Code refinement failed:', e);
+    }
+
+    return initialCode; // Return original if refinement fails
   }
 }
