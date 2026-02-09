@@ -42,7 +42,7 @@ export interface ElementInfo {
 }
 
 export interface ExecutionCommand {
-  action: 'navigate' | 'click' | 'type' | 'scroll' | 'wait' | 'examine';
+  action: 'navigate' | 'click' | 'type' | 'scroll' | 'wait' | 'examine' | 'scrape_data';
   target?: string;
   value?: string;
   waitTime?: number;
@@ -95,10 +95,10 @@ export type SingleAgentAction =
   | { type: 'click'; elementId?: string; selector?: string; semanticTarget?: string; thought?: string }
   | { type: 'type'; elementId?: string; selector?: string; semanticTarget?: string; text: string; thought?: string }
   | { type: 'select_option'; elementId?: string; selector?: string; semanticTarget?: string; option: string; thought?: string }
-  | { type: 'scrape_data'; instruction: string; thought?: string }
+  | { type: 'scrape_data'; instruction?: string; thought?: string }
   | { type: 'scroll'; direction: 'up' | 'down'; elementId?: string; thought?: string }
   | { type: 'wait'; durationMs: number; thought?: string }
-  | { type: 'finish'; thought?: string; summary: string };
+  | { type: 'finish'; summary?: string; thought?: string };
 
 // Update AgentStepResult to reflect batch execution
 export interface AgentStepResult {

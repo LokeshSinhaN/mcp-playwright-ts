@@ -19,6 +19,7 @@ export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
   private agentCommandBuffer: ExecutionCommand[] | null = null;
   private processedItems: Set<string> = new Set(); // Track processed items for state awareness
+  private lastOptimizedCommands: ExecutionCommand[] = []; // Store last optimized commands for generation
 
   // ... [Constructor and other methods remain the same] ...
   constructor(
@@ -241,11 +242,13 @@ export class McpTools {
 
     // --- CRITICAL: OPTIMIZE & GENERATE ---
     const optimizedCommands = this.optimizeHistory(this.sessionHistory);
-    
+    this.lastOptimizedCommands = optimizedCommands; // Store for later use
+
     // Pass 'urlInGoal' directly to generator to force it at the top
-    const seleniumCode = await new SeleniumGenerator().generate(
-        optimizedCommands, 
-        urlInGoal || undefined
+    const seleniumCode = await new SeleniumGenerator({}, this.gemini).generate(
+        optimizedCommands,
+        urlInGoal || undefined,
+        goal
     );
 
     return {
@@ -462,7 +465,9 @@ export class McpTools {
 
 
 
-7. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
+7. **SCRAPING**: If the goal involves scraping data (e.g., "scrape", "extract", "collect information"), after performing all navigation and filtering actions, include a 'scrape_data' action to collect the data before finishing.
+
+8. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
 
 
 
@@ -604,18 +609,19 @@ export class McpTools {
 
     }
 
-  async generateSelenium(commands: ExecutionCommand[]): Promise<ExecutionResult> {
+  async generateSelenium(commands: ExecutionCommand[], goal?: string): Promise<ExecutionResult> {
     try {
-      // If the frontend sends empty commands (common bug), use the server's persistent history
-      const commandsToUse = (commands && commands.length > 0) 
-                            ? commands 
-                            : this.sessionHistory;
+      // If the frontend sends empty commands, use the last optimized commands from the agent session, or fall back to session history
+      let commandsToUse = commands && commands.length > 0 ? commands : this.lastOptimizedCommands;
+      if (commandsToUse.length === 0) {
+        commandsToUse = this.sessionHistory; // Fallback to current session history
+      }
 
       if (commandsToUse.length === 0) {
           return { success: false, message: 'No actions recorded to generate code from.' };
       }
 
-      const seleniumCode = await new SeleniumGenerator().generate(commandsToUse);
+      const seleniumCode = await new SeleniumGenerator({}, this.gemini).generate(commandsToUse, undefined, goal || 'Automate the specified tasks');
       return { success: true, message: 'Selenium code generated', seleniumCode };
     } catch (e: any) {
       return { success: false, message: e.message };
@@ -768,6 +774,30 @@ export class McpTools {
         else if (action.type === 'navigate') {
                await this.navigate(action.url);
                result = { success: true, message: `Mapsd to ${action.url}` };
+        }
+
+        // SCRAPE_DATA
+        else if (action.type === 'scrape_data') {
+            const page = this.browser.getPage();
+            const data = await page.evaluate(() => {
+                const items = document.querySelectorAll('.member-item, .directory-item, li, .result, [class*="member"], [class*="directory"]');
+                const results: any[] = [];
+                Array.from(items).forEach(item => {
+                    const name = item.querySelector('.name, h3, .business-name, [class*="name"]')?.textContent?.trim() || '';
+                    const address = item.querySelector('.address, [class*="address"]')?.textContent?.trim() || '';
+                    const city = item.querySelector('.city, [class*="city"]')?.textContent?.trim() || '';
+                    const state = item.querySelector('.state, [class*="state"]')?.textContent?.trim() || '';
+                    const zip = item.querySelector('.zip, [class*="zip"]')?.textContent?.trim() || '';
+                    const website = item.querySelector('a')?.href || '';
+                    results.push({ 'Business Name': name, 'Address': address, 'City': city, 'State': state, 'Zip Code': zip, 'Website': website });
+                });
+                return results;
+            });
+            this.recordCommand({
+                action: 'scrape_data',
+                description: `Scrape data: ${action.instruction || 'Collect business information'}`
+            });
+            result = { success: true, message: 'Data scraped', data };
         }
 
         // FINISH (no browser action, just mark success)
