@@ -3,6 +3,7 @@ import { GenerativeModel } from '@google/generative-ai';
 import OpenAI from 'openai';
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
+import { SeleniumGenerator } from './seleniumGenerator';
 import {
   ExecutionCommand,
   ExecutionResult,
@@ -18,13 +19,16 @@ export class McpTools {
   private sessionHistory: ExecutionCommand[] = [];
   private agentCommandBuffer: ExecutionCommand[] | null = null;
   private processedItems: Set<string> = new Set(); // Track processed items for state awareness
+  private seleniumGenerator: SeleniumGenerator;
 
   // ... [Constructor and other methods remain the same] ...
   constructor(
     private readonly browser: BrowserManager,
     private readonly gemini?: GenerativeModel,
     private readonly openai?: OpenAI
-  ) {}
+  ) {
+    this.seleniumGenerator = new SeleniumGenerator({}, gemini, openai);
+  }
 
   private recordCommand(cmd: ExecutionCommand | ExecutionCommand[]): void {
     const cmds = Array.isArray(cmd) ? cmd : [cmd];
@@ -89,7 +93,7 @@ export class McpTools {
     const maxSteps = config.maxSteps ?? 30;
     const steps: AgentStepResult[] = [];
     const failedElements: Set<string> = new Set();
-    const actionHistory: string[] = []; 
+    const actionHistory: string[] = [];
 
     await this.browser.init();
     const page = this.browser.getPage();
@@ -240,7 +244,7 @@ export class McpTools {
 
     // --- CRITICAL: INTELLIGENT GENERATION ---
     // We pass the raw history to the LLM so it can detect patterns (loops) that a deduplicator might hide.
-    const seleniumCode = await this.generateSmartAutomationCode(goal, this.sessionHistory, config.modelProvider);
+    const seleniumCode = await this.seleniumGenerator.generateSmartAutomationCode(goal, this.sessionHistory, config.modelProvider);
 
     return {
         success: isFinished,
@@ -625,33 +629,44 @@ export class McpTools {
     history: ExecutionCommand[],
     provider: 'gemini' | 'openai' = 'gemini'
   ): Promise<string> {
+    const extractedUrl = this.extractUrlFromPrompt(goal) || 'https://example.com';
     const prompt = `
     ROLE: You are a Senior Python SDET (Software Development Engineer in Test) and Automation Architect.
-    
-    TASK: 
+
+    TASK:
     Generate a robust, production-ready Python Selenium script based on the User's SOP (Goal) and the recorded Execution Trace.
     The script must handle both the web automation parts and any "other actions" (data processing, API calls, file handling) described in the SOP.
+
+    **CRITICAL INSTRUCTION FOR URL:**
+    The base URL from the SOP is: ${extractedUrl}
+    In the generated Python code, you MUST include this exact line at the top:
+    TARGET_URL = "${extractedUrl}"
+    Do NOT use any other URL or placeholder. Use "${extractedUrl}" for all navigation.
 
     INPUTS:
     1. SOP / GOAL: "${goal}"
     2. EXECUTION TRACE: ${JSON.stringify(history.map(h => ({ action: h.action, target: h.target, value: h.value, description: h.description, selectors: h.selectors })))}
 
     GUIDELINES:
-    1. **Pattern Recognition & Loops**: 
-       - Analyze the TRACE. If you see repetitive actions (e.g., clicking row 1, then row 2, then row 3), DO NOT hardcode them. 
+    1. **URL Handling**:
+       - Always use TARGET_URL = "${extractedUrl}" at the top of the script.
+       - For navigation, use driver.get(TARGET_URL) or similar.
+
+    2. **Pattern Recognition & Loops**:
+       - Analyze the TRACE. If you see repetitive actions (e.g., clicking row 1, then row 2, then row 3), DO NOT hardcode them.
        - Write a dynamic loop (e.g., finding all elements by a common class and iterating).
-    
-    2. **Flow Optimization**:
+
+    3. **Flow Optimization**:
        - The Agent might have made mistakes or backtracked. Filter out these redundant steps.
        - Only include actions necessary to achieve the SOP.
 
-    3. **Hybrid Automation (Web + Non-Web)**:
+    4. **Hybrid Automation (Web + Non-Web)**:
        - If the SOP says "Download Excel and filter it" or "Upload to GDrive":
        - Write the Selenium code to do the download.
        - Write the Python code (using pandas, requests, google-auth, etc.) to perform the filtering or uploading.
        - If exact APIs are unknown, write structured placeholder functions with clear TODO comments.
 
-    4. **Code Quality**:
+    5. **Code Quality**:
        - Use 'webdriver_manager' for driver setup.
        - Use 'WebDriverWait' and 'expected_conditions' for stability.
        - Use the specific CSS/XPath selectors found in the TRACE, but generalize them if inside a loop.
