@@ -4,6 +4,7 @@ import OpenAI from 'openai';
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
+import { parseSopText, ParsedSop } from './sopParser';
 import {
   ExecutionCommand,
   ExecutionResult,
@@ -20,6 +21,7 @@ export class McpTools {
   private agentCommandBuffer: ExecutionCommand[] | null = null;
   private processedItems: Set<string> = new Set(); // Track processed items for state awareness
   private seleniumGenerator: SeleniumGenerator;
+  private currentSop: ParsedSop | null = null;
 
   // ... [Constructor and other methods remain the same] ...
   constructor(
@@ -45,7 +47,7 @@ export class McpTools {
   async navigate(url: string): Promise<ExecutionResult> {
       try {
           await this.browser.goto(url);
-          this.recordCommand({ action: 'navigate', target: url });
+          this.recordCommand({ action: 'navigate', target: url, timestampMs: Date.now(), url });
           return { success: true, message: `Mapsd to ${url}` };
       } catch (e: any) { return { success: false, message: e.message }; }
   }
@@ -53,7 +55,26 @@ export class McpTools {
   async clickExact(selector: string, desc?: string): Promise<ExecutionResult> {
       try {
           const info = await this.browser.click(selector);
-          this.recordCommand({ action: 'click', target: selector, description: desc });
+          this.recordCommand({
+            action: 'click',
+            target: selector,
+            description: desc,
+            selectors: {
+              css: info.cssSelector || selector,
+              xpath: info.xpath || '',
+              id: info.id || '',
+              text: info.text || ''
+            },
+            timestampMs: Date.now(),
+            url: this.browser.getPage().url(),
+            elementMeta: {
+              tagName: info.tagName,
+              ariaLabel: info.ariaLabel,
+              placeholder: info.placeholder,
+              roleHint: info.roleHint,
+              boundingBox: info.boundingBox
+            }
+          });
           return { success: true, message: `Clicked ${desc || selector}`, selectors: [info] };
       } catch (e: any) { return { success: false, message: e.message }; }
   }
@@ -61,7 +82,7 @@ export class McpTools {
   async type(selector: string, text: string): Promise<ExecutionResult> {
     try {
       await this.browser.type(selector, text);
-      this.recordCommand({ action: 'type', target: selector, value: text });
+      this.recordCommand({ action: 'type', target: selector, value: text, timestampMs: Date.now(), url: this.browser.getPage().url() });
       return { success: true, message: `Typed "${text}" into ${selector}` };
     } catch (e: any) {
       return { success: false, message: e.message };
@@ -98,8 +119,12 @@ export class McpTools {
     await this.browser.init();
     const page = this.browser.getPage();
 
+    // Parse SOP early so the agent can follow the execution flow strictly.
+    const parsedSop: ParsedSop = parseSopText(goal);
+    this.currentSop = parsedSop;
+
     // 1. EXTRACT URL & NAVIGATE
-    const urlInGoal = this.extractUrlFromPrompt(goal);
+    const urlInGoal = this.extractUrlFromPrompt(goal) || parsedSop.targetUrl;
     this.sessionHistory = []; // Reset history for clean generation
     this.processedItems.clear(); // Reset processed items for new session
 
@@ -140,7 +165,13 @@ export class McpTools {
 
       // Plan Action
       let nextActionsBatch = await this.planNextAgentAction(
-        goal, elements, actionHistory, failedElements, screenshotBase64, config.modelProvider
+        goal,
+        parsedSop,
+        elements,
+        actionHistory,
+        failedElements,
+        screenshotBase64,
+        config.modelProvider
       );
       let actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
 
@@ -325,6 +356,8 @@ export class McpTools {
 
           goal: string,
 
+          sop: ParsedSop,
+
           elements: ElementInfo[],
 
           history: string[],
@@ -395,38 +428,24 @@ export class McpTools {
                 const processedItemsList = Array.from(this.processedItems).join(', ');
 
                 const prompt = `
+            SYSTEM: You are an expert RPA Agent.
+            You MUST follow the SOP steps in order. Do not skip steps. Do not repeat steps that should happen once.
+            Only repeat actions when the SOP implies repetition (e.g., scrape multiple results, download many files).
 
+            GOAL (raw SOP text): "${goal}"
 
+            SOP (structured): ${JSON.stringify(sop.steps)}
 
-            SYSTEM: You are an expert RPA Agent. Goal: "${goal}".
-
-
-
-            HISTORY: ${history.slice(-5).join('; ')}
-
-
+            HISTORY: ${history.slice(-8).join('; ')}
 
             PROCESSED ITEMS: ${processedItemsList || 'None'}
 
-
-
             UI ELEMENTS:
-
-
-
             ${JSON.stringify(simplified)}
 
-
-
-
-
             INSTRUCTIONS:
-
-
-
-            1. Analyze the UI to find the next logical step(s). Avoid repeating actions on already processed items.
-
-
+            1. Analyze the UI to find the next logical step(s) required by the SOP. Avoid repeating actions on already processed items.
+            2. When the SOP requires scraping/extracting data, you MUST return a { "type": "scrape_data", "instruction": "..." } action before finishing.
 
             2. **For hierarchical navigation paths in the GOAL (indicated by arrows like "A -> B -> C"),
                treat each level as a distinct target. Once you have navigated to an intermediate level,
@@ -605,104 +624,32 @@ export class McpTools {
   async generateSelenium(commands: ExecutionCommand[]): Promise<ExecutionResult> {
     try {
       // If the frontend sends empty commands (common bug), use the server's persistent history
-      const commandsToUse = (commands && commands.length > 0) 
-                            ? commands 
-                            : this.sessionHistory;
+      const commandsToUse = (commands && commands.length > 0)
+        ? commands
+        : this.sessionHistory;
 
       if (commandsToUse.length === 0) {
-          return { success: false, message: 'No actions recorded to generate code from.' };
+        return { success: false, message: 'No actions recorded to generate code from.' };
       }
 
-      // Fallback goal if none provided in this context
-      const dummyGoal = "Automate the actions performed in the recorded trace efficiently.";
-      const seleniumCode = await this.generateSmartAutomationCode(dummyGoal, commandsToUse);
-      
+      const dummyGoal = 'Automate the actions performed in the recorded trace efficiently.';
+      const seleniumCode = await this.seleniumGenerator.generateSmartAutomationCode(
+        dummyGoal,
+        commandsToUse,
+        'gemini'
+      );
+
       return { success: true, message: 'Selenium code generated', seleniumCode };
     } catch (e: any) {
       return { success: false, message: e.message };
     }
   }
 
-  // --- NEW: LLM-DRIVEN CODE SYNTHESIS ---
-  private async generateSmartAutomationCode(
-    goal: string,
-    history: ExecutionCommand[],
-    provider: 'gemini' | 'openai' = 'gemini'
-  ): Promise<string> {
-    const extractedUrl = this.extractUrlFromPrompt(goal) || 'https://example.com';
-    const prompt = `
-    ROLE: You are a Senior Python SDET (Software Development Engineer in Test) and Automation Architect.
-
-    TASK:
-    Generate a robust, production-ready Python Selenium script based on the User's SOP (Goal) and the recorded Execution Trace.
-    The script must handle both the web automation parts and any "other actions" (data processing, API calls, file handling) described in the SOP.
-
-    **CRITICAL INSTRUCTION FOR URL:**
-    The base URL from the SOP is: ${extractedUrl}
-    In the generated Python code, you MUST include this exact line at the top:
-    TARGET_URL = "${extractedUrl}"
-    Do NOT use any other URL or placeholder. Use "${extractedUrl}" for all navigation.
-
-    INPUTS:
-    1. SOP / GOAL: "${goal}"
-    2. EXECUTION TRACE: ${JSON.stringify(history.map(h => ({ action: h.action, target: h.target, value: h.value, description: h.description, selectors: h.selectors })))}
-
-    GUIDELINES:
-    1. **URL Handling**:
-       - Always use TARGET_URL = "${extractedUrl}" at the top of the script.
-       - For navigation, use driver.get(TARGET_URL) or similar.
-
-    2. **Pattern Recognition & Loops**:
-       - Analyze the TRACE. If you see repetitive actions (e.g., clicking row 1, then row 2, then row 3), DO NOT hardcode them.
-       - Write a dynamic loop (e.g., finding all elements by a common class and iterating).
-
-    3. **Flow Optimization**:
-       - The Agent might have made mistakes or backtracked. Filter out these redundant steps.
-       - Only include actions necessary to achieve the SOP.
-
-    4. **Hybrid Automation (Web + Non-Web)**:
-       - If the SOP says "Download Excel and filter it" or "Upload to GDrive":
-       - Write the Selenium code to do the download.
-       - Write the Python code (using pandas, requests, google-auth, etc.) to perform the filtering or uploading.
-       - If exact APIs are unknown, write structured placeholder functions with clear TODO comments.
-
-    5. **Code Quality**:
-       - Use 'webdriver_manager' for driver setup.
-       - Use 'WebDriverWait' and 'expected_conditions' for stability.
-       - Use the specific CSS/XPath selectors found in the TRACE, but generalize them if inside a loop.
-       - Include error handling (try/except) where appropriate.
-
-    OUTPUT:
-    - Return ONLY the Python code. Do not use markdown formatting (no \`\`\`).
-    `;
-
-    let code = '';
-
-    if (provider === 'openai' && this.openai) {
-        const completion = await this.openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: [
-                { role: "system", content: "You are a Python Code Generator." },
-                { role: "user", content: prompt }
-            ]
-        });
-        code = completion.choices[0].message.content || '';
-    } else if (this.gemini) {
-        const res = await this.gemini.generateContent({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }]
-        });
-        code = res.response.text();
-    } else {
-        return "# Error: No AI provider configured for code generation.";
-    }
-
-    // Strip markdown if the LLM ignores instructions
-    return code.replace(/```python|```/g, '').trim();
-  }
-
     // --- EXECUTE ACTION WITH ROBUST RECORDING ---
 
       private async executeAgentAction(action: SingleAgentAction, elements: ElementInfo[]): Promise<ExecutionResult> {
+    const page = this.browser.getPage();
+
     // Resolve Element (if referenced by elementId)
     let targetElement: ElementInfo | undefined;
     if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
@@ -755,7 +702,16 @@ export class McpTools {
                 action: 'click',
                 target: robustSelector,
                 selectors: selectorsForSelenium,
-                description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`
+                description: `Click ${action.semanticTarget || targetElement?.text || 'element'}`,
+                timestampMs: Date.now(),
+                url: page.url(),
+                elementMeta: targetElement ? {
+                  tagName: targetElement.tagName,
+                  ariaLabel: targetElement.ariaLabel,
+                  placeholder: targetElement.placeholder,
+                  roleHint: targetElement.roleHint,
+                  boundingBox: targetElement.boundingBox
+                } : undefined
             });
 
             result = {
@@ -777,14 +733,22 @@ export class McpTools {
                 target: robustSelector, 
                 value: action.text,
                 selectors: selectorsForSelenium,
-                description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`
+                description: `Type "${action.text}" into ${action.semanticTarget || 'field'}`,
+                timestampMs: Date.now(),
+                url: page.url(),
+                elementMeta: targetElement ? {
+                  tagName: targetElement.tagName,
+                  ariaLabel: targetElement.ariaLabel,
+                  placeholder: targetElement.placeholder,
+                  roleHint: targetElement.roleHint,
+                  boundingBox: targetElement.boundingBox
+                } : undefined
             });
             result = { success: true, message: `Filled "${action.text}"` };
         }
 
         // NEW: SELECT_OPTION (dropdown intelligence)
         else if (action.type === 'select_option') {
-            const page = this.browser.getPage();
             const optionLabel = action.option;
             const dropdownLabel =
                 action.semanticTarget ||
@@ -825,7 +789,9 @@ export class McpTools {
                 action: 'click',
                 target: targetName,
                 selectors: finalSelectors,
-                description: `Select option "${optionLabel}"${dropdownLabel ? ` from "${dropdownLabel}" dropdown` : ''}`
+                description: `Select option "${optionLabel}"${dropdownLabel ? ` from "${dropdownLabel}" dropdown` : ''}`,
+                timestampMs: Date.now(),
+                url: page.url()
             });
             // --- FIX ENDS HERE ---
 
@@ -835,10 +801,272 @@ export class McpTools {
             };
         }
 
+        // SCRAPE_DATA (records a scrape spec for downstream Selenium codegen)
+        else if (action.type === 'scrape_data') {
+              const instruction = action.instruction;
+              const fieldsFromSop = this.currentSop?.scrapeFields ?? [];
+
+              const scrapeSpec = await page.evaluate(
+                ({ instr, fields }: { instr: string; fields: string[] }) => {
+                  const escapeCss = (s: string): string => {
+                    try { return CSS.escape(String(s)); } catch { return String(s).replace(/[^a-zA-Z0-9_-]/g, '\\$&'); }
+                  };
+
+                  const isVisible = (el: Element): boolean => {
+                    const rect = (el as HTMLElement).getBoundingClientRect?.();
+                    if (!rect) return true;
+                    if (rect.width <= 0 || rect.height <= 0) return false;
+                    const style = window.getComputedStyle(el as any);
+                    if (style && (style.visibility === 'hidden' || style.display === 'none')) return false;
+                    return true;
+                  };
+
+                  const cssPathWithin = (root: Element, el: Element): string | null => {
+                    // If there's an ID anywhere in the chain, prefer it.
+                    if ((el as any).id) return `#${escapeCss((el as any).id)}`;
+
+                    const parts: string[] = [];
+                    let cur: Element | null = el;
+                    let safety = 0;
+
+                    while (cur && cur !== root && safety++ < 12) {
+                      const tag = cur.tagName.toLowerCase();
+                      const id = (cur as any).id as string | undefined;
+                      if (id) {
+                        parts.unshift(`#${escapeCss(id)}`);
+                        break;
+                      }
+
+                      const clsRaw = (cur.getAttribute('class') || '').trim();
+                      const cls = clsRaw.split(/\s+/).filter(Boolean).slice(0, 2);
+                      let seg = tag;
+                      if (cls.length) seg += `.${cls.map(escapeCss).join('.')}`;
+
+                      // Disambiguate among same-tag siblings
+                      const parent = cur.parentElement;
+                      if (parent) {
+                        const same = Array.from(parent.children).filter(c => (c as Element).tagName.toLowerCase() === tag);
+                        if (same.length > 1) {
+                          const idx = same.indexOf(cur) + 1;
+                          seg += `:nth-of-type(${idx})`;
+                        }
+                      }
+
+                      parts.unshift(seg);
+                      cur = cur.parentElement;
+                    }
+
+                    if (!parts.length) return null;
+                    return parts.join(' > ');
+                  };
+
+                  // Prefer the actual directory/root container (prevents scraping header/nav)
+                  const root =
+                    document.querySelector('#pmpro_member_directory') ||
+                    document.querySelector('[id*="pmpro_member_directory" i], [class*="pmpro_member_directory" i]') ||
+                    document.querySelector('[id*="member-directory" i], [class*="member-directory" i], [id*="member_directory" i], [class*="member_directory" i]') ||
+                    document.querySelector('main') ||
+                    document.body;
+
+                  const rootSelector = (root as any).id
+                    ? `#${escapeCss((root as any).id)}`
+                    : cssPathWithin(document.body, root) || null;
+
+                  // 1) Identify item selector (real, present in DOM now)
+                  let itemSelector: string | null = null;
+                  const knownItemSelectors = [
+                    '.pmpro_member_directory-item',
+                    '[class*="pmpro_member_directory-item" i]',
+                    '[class*="member_directory-item" i]',
+                    '[class*="member-directory-item" i]'
+                  ];
+
+                  for (const sel of knownItemSelectors) {
+                    const cnt = root.querySelectorAll(sel).length;
+                    if (cnt >= 3) {
+                      itemSelector = sel;
+                      break;
+                    }
+                  }
+
+                  // 2) Heuristic fallback if we didn't match known patterns
+                  if (!itemSelector) {
+                    const candidates = Array.from(root.querySelectorAll('article, li, div'))
+                      .filter((el) => {
+                        if (!isVisible(el)) return false;
+                        const cls = (el.getAttribute('class') || '').trim();
+                        const txt = (el.textContent || '').trim();
+                        if (!cls) return false;
+                        if (txt.length < 60) return false;
+                        // try to ensure we are in the directory body (avoid header/footer)
+                        const nearNav = el.closest('header, nav, footer');
+                        if (nearNav) return false;
+
+                        // if we have expected fields, require at least one keyword hint
+                        if (Array.isArray(fields) && fields.length) {
+                          const lower = txt.toLowerCase();
+                          const hits = fields
+                            .map(f => String(f).toLowerCase())
+                            .filter(f => f.length >= 3)
+                            .filter(f => lower.includes(f)).length;
+                          if (hits === 0) {
+                            // still allow, but require some address-like shape
+                            if (!/\b\d{5}(?:-\d{4})?\b/.test(txt) && !/\b[A-Z]{2}\b/.test(txt)) return false;
+                          }
+                        }
+
+                        return true;
+                      })
+                      .slice(0, 2500);
+
+                    const groups = new Map<string, Element[]>();
+                    for (const el of candidates) {
+                      const tag = el.tagName.toLowerCase();
+                      const firstClass = (el.className || '').toString().trim().split(/\s+/)[0];
+                      if (!firstClass) continue;
+                      const k = `${tag}|${firstClass}`;
+                      const arr = groups.get(k) || [];
+                      arr.push(el);
+                      groups.set(k, arr);
+                    }
+
+                    let bestKey: string | null = null;
+                    let bestScore = -1;
+                    for (const [k, arr] of groups.entries()) {
+                      const n = arr.length;
+                      if (n < 3 || n > 300) continue;
+                      const avgLen = arr.slice(0, 10).reduce((sum: number, e: Element) => sum + ((e.textContent || '').trim().length), 0) / Math.min(arr.length, 10);
+                      const score = n * Math.min(avgLen, 250);
+                      if (score > bestScore) {
+                        bestScore = score;
+                        bestKey = k;
+                      }
+                    }
+
+                    if (bestKey) {
+                      const [tag, firstClass] = bestKey.split('|');
+                      itemSelector = `${tag}.${escapeCss(firstClass)}`;
+                    }
+                  }
+
+                  const firstItem = itemSelector ? root.querySelector(itemSelector) : null;
+
+                  // 3) Capture pagination controls (real selectors)
+                  const paginationCandidates = [
+                    '[rel="next"]',
+                    'a.next',
+                    'a.page-numbers.next',
+                    '.pagination a.next',
+                    'a:has-text("Next")',
+                  ];
+
+                  const findNextEl = (): Element | null => {
+                    // Prefer rel=next / class=next
+                    const direct = root.querySelector('[rel="next"], a.next, a.page-numbers.next, .pagination a.next');
+                    if (direct && isVisible(direct)) return direct;
+
+                    // Text-based fallback (unicode arrows included)
+                    const links = Array.from(root.querySelectorAll('a, button')).filter(isVisible);
+                    const nextText = ['next', '›', '»', '→'];
+                    for (const el of links) {
+                      const t = (el.textContent || '').trim().toLowerCase();
+                      if (nextText.some(x => t === x || t.includes(x))) return el;
+                      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                      if (aria.includes('next')) return el;
+                    }
+                    return null;
+                  };
+
+                  const findLoadMoreEl = (): Element | null => {
+                    const btns = Array.from(root.querySelectorAll('button, a')).filter(isVisible);
+                    for (const el of btns) {
+                      const t = (el.textContent || '').trim().toLowerCase();
+                      if (t.includes('load more') || t.includes('show more') || t === 'more') return el;
+                      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                      if (aria.includes('load more') || aria.includes('show more')) return el;
+                    }
+                    return null;
+                  };
+
+                  const nextEl = findNextEl();
+                  const loadMoreEl = findLoadMoreEl();
+
+                  const pagination = {
+                    nextSelector: nextEl ? (cssPathWithin(root, nextEl) || cssPathWithin(document.body, nextEl)) : null,
+                    loadMoreSelector: loadMoreEl ? (cssPathWithin(root, loadMoreEl) || cssPathWithin(document.body, loadMoreEl)) : null,
+                  };
+
+                  // 4) Field selectors within item (relative, real-time)
+                  const inferred: Record<string, string | null> = {};
+                  if (firstItem) {
+                    const pick = (sel: string): Element | null => {
+                      const el = firstItem.querySelector(sel);
+                      return el && isVisible(el) ? el : null;
+                    };
+
+                    const nameEl = pick('h1, h2, h3, h4, .name, .title, strong, a');
+                    inferred['businessNameSelector'] = nameEl ? cssPathWithin(firstItem, nameEl) : null;
+
+                    // Try to locate an address-ish block
+                    const addrEl = pick('[class*="address" i], [class*="location" i], [class*="addr" i]') ||
+                      (() => {
+                        const textNodes = Array.from(firstItem.querySelectorAll('div, p, span, li'))
+                          .filter(isVisible)
+                          .filter(el => /\b\d{5}(?:-\d{4})?\b/.test((el.textContent || '').trim()));
+                        return textNodes[0] || null;
+                      })();
+                    inferred['addressBlockSelector'] = addrEl ? cssPathWithin(firstItem, addrEl) : null;
+
+                    // External website link (avoid internal/nav links)
+                    const links = Array.from(firstItem.querySelectorAll('a[href]'))
+                      .filter(isVisible)
+                      .map(a => ({
+                        href: (a as HTMLAnchorElement).href || a.getAttribute('href') || '',
+                        el: a as Element
+                      }))
+                      .filter(x => x.href && !x.href.startsWith('mailto:'))
+                      .filter(x => !/aoaipa\.com\/(cart|my-account|courses|faqs|membership|contact|privacy|term)/i.test(x.href));
+
+                    const external = links.find(x => /^https?:\/\//i.test(x.href) && !/aoaipa\.com/i.test(x.href));
+                    const anyHttp = links.find(x => /^https?:\/\//i.test(x.href));
+                    const websiteEl = (external || anyHttp)?.el || null;
+                    inferred['websiteLinkSelector'] = websiteEl ? cssPathWithin(firstItem, websiteEl) : null;
+                  }
+
+                  const rootText = ((root as any).innerText || root.textContent || '').toString();
+                  const sampleText = firstItem
+                    ? (firstItem.textContent || '').trim().slice(0, 1500)
+                    : rootText.slice(0, 2000);
+
+                  return {
+                    instruction: instr,
+                    fields,
+                    rootSelector,
+                    itemSelector,
+                    pagination,
+                    inferred,
+                    sampleText,
+                    itemCountOnFirstView: itemSelector ? root.querySelectorAll(itemSelector).length : 0,
+                  };
+                },
+                { instr: instruction, fields: fieldsFromSop }
+              );
+
+              this.recordCommand({
+                action: 'scrape_data',
+                description: `Scrape data: ${instruction}`,
+                timestampMs: Date.now(),
+                url: page.url(),
+                data: scrapeSpec
+              });
+
+              result = { success: true, message: 'Captured scrape specification for code generation', data: scrapeSpec };
+        }
+
         // WAIT
         else if (action.type === 'wait') {
                await new Promise(r => setTimeout(r, action.durationMs));
-               this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000 });
+               this.recordCommand({ action: 'wait', waitTime: action.durationMs / 1000, timestampMs: Date.now(), url: page.url() });
                result = { success: true, message: 'Waited' };
         }
 

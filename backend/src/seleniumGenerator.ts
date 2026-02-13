@@ -1,6 +1,7 @@
 import { GenerativeModel } from '@google/generative-ai';
 import OpenAI from 'openai';
 import { ExecutionCommand } from './types';
+import { parseSopText } from './sopParser';
 
 export class SeleniumGenerator {
   constructor(
@@ -25,77 +26,357 @@ export class SeleniumGenerator {
     return null;
   }
 
-  // --- NEW: LLM-DRIVEN CODE SYNTHESIS ---
+  private validatePythonOutput(
+    python: string,
+    allowed: { css: string[]; xpath: string[]; id: string[] },
+    wantsGDriveUpload: boolean
+  ): string[] {
+    const issues: string[] = [];
+
+    const lower = python.toLowerCase();
+    if (!wantsGDriveUpload) {
+      const gdriveMarkers = [
+        'googleapiclient',
+        'google.oauth2',
+        'service_account',
+        'drive',
+        'gdrive',
+        'upload'
+      ];
+
+      // Only flag if it looks like Google Drive API usage (not just the word "drive" in a comment).
+      if (/googleapiclient|google\.oauth2|service_account\.credentials|build\(['\"]drive['\"]\s*,\s*['\"]v3['\"]/i.test(python)) {
+        issues.push('Google Drive upload code detected but SOP does not request upload.');
+      }
+    }
+
+    const allowedCss = new Set((allowed.css || []).map(s => s.trim()).filter(Boolean));
+    const allowedXpath = new Set((allowed.xpath || []).map(s => s.trim()).filter(Boolean));
+
+    const cssRe = /By\.CSS_SELECTOR\s*,\s*(['\"])(.*?)\1/g;
+    const xpRe = /By\.XPATH\s*,\s*(['\"])(.*?)\1/g;
+
+    const disallowedCss = new Set<string>();
+    const disallowedXpath = new Set<string>();
+
+    for (const m of python.matchAll(cssRe)) {
+      const sel = (m[2] || '').trim();
+      if (!sel) continue;
+      if (!allowedCss.has(sel)) disallowedCss.add(sel);
+    }
+
+    for (const m of python.matchAll(xpRe)) {
+      const sel = (m[2] || '').trim();
+      if (!sel) continue;
+      if (!allowedXpath.has(sel)) disallowedXpath.add(sel);
+    }
+
+    const maxList = 15;
+    if (disallowedCss.size > 0) {
+      issues.push(`Disallowed CSS selectors found (must be from allowedSelectors): ${Array.from(disallowedCss).slice(0, maxList).join(', ')}`);
+    }
+    if (disallowedXpath.size > 0) {
+      issues.push(`Disallowed XPath selectors found (must be from allowedSelectors): ${Array.from(disallowedXpath).slice(0, maxList).join(', ')}`);
+    }
+
+    return issues;
+  }
+
+  private collectAllowedSelectors(
+    history: ExecutionCommand[],
+    scrapeSpecs: any[]
+  ): { css: string[]; xpath: string[]; id: string[] } {
+    const css = new Set<string>();
+    const xpath = new Set<string>();
+    const id = new Set<string>();
+
+    const add = (set: Set<string>, v: unknown) => {
+      if (typeof v !== 'string') return;
+      const s = v.trim();
+      if (!s) return;
+      set.add(s);
+    };
+
+    for (const cmd of history) {
+      add(css, cmd.selectors?.css);
+      add(xpath, cmd.selectors?.xpath);
+      add(id, cmd.selectors?.id);
+
+      // Some commands store a CSS selector directly in target.
+      if (cmd.action === 'click' || cmd.action === 'type') {
+        if (typeof cmd.target === 'string' && /^(#|\.|\[|[a-zA-Z])/.test(cmd.target.trim())) {
+          add(css, cmd.target);
+        }
+      }
+    }
+
+    for (const spec of scrapeSpecs || []) {
+      if (!spec || typeof spec !== 'object') continue;
+      add(css, (spec as any).rootSelector);
+      add(css, (spec as any).itemSelector);
+      add(css, (spec as any)?.pagination?.nextSelector);
+      add(css, (spec as any)?.pagination?.loadMoreSelector);
+
+      const inferred = (spec as any).inferred;
+      if (inferred && typeof inferred === 'object') {
+        for (const k of Object.keys(inferred)) {
+          add(css, inferred[k]);
+        }
+      }
+    }
+
+    // Keep these bounded so prompts don't explode.
+    const bounded = (arr: string[], max: number) => arr.slice(0, max);
+
+    return {
+      css: bounded(Array.from(css), 300),
+      xpath: bounded(Array.from(xpath), 150),
+      id: bounded(Array.from(id), 150)
+    };
+  }
+
+  private inferLoopHints(history: ExecutionCommand[]): Array<{
+    action: string;
+    selectorKind: 'css' | 'xpath';
+    baseSelector: string;
+    startIndex: number;
+    endIndex: number;
+    count: number;
+    examples: string[];
+  }> {
+    const hints: Array<{
+      action: string;
+      selectorKind: 'css' | 'xpath';
+      baseSelector: string;
+      startIndex: number;
+      endIndex: number;
+      count: number;
+      examples: string[];
+    }> = [];
+
+    const cssNth = /^(.*?):nth-of-type\((\d+)\)(.*)$/;
+    const xpathIdx = /^(.*)\[(\d+)\]$/;
+
+    type Candidate = {
+      action: string;
+      selectorKind: 'css' | 'xpath';
+      baseSelector: string;
+      index: number;
+      full: string;
+    };
+
+    const candidates: Candidate[] = [];
+    for (const cmd of history) {
+      if (cmd.action !== 'click') continue;
+
+      const css = cmd.selectors?.css || '';
+      const xpath = cmd.selectors?.xpath || '';
+
+      const cm = css.match(cssNth);
+      if (cm) {
+        candidates.push({
+          action: cmd.action,
+          selectorKind: 'css',
+          baseSelector: `${cm[1]}:nth-of-type({i})${cm[3]}`,
+          index: Number(cm[2]),
+          full: css
+        });
+        continue;
+      }
+
+      const xm = xpath.match(xpathIdx);
+      if (xm) {
+        candidates.push({
+          action: cmd.action,
+          selectorKind: 'xpath',
+          baseSelector: `${xm[1]}[{i}]`,
+          index: Number(xm[2]),
+          full: xpath
+        });
+      }
+    }
+
+    // Group consecutive indices by base selector.
+    const byBase = new Map<string, Candidate[]>();
+    for (const c of candidates) {
+      const k = `${c.selectorKind}|${c.baseSelector}`;
+      const arr = byBase.get(k) || [];
+      arr.push(c);
+      byBase.set(k, arr);
+    }
+
+    for (const [k, arr] of byBase.entries()) {
+      arr.sort((a, b) => a.index - b.index);
+
+      let runStart = 0;
+      for (let i = 1; i <= arr.length; i++) {
+        const prev = arr[i - 1];
+        const curr = arr[i];
+        const runBreak = !curr || curr.index !== prev.index + 1;
+        if (runBreak) {
+          const run = arr.slice(runStart, i);
+          if (run.length >= 3) {
+            const [selectorKind, baseSelector] = k.split('|') as ['css' | 'xpath', string];
+            hints.push({
+              action: run[0].action,
+              selectorKind,
+              baseSelector,
+              startIndex: run[0].index,
+              endIndex: run[run.length - 1].index,
+              count: run.length,
+              examples: run.slice(0, 3).map(r => r.full)
+            });
+          }
+          runStart = i;
+        }
+      }
+    }
+
+    return hints.slice(0, 20);
+  }
+
+  // --- LLM-DRIVEN CODE SYNTHESIS (SOP + TRACE + SELECTORS) ---
   async generateSmartAutomationCode(
     goal: string,
     history: ExecutionCommand[],
     provider: 'gemini' | 'openai' = 'gemini'
   ): Promise<string> {
-    const extractedUrl = this.extractUrlFromPrompt(goal) || 'https://example.com';
+    const sop = parseSopText(goal);
+    const extractedUrl = this.extractUrlFromPrompt(goal) || sop.targetUrl || 'https://example.com';
+    const wantsGDriveUpload = !!sop.wantsGDriveUpload;
+
+    // Heuristic loop hints for the LLM (keeps output dynamic, avoids repeated hardcoded blocks)
+    const loopHints = this.inferLoopHints(history);
+
+    const scrapeSpecs = history
+      .filter(h => h.action === 'scrape_data')
+      .map(h => h.data)
+      .filter(Boolean);
+
+    const allowedSelectors = this.collectAllowedSelectors(history, scrapeSpecs);
+
+    const traceWindow = history.length <= 400
+      ? history
+      : [...history.slice(0, 100), ...history.slice(-300)];
+
+    const traceForPrompt = traceWindow.map(h => ({
+      action: h.action,
+      target: h.target,
+      value: h.value,
+      description: h.description,
+      selectors: h.selectors,
+      url: h.url,
+      elementMeta: h.elementMeta,
+      data: h.action === 'scrape_data' ? h.data : undefined
+    }));
+
+    const automationSpec = {
+      preferences: {
+        selectorPriority: 'recorded-only',
+        // User requested: only real-time selectors (no invented fallbacks)
+        allowBetterFallbackSelectors: false,
+        output: {
+          singlePythonFile: true,
+          ...(wantsGDriveUpload ? { googleDriveUpload: { method: 'service_account' } } : {})
+        }
+      },
+      sop: {
+        raw: goal,
+        parsed: sop,
+      },
+      targetUrl: extractedUrl,
+      allowedSelectors,
+      loopHints,
+      scrapeSpecs,
+      executionTrace: traceForPrompt,
+    };
+
     const prompt = `
-    ROLE: You are a Senior Python SDET (Software Development Engineer in Test) and Automation Architect.
+ROLE: You are a Senior Python Automation Architect.
 
-    TASK:
-    Generate a robust, production-ready Python Selenium script based on the User's SOP (Goal) and the recorded Execution Trace.
-    The script must handle both the web automation parts and any "other actions" (data processing, API calls, file handling) described in the SOP.
+TASK:
+Generate ONE single-file, production-ready Python Selenium script that follows the SOP exactly.
+- Do NOT add any extra steps beyond the SOP.
+- Use ONLY the real-time selectors provided in INPUT_SPEC_JSON.allowedSelectors and executionTrace[*].selectors.
+- Do NOT invent or "improve" selectors beyond the allowed list.
+- Enforce execution flow: steps that must happen once (navigate, set filters, click FILTER) must appear once.
+- Detect repetition patterns and emit loops (do NOT duplicate blocks).
+- Implement non-web steps only if explicitly required by the SOP (e.g., Excel output; Google Drive upload only if SOP says upload).
 
-    **CRITICAL INSTRUCTION FOR URL:**
-    The base URL from the SOP is: ${extractedUrl}
-    In the generated Python code, you MUST include this exact line at the top:
-    TARGET_URL = "${extractedUrl}"
-    Do NOT use any other URL or placeholder. Use "${extractedUrl}" for all navigation.
+CRITICAL:
+- The base URL is: ${extractedUrl}
+- You MUST include this exact line near the top of the script:
+  TARGET_URL = "${extractedUrl}"
+- Output MUST be valid Python only. No markdown.
 
-    INPUTS:
-    1. SOP / GOAL: "${goal}"
-    2. EXECUTION TRACE: ${JSON.stringify(history.map(h => ({ action: h.action, target: h.target, value: h.value, description: h.description, selectors: h.selectors })))}
+INPUT_SPEC_JSON:
+${JSON.stringify(automationSpec, null, 2)}
 
-    GUIDELINES:
-    1. **URL Handling**:
-       - Always use TARGET_URL = "${extractedUrl}" at the top of the script.
-       - For navigation, use driver.get(TARGET_URL) or similar.
+REQUIREMENTS:
+1) Selenium setup:
+- Use webdriver_manager (ChromeDriverManager) and ChromeOptions.
+- Use WebDriverWait + expected_conditions; avoid arbitrary sleeps except for tiny UI settling.
 
-    2. **Pattern Recognition & Loops**:
-       - Analyze the TRACE. If you see repetitive actions (e.g., clicking row 1, then row 2, then row 3), DO NOT hardcode them.
-       - Write a dynamic loop (e.g., finding all elements by a common class and iterating).
+2) Locator strategy (must be implemented as code):
+- Create helper functions like find_one(driver, candidates) where candidates is a list of (By, selector).
+- For each action, try recorded CSS, then recorded XPath, then recorded id.
+- IMPORTANT: Do not generate any new selectors. Use only selectors present in allowedSelectors/executionTrace/scrapeSpecs.
 
-    3. **Flow Optimization**:
-       - The Agent might have made mistakes or backtracked. Filter out these redundant steps.
-       - Only include actions necessary to achieve the SOP.
+3) Scraping:
+- If SOP includes a scrape step, you MUST use scrapeSpecs (captured from the real DOM) for scraping.
+- Prefer scrapeSpecs[0].rootSelector to scope scraping to the directory results area (avoid header/nav).
+- Prefer scrapeSpecs[0].itemSelector for finding items and iterate over ALL items.
+- Pagination:
+  - If scrapeSpecs[0].pagination.nextSelector exists, click it in a loop until it is absent/disabled.
+  - Else if scrapeSpecs[0].pagination.loadMoreSelector exists, click it until no new items appear.
+- Extract ONLY the requested fields into a list of dicts.
 
-    4. **Hybrid Automation (Web + Non-Web)**:
-       - If the SOP says "Download Excel and filter it" or "Upload to GDrive":
-       - Write the Selenium code to do the download.
-       - Write the Python code (using pandas, requests, google-auth, etc.) to perform the filtering or uploading.
-       - If exact APIs are unknown, write structured placeholder functions with clear TODO comments.
+4) Excel:
+- Save data to an .xlsx using pandas.
 
-    5. **Code Quality**:
-       - Use 'webdriver_manager' for driver setup.
-       - Use 'WebDriverWait' and 'expected_conditions' for stability.
-       - Use the specific CSS/XPath selectors found in the TRACE, but generalize them if inside a loop.
-       - Include error handling (try/except) where appropriate.
+${wantsGDriveUpload ? `5) Google Drive upload (service account):
+- Implement upload_file_to_gdrive_service_account(file_path, folder_id=None).
+- Use google.oauth2.service_account + googleapiclient.discovery.build('drive','v3').
+- Credential path should be configurable via SERVICE_ACCOUNT_FILE env var.
+` : `5) Google Drive upload:
+- NOT REQUESTED by the SOP. Do NOT include any Google Drive / gdrive code.
+`}
 
-    OUTPUT:
-    - Return ONLY the Python code. Do not use markdown formatting (no \`\`\`).
-    `;
+OUTPUT:
+Return ONLY the Python code.
+`;
 
-    let code = '';
-
-    if (provider === 'openai' && this.openai) {
+    const runOnce = async (p: string): Promise<string> => {
+      if (provider === 'openai' && this.openai) {
         const completion = await this.openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: [
-                { role: "system", content: "You are a Python Code Generator." },
-                { role: "user", content: prompt }
-            ]
+          model: 'gpt-4o',
+          messages: [
+            { role: 'system', content: 'You are a Python Code Generator.' },
+            { role: 'user', content: p }
+          ]
         });
-        code = completion.choices[0].message.content || '';
-    } else if (this.gemini) {
+        return completion.choices[0].message.content || '';
+      }
+
+      if (this.gemini) {
         const res = await this.gemini.generateContent({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }]
+          contents: [{ role: 'user', parts: [{ text: p }] }]
         });
-        code = res.response.text();
-    } else {
-        return "# Error: No AI provider configured for code generation.";
+        return res.response.text();
+      }
+
+      return '# Error: No AI provider configured for code generation.';
+    };
+
+    let code = await runOnce(prompt);
+
+    // Basic validation: do not allow unwanted features (like GDrive) and do not allow selector hallucination.
+    const cleanedOnce = code.replace(/```python|```/g, '').trim();
+    const issues = this.validatePythonOutput(cleanedOnce, allowedSelectors, wantsGDriveUpload);
+
+    if (issues.length > 0) {
+      const repairPrompt = `${prompt}\n\nVALIDATION_ERRORS:\n${issues.map(i => `- ${i}`).join('\n')}\n\nREPAIR_INSTRUCTIONS:\n- Regenerate the FULL python script.\n- Fix ALL validation errors.\n- Do not mention the errors; output only python code.`;
+      code = await runOnce(repairPrompt);
     }
 
     // Strip markdown if the LLM ignores instructions

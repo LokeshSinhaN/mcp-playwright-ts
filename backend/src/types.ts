@@ -42,7 +42,15 @@ export interface ElementInfo {
 }
 
 export interface ExecutionCommand {
-  action: 'navigate' | 'click' | 'type' | 'scroll' | 'wait' | 'examine';
+  action:
+    | 'navigate'
+    | 'click'
+    | 'type'
+    | 'scroll'
+    | 'wait'
+    | 'examine'
+    | 'scrape_data'
+    | 'external_action';
   target?: string;
   value?: string;
   waitTime?: number;
@@ -53,6 +61,21 @@ export interface ExecutionCommand {
     text?: string;
   };
   description?: string;
+
+  // Extra context to improve downstream code generation
+  timestampMs?: number;
+  url?: string;
+  sopStepIndex?: number;
+  elementMeta?: {
+    tagName?: string;
+    ariaLabel?: string;
+    placeholder?: string;
+    roleHint?: 'button' | 'link' | 'input' | 'option' | 'listbox' | 'other';
+    boundingBox?: { x: number; y: number; width: number; height: number };
+  };
+
+  // For scrape/external steps, store structured hints.
+  data?: unknown;
 }
 
 export interface ExecutionResult {
