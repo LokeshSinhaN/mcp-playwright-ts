@@ -75,6 +75,10 @@ function appendLog(p: WsPayload | { type: string; message: string; timestamp?: s
     (p.type === 'action' ? 'action' : undefined) ||
     (p.type === 'thought' ? 'ai-thought' : undefined) ||
     (p.type === 'action_taken' ? 'ai-action' : undefined) ||
+    (p.type === 'progress' ? 'progress' : undefined) ||
+    (p.type === 'warning' ? 'warning' : undefined) ||
+    (p.type === 'action_success' ? 'success' : undefined) ||
+    (p.type === 'action_failed' ? 'error' : undefined) ||
     'system';
 
   entry.className = `chat-entry ${p.type} role-${inferredRole}`;
@@ -108,7 +112,7 @@ function appendLog(p: WsPayload | { type: string; message: string; timestamp?: s
 }
 
 wsClient.on((p) => {
-  if (p.type === 'log' || p.type === 'action' || p.type === 'success' || p.type === 'thought' || p.type === 'action_taken') {
+  if (p.type === 'log' || p.type === 'action' || p.type === 'success' || p.type === 'thought' || p.type === 'action_taken' || p.type === 'progress' || p.type === 'warning' || p.type === 'action_success' || p.type === 'action_failed') {
     setWsStatus('connected', 'Connected');
   } else if (p.type === 'error') {
     setWsStatus('error', 'Error');

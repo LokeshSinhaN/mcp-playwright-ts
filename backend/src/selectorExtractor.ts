@@ -75,14 +75,23 @@ export class SelectorExtractor {
   }
 
   private async extractFromScope(scope: Page | Frame): Promise<ElementInfo[]> {
-    // 1. Expanded Selector list to catch everything
+    // 1. ENHANCED: Expanded Selector list to catch EVERYTHING including dropdown triggers
+    // This is critical for finding dropdowns that might be hidden in custom components
     const handles = await scope.$$(
       [
         'button', 'a', 'input:not([type="hidden"])', 'textarea', 'select',
-        '[role=button]', '[role=link]', '[role="checkbox"]', '[role="switch"]', 
-        '[role="menuitem"]', '[role="option"]',
-        '[onclick]', '[class*="btn" i]', '[class*="button" i]', 
-        '[contenteditable]', '[tabindex]:not([tabindex="-1"])'
+        '[role=button]', '[role=link]', '[role="checkbox"]', '[role="switch"]',
+        '[role="menuitem"]', '[role="option"]', '[role="listbox"]', '[role="menu"]',
+        '[role="combobox"]', '[role="searchbox"]',
+        '[onclick]', '[class*="btn" i]', '[class*="button" i]',
+        '[class*="dropdown" i]', '[class*="menu" i]', '[class*="option" i]',
+        '[class*="select" i]', '[class*="filter" i]', '[class*="sort" i]',
+        '.dropdown-item', '.MuiMenuItem-root', '.ant-select-item-option-content',
+        'li', 'div[onclick]', 'span[onclick]',
+        '[contenteditable]', '[tabindex]:not([tabindex="-1"])',
+        '[data-testid*="dropdown" i]', '[data-testid*="select" i]',
+        '[aria-haspopup="listbox"]', '[aria-haspopup="menu"]',
+        'div[role="button"]', 'span[role="button"]'
       ].join(', ')
     );
 

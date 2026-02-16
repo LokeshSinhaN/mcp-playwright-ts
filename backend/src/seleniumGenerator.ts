@@ -267,7 +267,8 @@ export class SeleniumGenerator {
       selectors: h.selectors,
       url: h.url,
       elementMeta: h.elementMeta,
-      data: h.action === 'scrape_data' ? h.data : undefined
+      // Keep data for ALL actions (e.g., dropdown selection hints) to keep codegen dynamic.
+      data: h.data
     }));
 
     const automationSpec = {
@@ -317,7 +318,12 @@ REQUIREMENTS:
 - Use webdriver_manager (ChromeDriverManager) and ChromeOptions.
 - Use WebDriverWait + expected_conditions; avoid arbitrary sleeps except for tiny UI settling.
 
-2) Locator strategy (must be implemented as code):
+2) Dropdown selection (IMPORTANT):
+- If executionTrace contains a typing step that indicates an Enter press (either data.pressEnter==true or the description contains "press Enter"), treat it as a dropdown selection.
+- Implement as: click/focus the dropdown element -> send_keys(<value>) -> send_keys(Keys.ENTER).
+- Import Keys only when needed.
+
+3) Locator strategy (must be implemented as code):
 - Create helper functions like find_one(driver, candidates) where candidates is a list of (By, selector).
 - For each action, try recorded CSS, then recorded XPath, then recorded id.
 - IMPORTANT: Do not generate any new selectors. Use only selectors present in allowedSelectors/executionTrace/scrapeSpecs.
@@ -387,12 +393,20 @@ Return ONLY the Python code.
     const testName = this.opts.testName ?? 'test_flow';
     const driverPath = this.opts.chromeDriverPath ?? 'C:\\\\hyprtask\\\\lib\\\\Chromium\\\\chromedriver.exe';
 
+    const needsKeys = commands.some(c => {
+      if (c.action !== 'type') return false;
+      const data: any = (c as any).data;
+      if (data && typeof data === 'object' && data.pressEnter === true) return true;
+      return typeof c.value === 'string' && /\n\s*$/.test(c.value);
+    });
+
     // 1. ROBUST HEADER & SAFE_CLICK
     // We switched safe_click to use JS immediately if standard click fails,
     // and added scrollIntoView to handle headers covering elements.
     const header = [
       'from selenium import webdriver',
       'from selenium.webdriver.common.by import By',
+      ...(needsKeys ? ['from selenium.webdriver.common.keys import Keys'] : []),
       'from selenium.webdriver.support.ui import WebDriverWait',
       'from selenium.webdriver.support import expected_conditions as EC',
       'from selenium.webdriver.chrome.service import Service',
@@ -511,14 +525,21 @@ Return ONLY the Python code.
             );
           break;
 
-        case 'type':
+        case 'type': {
+            const rawValue = String(cmd.value ?? '');
+            const data: any = (cmd as any).data;
+            const pressEnter = (data && typeof data === 'object' && data.pressEnter === true) || /\n\s*$/.test(rawValue);
+            const value = pressEnter ? rawValue.replace(/\n\s*$/, '') : rawValue;
+
             rawBodyLines.push(
               `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
               `        safe_clear(elem)`,
-              `        elem.send_keys("${(cmd.value ?? '').replace(/"/g, '\\"')}")`,
+              `        elem.send_keys("${value.replace(/"/g, '\\"')}")`,
+              ...(pressEnter ? ['        elem.send_keys(Keys.ENTER)'] : []),
               '        time.sleep(0.5)'
             );
           break;
+        }
 
         case 'wait':
           const t = (cmd.waitTime && !isNaN(cmd.waitTime)) ? cmd.waitTime : 1;

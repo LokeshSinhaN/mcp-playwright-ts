@@ -95,7 +95,7 @@ export interface ExecutionResult {
 }
 
 export interface WebSocketMessage {
-  type: 'log' | 'error' | 'success' | 'action' | 'selector' | 'selenium' | 'thought' | 'action_taken';
+  type: 'log' | 'error' | 'success' | 'action' | 'selector' | 'selenium' | 'thought' | 'action_taken' | 'progress' | 'warning' | 'action_success' | 'action_failed';
   timestamp: string;
   message: string;
   data?: unknown;

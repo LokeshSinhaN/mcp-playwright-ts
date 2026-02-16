@@ -12,7 +12,8 @@ import {
   SingleAgentAction,
   AgentStepResult,
   AgentSessionResult,
-  AgentConfig
+  AgentConfig,
+  WebSocketMessage
 } from './types';
 import { selectFromDropdown, selectOptionInOpenDropdown, parseDropdownInstruction, DropdownIntent } from './dropdownUtils';
 
@@ -22,6 +23,14 @@ export class McpTools {
   private processedItems: Set<string> = new Set(); // Track processed items for state awareness
   private seleniumGenerator: SeleniumGenerator;
   private currentSop: ParsedSop | null = null;
+  
+  // NEW: Loop detection and progress tracking
+  private actionRetryCount: Map<string, number> = new Map();
+  private lastBroadcastAction: string = '';
+  private consecutiveNoActionCount: number = 0;
+  private currentSopStep: number = 0;
+  private readonly MAX_RETRIES_PER_ACTION = 3;
+  private readonly MAX_CONSECUTIVE_NO_ACTION = 5;
 
   // ... [Constructor and other methods remain the same] ...
   constructor(
@@ -30,6 +39,162 @@ export class McpTools {
     private readonly openai?: OpenAI
   ) {
     this.seleniumGenerator = new SeleniumGenerator({}, gemini, openai);
+  }
+  
+  // NEW: Reset progress tracking for new session
+  private resetProgressTracking(): void {
+    this.actionRetryCount.clear();
+    this.lastBroadcastAction = '';
+    this.consecutiveNoActionCount = 0;
+    this.currentSopStep = 0;
+  }
+  
+  // NEW: Detect and handle action loops
+  private checkForLoop(action: SingleAgentAction, config: AgentConfig): { isLoop: boolean; message: string } {
+    // Get action identifier based on action type (type-safe)
+    let actionId = '';
+    if (action.type === 'click' || action.type === 'type') {
+      actionId = action.elementId || ('semanticTarget' in action ? action.semanticTarget || '' : '');
+    } else if (action.type === 'select_option') {
+      actionId = 'option' in action ? (action.option || '') : '';
+      if (!actionId) actionId = 'semanticTarget' in action ? (action.semanticTarget || '') : '';
+    } else if (action.type === 'navigate') {
+      actionId = action.url || '';
+    } else if (action.type === 'scrape_data') {
+      actionId = action.instruction || '';
+    } else if (action.type === 'scroll') {
+      actionId = action.direction || '';
+    } else if (action.type === 'wait') {
+      actionId = String(action.durationMs);
+    }
+    
+    const actionKey = `${action.type}_${actionId}`;
+    const currentCount = this.actionRetryCount.get(actionKey) || 0;
+    
+    // Track consecutive "no action" states (thinking but not executing)
+    if (action.type === 'wait' || action.thought?.includes('analyzing')) {
+      this.consecutiveNoActionCount++;
+    } else {
+      this.consecutiveNoActionCount = 0;
+    }
+    
+    // Check if we're repeating the same action
+    if (actionKey === this.lastBroadcastAction) {
+      const newCount = currentCount + 1;
+      this.actionRetryCount.set(actionKey, newCount);
+      
+      if (newCount >= this.MAX_RETRIES_PER_ACTION) {
+        return {
+          isLoop: true,
+          message: `⚠️ LOOP DETECTED: Same action "${action.type}" repeated ${newCount} times. `
+        };
+      }
+    } else {
+      this.actionRetryCount.set(actionKey, 1);
+    }
+    
+    this.lastBroadcastAction = actionKey;
+    
+    // Check for consecutive no-action state
+    if (this.consecutiveNoActionCount >= this.MAX_CONSECUTIVE_NO_ACTION) {
+      return {
+        isLoop: true,
+        message: `⚠️ STALLED: No actions executed for ${this.consecutiveNoActionCount} consecutive iterations. `
+      };
+    }
+    
+    return { isLoop: false, message: '' };
+  }
+  
+  // UNIVERSAL: Update and broadcast SOP progress - dynamically from parsed SOP
+  private updateSopProgress(action: SingleAgentAction, broadcast?: (msg: WebSocketMessage) => void): void {
+    if (!this.currentSop?.steps?.length) return;
+    
+    // Universal step detection based on action type and semanticTarget
+    const actionType = action.type;
+    // Handle semanticTarget safely
+    const semanticTarget = 'semanticTarget' in action ? (action.semanticTarget || '') : '';
+    const optionValue = 'option' in action ? (action.option || '') : '';
+    
+    // Map action types to SOP steps dynamically
+    let matchedStepIndex = -1;
+    
+    for (let i = 0; i < this.currentSop.steps.length; i++) {
+      const step = this.currentSop.steps[i];
+      const stepText = step.raw.toLowerCase();
+      const actionText = `${actionType} ${semanticTarget} ${optionValue}`.toLowerCase();
+      
+      // Check if action matches this step
+      if (step.kind === 'navigate' && actionType === 'navigate') {
+        matchedStepIndex = i;
+        break;
+      }
+      if (step.kind === 'click' && actionType === 'click') {
+        if (semanticTarget && stepText.includes(semanticTarget.toLowerCase())) {
+          matchedStepIndex = i;
+          break;
+        }
+      }
+      if (step.kind === 'select' && (actionType === 'select_option' || actionType === 'click')) {
+        if (optionValue && stepText.includes(optionValue.toLowerCase())) {
+          matchedStepIndex = i;
+          break;
+        }
+      }
+      if (step.kind === 'scrape' && actionType === 'scrape_data') {
+        matchedStepIndex = i;
+        break;
+      }
+    }
+    
+    if (matchedStepIndex >= 0 && matchedStepIndex !== this.currentSopStep) {
+      this.currentSopStep = matchedStepIndex;
+      if (broadcast) {
+        const stepInfo = this.currentSop.steps[matchedStepIndex];
+        broadcast({
+          type: 'progress',
+          timestamp: new Date().toISOString(),
+          message: `📍 Step ${matchedStepIndex + 1}/${this.currentSop.steps.length}: ${stepInfo.raw}`
+        });
+      }
+    }
+  }
+  
+  // NEW: Broadcast retry warning
+  private broadcastRetryWarning(action: SingleAgentAction, retryCount: number, config: AgentConfig): void {
+    if (!config.broadcast) return;
+    
+    config.broadcast({
+      type: 'warning',
+      timestamp: new Date().toISOString(),
+      message: `🔄 RETRY ${retryCount}/${this.MAX_RETRIES_PER_ACTION}: Trying alternative approach for "${action.type}" action...`
+    });
+  }
+  
+  // NEW: Broadcast execution status
+  private broadcastExecutionStatus(action: SingleAgentAction, success: boolean, config: AgentConfig): void {
+    if (!config.broadcast) return;
+    
+    const status = success ? '✅' : '❌';
+    const actionDesc = this.getActionDescription(action);
+    config.broadcast({
+      type: success ? 'action_success' : 'action_failed',
+      timestamp: new Date().toISOString(),
+      message: `${status} ${actionDesc}`
+    });
+  }
+  
+  private getActionDescription(action: SingleAgentAction): string {
+    switch (action.type) {
+      case 'click': return `Clicked: ${action.semanticTarget || action.elementId || 'element'}`;
+      case 'type': return `Typed in: ${action.semanticTarget || action.elementId || 'field'}`;
+      case 'select_option': return `Selected: ${action.option} from ${action.semanticTarget || 'dropdown'}`;
+      case 'scrape_data': return `Scraping: ${action.instruction}`;
+      case 'navigate': return `Navigated to: ${action.url}`;
+      case 'wait': return `Waited: ${action.durationMs}ms`;
+      case 'finish': return 'Task completed';
+      default: return `Action: ${action.type}`;
+    }
   }
 
   private recordCommand(cmd: ExecutionCommand | ExecutionCommand[]): void {
@@ -122,6 +287,18 @@ export class McpTools {
     // Parse SOP early so the agent can follow the execution flow strictly.
     const parsedSop: ParsedSop = parseSopText(goal);
     this.currentSop = parsedSop;
+    
+    // Reset progress tracking for new session
+    this.resetProgressTracking();
+    
+    // Broadcast SOP start
+    if (config.broadcast) {
+      config.broadcast({
+        type: 'progress',
+        timestamp: new Date().toISOString(),
+        message: `🚀 Starting SOP execution: ${goal.substring(0, 100)}...`
+      });
+    }
 
     // 1. EXTRACT URL & NAVIGATE
     const urlInGoal = this.extractUrlFromPrompt(goal) || parsedSop.targetUrl;
@@ -213,23 +390,86 @@ export class McpTools {
           message: `AI thought: ${thoughts}`
         });
       }
-
-      // Execute Batch
+      
+      // Execute Batch - SEQUENTIAL with proper waits like a human
+      // CRITICAL: When clicking dropdown triggers, execute ONLY ONE action then re-analyze
       this.agentCommandBuffer = [];
       let batchSuccess = true;
+      let dropdownJustOpened: { name: string; action: SingleAgentAction } | null = null;
       
-      for (const action of actionsToExecute) {
-         if (!batchSuccess) break;
-         if (this.isActionRedundant(action, this.sessionHistory.concat(this.agentCommandBuffer))) continue;
+      for (let actionIdx = 0; actionIdx < actionsToExecute.length; actionIdx++) {
+        const action = actionsToExecute[actionIdx];
+        
+        if (!batchSuccess) break;
+        if (this.isActionRedundant(action, this.sessionHistory.concat(this.agentCommandBuffer))) continue;
 
-         try {
-             const res = await this.executeAgentAction(action, elements);
-             if (!res.success) {
-                 batchSuccess = false;
-                 if (res.failedSelector) failedElements.add(res.failedSelector);
-             }
-         } catch { batchSuccess = false; }
-         await page.waitForTimeout(500);
+        // Update SOP progress + loop detection only for actions we're actually executing
+        this.updateSopProgress(action, config.broadcast);
+        const loopCheck = this.checkForLoop(action, config);
+        if (loopCheck.isLoop && config.broadcast) {
+          config.broadcast({
+            type: 'warning',
+            timestamp: new Date().toISOString(),
+            message: loopCheck.message
+          });
+        }
+
+        try {
+            const res = await this.executeAgentAction(action, elements);
+            
+            // Track if we just opened a dropdown - detect by semanticTarget containing common dropdown words
+            if (action.type === 'click' && action.semanticTarget) {
+              const target = action.semanticTarget.toLowerCase();
+              const isDropdownTrigger = /dropdown|select|filter|sort/i.test(target);
+              
+              if (isDropdownTrigger) {
+                dropdownJustOpened = { name: action.semanticTarget, action };
+                // After clicking dropdown, BREAK - must re-analyze to find options!
+                if (!res.success) {
+                  batchSuccess = false;
+                  if (res.failedSelector) failedElements.add(res.failedSelector);
+                }
+                break;
+              }
+            }
+            
+            if (!res.success) {
+                batchSuccess = false;
+                if (res.failedSelector) failedElements.add(res.failedSelector);
+            }
+        } catch { batchSuccess = false; }
+      }
+      
+      // UNIVERSAL FALLBACK: If we just opened a dropdown, wait for options to appear before continuing
+      if (dropdownJustOpened && batchSuccess) {
+        // Wait specifically for dropdown options to be visible
+        try {
+          await page.waitForFunction(() => {
+            const options = Array.from(document.querySelectorAll('[role="option"], [role="menuitem"], .dropdown-item, .MuiMenuItem-root, .ant-select-item-option-content, li:has(a), a, button, span, div'));
+            for (const option of options) {
+              const style = window.getComputedStyle(option);
+              const htmlElement = option as HTMLElement;
+              if (style.display !== 'none' && style.visibility !== 'hidden' && htmlElement.offsetWidth > 0 && htmlElement.offsetHeight > 0) {
+                const text = (option.textContent || '').trim();
+                if (text.length > 0 && text.length < 100) {
+                  return true;
+                }
+              }
+            }
+            return false;
+          }, { timeout: 3000 });
+        } catch {
+          // Options didn't appear, continue anyway
+        }
+
+        // Just broadcast that dropdown was opened so user knows what's happening
+        if (config.broadcast) {
+          config.broadcast({
+            type: 'action_taken',
+            timestamp: new Date().toISOString(),
+            message: `📂 Opened dropdown: ${dropdownJustOpened.name} - waiting for options to appear...`
+          });
+        }
       }
 
       if (batchSuccess && this.agentCommandBuffer.length > 0) {
@@ -428,9 +668,8 @@ export class McpTools {
                 const processedItemsList = Array.from(this.processedItems).join(', ');
 
                 const prompt = `
-            SYSTEM: You are an expert RPA Agent.
+            SYSTEM: You are an expert RPA Agent that behaves exactly like a human interacting with a browser.
             You MUST follow the SOP steps in order. Do not skip steps. Do not repeat steps that should happen once.
-            Only repeat actions when the SOP implies repetition (e.g., scrape multiple results, download many files).
 
             GOAL (raw SOP text): "${goal}"
 
@@ -443,17 +682,33 @@ export class McpTools {
             UI ELEMENTS:
             ${JSON.stringify(simplified)}
 
+            CRITICAL DROPDOWN INSTRUCTIONS:
+            When a SOP step says "Click the [dropdown name] dropdown and select [option]", you MUST use ONE action:
+            
+            - Use type: "select_option"
+              - semanticTarget: the dropdown name (label)
+              - option: the option text to select
+              - The engine will perform: click dropdown → type the option text (typeahead) → press Enter.
+              - This avoids loops when dropdown values are inside a single container (native <select> / listbox).
+            
+            Example format for dropdown selection:
+            [
+              { "type": "select_option", "semanticTarget": "[dropdown name]", "option": "[option to select]", "thought": "Select dropdown option via type + Enter" }
+            ]
+
+            IMPORTANT: Do NOT batch multiple dropdown operations together. Process ONE dropdown at a time.
+
             INSTRUCTIONS:
             1. Analyze the UI to find the next logical step(s) required by the SOP. Avoid repeating actions on already processed items.
             2. When the SOP requires scraping/extracting data, you MUST return a { "type": "scrape_data", "instruction": "..." } action before finishing.
 
-            2. **For hierarchical navigation paths in the GOAL (indicated by arrows like "A -> B -> C"),
+            3. **For hierarchical navigation paths in the GOAL (indicated by arrows like "A -> B -> C"),
                treat each level as a distinct target. Once you have navigated to an intermediate level,
                focus on reaching the final destination without unnecessarily backtracking to earlier levels.**
 
 
 
-            3. **BATCHING**: Return an ARRAY of actions for forms (e.g. Login).
+            3. **BATCHING**: For dropdowns, NEVER batch - do ONE dropdown at a time.
 
 
 
@@ -761,39 +1016,68 @@ export class McpTools {
                 ? await selectFromDropdown(page, dropdownLabel, optionLabel)
                 : await selectOptionInOpenDropdown(page, optionLabel);
 
-            const optionCss = selection.optionSelector;
-
-            // --- FIX STARTS HERE ---
-            // If we have a specific CSS for the option, use it.
-            // If NOT (e.g. keyboard selection), we MUST force the recorder to look for the OPTION TEXT
-            // otherwise it will just record a click on the "Dropdown Trigger" (selectorsForSelenium).
-            let finalSelectors;
-            
-            if (optionCss && optionCss.trim().length > 0) {
-                 finalSelectors = { css: optionCss, xpath: '', id: '', text: optionLabel };
-            } else {
-                 // Force text-based selection for Selenium fallback
-                 finalSelectors = { 
-                     css: '', 
-                     xpath: `//*[contains(text(), '${optionLabel}')]`, // Explicit text fallback
-                     id: '', 
-                     text: optionLabel 
-                 };
+            // Mark item as processed for state awareness
+            if (dropdownLabel || optionLabel) {
+                this.processedItems.add(`dropdown:${dropdownLabel}|option:${optionLabel}`);
             }
-            
-            // If we didn't get a CSS selector, we must NOT use the 'robustSelector' (which is the dropdown button).
-            // We use 'optionLabel' as the target name so SeleniumGenerator uses its text-matching logic.
-            const targetName = (optionCss && optionCss.length > 0) ? optionCss : optionLabel;
 
-            this.recordCommand({
-                action: 'click',
-                target: targetName,
-                selectors: finalSelectors,
-                description: `Select option "${optionLabel}"${dropdownLabel ? ` from "${dropdownLabel}" dropdown` : ''}`,
-                timestampMs: Date.now(),
-                url: page.url()
-            });
-            // --- FIX ENDS HERE ---
+            // Prefer recording the CONTROL selector (so Selenium can reproduce "click + type + Enter").
+            const controlCss = selection.controlSelector || robustSelector || selectorsForSelenium.css || '';
+            const controlSelectors = {
+                css: controlCss || selectorsForSelenium.css,
+                xpath: selectorsForSelenium.xpath,
+                id: selectorsForSelenium.id,
+                text: dropdownLabel || selectorsForSelenium.text
+            };
+
+            // If the selection happened via keyboard/typeahead (common for native <select>),
+            // record it as: click dropdown -> type option -> press Enter.
+            if (selection.method === 'keyboard') {
+                if (dropdownLabel || controlCss) {
+                    this.recordCommand({
+                        action: 'click',
+                        target: controlCss || dropdownLabel,
+                        selectors: controlSelectors,
+                        description: `Open dropdown ${dropdownLabel ? `"${dropdownLabel}"` : ''}`.trim(),
+                        timestampMs: Date.now(),
+                        url: page.url()
+                    });
+                }
+
+                this.recordCommand({
+                    action: 'type',
+                    target: controlCss || dropdownLabel,
+                    value: optionLabel,
+                    selectors: controlSelectors,
+                    description: `Type "${optionLabel}" and press Enter${dropdownLabel ? ` in "${dropdownLabel}" dropdown` : ''}`,
+                    timestampMs: Date.now(),
+                    url: page.url(),
+                    data: {
+                        kind: 'dropdown_select',
+                        dropdownLabel,
+                        optionLabel,
+                        typedQuery: selection.typedQuery,
+                        pressEnter: true
+                    }
+                });
+            } else {
+                // Fallback: clicked an explicit option element (non-typeahead dropdowns)
+                const optionCss = selection.optionSelector;
+                const finalSelectors = optionCss && optionCss.trim().length > 0
+                    ? { css: optionCss, xpath: '', id: '', text: optionLabel }
+                    : { css: '', xpath: `//*[contains(text(), '${optionLabel}')]`, id: '', text: optionLabel };
+
+                const targetName = (optionCss && optionCss.length > 0) ? optionCss : optionLabel;
+
+                this.recordCommand({
+                    action: 'click',
+                    target: targetName,
+                    selectors: finalSelectors,
+                    description: `Select option "${optionLabel}"${dropdownLabel ? ` from "${dropdownLabel}" dropdown` : ''}`,
+                    timestampMs: Date.now(),
+                    url: page.url()
+                });
+            }
 
             result = {
                 success: true,
@@ -860,33 +1144,52 @@ export class McpTools {
                     return parts.join(' > ');
                   };
 
-                  // Prefer the actual directory/root container (prevents scraping header/nav)
+                  // UNIVERSAL: Find the actual content container (not header/nav/footer)
+                  // Try to find a main content area, or fall back to body
                   const root =
-                    document.querySelector('#pmpro_member_directory') ||
-                    document.querySelector('[id*="pmpro_member_directory" i], [class*="pmpro_member_directory" i]') ||
-                    document.querySelector('[id*="member-directory" i], [class*="member-directory" i], [id*="member_directory" i], [class*="member_directory" i]') ||
                     document.querySelector('main') ||
+                    document.querySelector('[role="main"]') ||
+                    document.querySelector('.content, .main-content, .container, .results, .listing') ||
                     document.body;
 
                   const rootSelector = (root as any).id
                     ? `#${escapeCss((root as any).id)}`
                     : cssPathWithin(document.body, root) || null;
 
-                  // 1) Identify item selector (real, present in DOM now)
+                  // 1) UNIVERSAL: Identify item selector dynamically
+                  // Find elements that appear multiple times (likely list items)
                   let itemSelector: string | null = null;
-                  const knownItemSelectors = [
-                    '.pmpro_member_directory-item',
-                    '[class*="pmpro_member_directory-item" i]',
-                    '[class*="member_directory-item" i]',
-                    '[class*="member-directory-item" i]'
-                  ];
-
-                  for (const sel of knownItemSelectors) {
-                    const cnt = root.querySelectorAll(sel).length;
-                    if (cnt >= 3) {
-                      itemSelector = sel;
-                      break;
+                  
+                  // Get all potential container elements
+                  const containerTags = ['article', 'li', 'div', 'section'];
+                  for (const tag of containerTags) {
+                    const candidates = Array.from(root.querySelectorAll(tag))
+                      .filter(el => isVisible(el))
+                      .filter(el => {
+                        // Must have substantial text content
+                        const txt = (el.textContent || '').trim();
+                        return txt.length > 50;
+                      });
+                    
+                    // Group by class to find common patterns
+                    const classGroups = new Map<string, Element[]>();
+                    for (const el of candidates) {
+                      const cls = (el.getAttribute('class') || '').split(/\s+/).filter(Boolean)[0];
+                      if (!cls) continue;
+                      const arr = classGroups.get(cls) || [];
+                      arr.push(el);
+                      classGroups.set(cls, arr);
                     }
+                    
+                    // Find class with 3+ items (likely our list items)
+                    for (const [cls, els] of classGroups) {
+                      if (els.length >= 3) {
+                        itemSelector = `${tag}.${escapeCss(cls)}`;
+                        break;
+                      }
+                    }
+                    
+                    if (itemSelector) break;
                   }
 
                   // 2) Heuristic fallback if we didn't match known patterns
@@ -996,41 +1299,71 @@ export class McpTools {
                     loadMoreSelector: loadMoreEl ? (cssPathWithin(root, loadMoreEl) || cssPathWithin(document.body, loadMoreEl)) : null,
                   };
 
-                  // 4) Field selectors within item (relative, real-time)
+                  // 4) Field selectors within item - FULLY DYNAMIC based on actual content analysis
+                  // The system analyzes element text content to determine what field it represents
                   const inferred: Record<string, string | null> = {};
-                  if (firstItem) {
-                    const pick = (sel: string): Element | null => {
-                      const el = firstItem.querySelector(sel);
-                      return el && isVisible(el) ? el : null;
-                    };
-
-                    const nameEl = pick('h1, h2, h3, h4, .name, .title, strong, a');
-                    inferred['businessNameSelector'] = nameEl ? cssPathWithin(firstItem, nameEl) : null;
-
-                    // Try to locate an address-ish block
-                    const addrEl = pick('[class*="address" i], [class*="location" i], [class*="addr" i]') ||
-                      (() => {
-                        const textNodes = Array.from(firstItem.querySelectorAll('div, p, span, li'))
-                          .filter(isVisible)
-                          .filter(el => /\b\d{5}(?:-\d{4})?\b/.test((el.textContent || '').trim()));
-                        return textNodes[0] || null;
-                      })();
-                    inferred['addressBlockSelector'] = addrEl ? cssPathWithin(firstItem, addrEl) : null;
-
-                    // External website link (avoid internal/nav links)
-                    const links = Array.from(firstItem.querySelectorAll('a[href]'))
-                      .filter(isVisible)
-                      .map(a => ({
-                        href: (a as HTMLAnchorElement).href || a.getAttribute('href') || '',
-                        el: a as Element
-                      }))
-                      .filter(x => x.href && !x.href.startsWith('mailto:'))
-                      .filter(x => !/aoaipa\.com\/(cart|my-account|courses|faqs|membership|contact|privacy|term)/i.test(x.href));
-
-                    const external = links.find(x => /^https?:\/\//i.test(x.href) && !/aoaipa\.com/i.test(x.href));
-                    const anyHttp = links.find(x => /^https?:\/\//i.test(x.href));
-                    const websiteEl = (external || anyHttp)?.el || null;
-                    inferred['websiteLinkSelector'] = websiteEl ? cssPathWithin(firstItem, websiteEl) : null;
+                  if (firstItem && fields && fields.length > 0) {
+                    // Get all potential text/link elements from the item
+                    const allElements = Array.from(firstItem.querySelectorAll('h1, h2, h3, h4, h5, h6, p, span, li, div, a[href], strong, em'));
+                    
+                    for (const field of fields) {
+                      const fieldLower = String(field).toLowerCase();
+                      let bestSelector: string | null = null;
+                      let bestScore = 0;
+                      
+                      // Analyze each element to see if it matches the field based on content patterns
+                      for (const el of allElements) {
+                        if (!isVisible(el)) continue;
+                        
+                        const text = (el.textContent || '').trim();
+                        if (!text || text.length < 2) continue;
+                        
+                        let score = 0;
+                        
+                        // DYNAMIC: Score element based on content analysis
+                        // Check if text content matches field name or contains field-related keywords
+                        if (fieldLower.includes('name') || fieldLower.includes('business') || fieldLower.includes('company')) {
+                          // Look for heading elements or links with substantial text (likely names)
+                          const isHeading = /^h[1-6]$/i.test(el.tagName);
+                          const isLink = el.tagName.toLowerCase() === 'a';
+                          if (isHeading || isLink) {
+                            score = text.length > 3 ? 10 : 0;
+                          }
+                        }
+                        
+                        if (fieldLower.includes('address') || fieldLower.includes('city') || fieldLower.includes('state') || fieldLower.includes('zip') || fieldLower.includes('location')) {
+                          // Look for patterns: ZIP codes, state abbreviations, address keywords
+                          const hasZip = /\b\d{5}(?:-\d{4})?\b/.test(text);
+                          const hasState = /\b[A-Z]{2}\b/.test(text);
+                          const hasAddressKeyword = /\b(?:address|street|ave|rd|drive|ln|blvd)\b/i.test(text);
+                          if (hasZip || hasState || hasAddressKeyword) {
+                            score = 20;
+                          }
+                        }
+                        
+                        if (fieldLower.includes('website') || fieldLower.includes('url') || fieldLower.includes('link')) {
+                          // Look for anchor tags with href
+                          if (el.tagName.toLowerCase() === 'a') {
+                            const href = (el as HTMLAnchorElement).href || '';
+                            if (href.startsWith('http')) {
+                              score = 15;
+                            }
+                          }
+                        }
+                        
+                        // Select best match
+                        if (score > bestScore) {
+                          bestScore = score;
+                          bestSelector = cssPathWithin(firstItem, el);
+                        }
+                      }
+                      
+                      // Store if we found a match with reasonable confidence
+                      if (bestScore > 0) {
+                        const fieldKey = String(field).replace(/\s+/g, '');
+                        inferred[fieldKey + 'Selector'] = bestSelector;
+                      }
+                    }
                   }
 
                   const rootText = ((root as any).innerText || root.textContent || '').toString();
@@ -1115,4 +1448,5 @@ export class McpTools {
       }
       return false;
   }
+  
 }
