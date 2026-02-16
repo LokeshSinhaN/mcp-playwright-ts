@@ -7,7 +7,22 @@ const chatForm = document.getElementById('chat-form') as HTMLFormElement;
 const promptInput = document.getElementById('prompt-input') as HTMLTextAreaElement;
 const screenshotImg = document.getElementById('browser-screenshot') as HTMLImageElement;
 const placeholder = document.getElementById('browser-placeholder') as HTMLDivElement;
+const placeholderTitle = placeholder.querySelector('.placeholder-title') as HTMLDivElement | null;
+const placeholderText = placeholder.querySelector('.placeholder-text') as HTMLDivElement | null;
 const takeScreenshotBtn = document.getElementById('take-screenshot-btn') as HTMLButtonElement;
+
+function showPlaceholder(title: string, text: string) {
+  if (placeholderTitle) placeholderTitle.textContent = title;
+  if (placeholderText) placeholderText.textContent = text;
+  placeholder.hidden = false;
+  screenshotImg.hidden = true;
+}
+
+function showScreenshot(src: string) {
+  screenshotImg.src = src;
+  screenshotImg.hidden = false;
+  placeholder.hidden = true;
+}
 const generateScriptBtn = document.getElementById('generate-script-btn') as HTMLButtonElement | null;
 const closeSessionBtn = document.getElementById('close-session-btn') as HTMLButtonElement;
 const seleniumCodeContainer = document.getElementById('selenium-code-container') as HTMLDivElement | null;
@@ -112,12 +127,39 @@ wsClient.on((p) => {
     setWsStatus('connected', 'Connected');
   } else if (p.type === 'error') {
     setWsStatus('error', 'Error');
-  } else if (p.type === 'screenshot' && p.data && (p.data as any).screenshot) {
-    screenshotImg.src = (p.data as any).screenshot;
-    screenshotImg.hidden = false;
-    placeholder.hidden = true;
+  } else if (p.type === 'screenshot') {
+    const data: any = (p as any).data ?? {};
+
+    // Only ever show the latest screenshot state; if we're capturing, hide the old image.
+    if (typeof data.screenshot === 'string' && data.screenshot) {
+      showScreenshot(data.screenshot);
+      return;
+    }
+
+    if (data.status === 'loading') {
+      showPlaceholder(
+        'Capturing screenshot…',
+        data.slow
+          ? 'The page is loading slowly, so the screenshot may take a few extra seconds.'
+          : 'Updating browser preview…'
+      );
+      return;
+    }
+
+    if (data.status === 'error') {
+      showPlaceholder(
+        'Screenshot unavailable',
+        typeof data.error === 'string' && data.error.trim()
+          ? data.error
+          : 'Failed to capture the latest screenshot.'
+      );
+      return;
+    }
+
+    showPlaceholder('Browser Preview', 'Updating browser preview…');
     return; // Don't log screenshot messages
   }
+
   appendLog(p);
 });
 
@@ -192,6 +234,9 @@ chatForm.addEventListener('submit', async (e) => {
   const action = isUrl ? 'navigate' : 'ai'; // use AI brain for natural language commands
 
   try {
+    // Immediately switch the preview to "loading" so we never keep showing a stale screenshot.
+    showPlaceholder('Updating preview…', 'Capturing the latest screenshot…');
+
     const res = await api.execute(
       action,
       isUrl
@@ -201,11 +246,11 @@ chatForm.addEventListener('submit', async (e) => {
             agentConfig: { modelProvider: provider },
           }
     );
-    if (res.screenshot) {
-      screenshotImg.src = res.screenshot;
-      screenshotImg.hidden = false;
-      placeholder.hidden = true;
+
+    if (typeof res.screenshot === 'string' && res.screenshot) {
+      showScreenshot(res.screenshot);
     }
+
     // Any navigation or AI action switches the preview back to screenshot mode.
     if (seleniumCodeContainer && seleniumCodeOutput) {
       seleniumCodeContainer.hidden = true;
@@ -213,23 +258,28 @@ chatForm.addEventListener('submit', async (e) => {
     }
   } catch (err: any) {
     appendLog({ type: 'error', message: err.message ?? String(err) });
+    showPlaceholder('Screenshot unavailable', 'Failed to update the browser preview.');
   }
 });
 
 takeScreenshotBtn.addEventListener('click', async () => {
   try {
+    showPlaceholder('Capturing screenshot…', 'Updating browser preview…');
+
     const res = await api.screenshot();
-    if (res.screenshot) {
-      screenshotImg.src = res.screenshot;
-      screenshotImg.hidden = false;
-      placeholder.hidden = true;
+    if (typeof res.screenshot === 'string' && res.screenshot) {
+      showScreenshot(res.screenshot);
+    } else {
+      showPlaceholder('Screenshot unavailable', 'No screenshot was returned (page may still be loading).');
     }
+
     if (seleniumCodeContainer && seleniumCodeOutput) {
       seleniumCodeContainer.hidden = true;
       seleniumCodeOutput.textContent = '';
     }
   } catch (err: any) {
     appendLog({ type: 'error', message: err.message ?? String(err) });
+    showPlaceholder('Screenshot unavailable', 'Failed to capture screenshot.');
   }
 });
 

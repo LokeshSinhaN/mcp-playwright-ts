@@ -3,13 +3,20 @@ import { BrowserConfig, ElementInfo, SessionState, ExecutionResult, StateFingerp
 import { SelectorExtractor } from './selectorExtractor';
 import * as crypto from 'crypto'; // Built-in Node module
 
+type ScreenshotCaptureResult =
+  | { ok: true; screenshot: string; durationMs: number }
+  | { ok: false; screenshot: null; durationMs: number; error: string; timedOut: boolean };
+
 export class BrowserManager {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private screenshotStreamer: NodeJS.Timeout | null = null;
-  // Cache the last good screenshot so transient failures don't break the agent/stream
-  private lastScreenshot: string | null = null;
+  private isCapturingScreenshot = false;
+  private screenshotCaptureSeq = 0;
+  private activeCaptureId = 0;
+  private lastScreenshotDelayNoticeAt = 0;
+  private lastScreenshotErrorNoticeAt = 0;
   private readonly config: BrowserConfig;
   private readonly state: SessionState = {
     isOpen: false,
@@ -27,13 +34,114 @@ export class BrowserManager {
 
   // ... [Existing startScreenshotStream, stopScreenshotStream, getters remain unchanged] ...
 
-  startScreenshotStream(broadcast: (message: string) => void) {
+  startScreenshotStream(send: (message: string) => void) {
     if (this.screenshotStreamer) return;
-    this.screenshotStreamer = setInterval(async () => {
-      try {
-        const screenshot = await this.screenshot();
-        broadcast(JSON.stringify({ type: 'screenshot', data: { screenshot, timestamp: Date.now() } }));
-      } catch (err) { console.warn('Stream tick failed', err); }
+
+    const emit = (payload: { type: string; timestamp: string; message: string; data?: unknown }) => {
+      send(JSON.stringify(payload));
+    };
+
+    this.screenshotStreamer = setInterval(() => {
+      // Avoid overlapping screenshots; if a capture is slow, keep the UI in a loading state.
+      if (this.isCapturingScreenshot) return;
+      if (!this.page || this.page.isClosed()) return;
+
+      const captureId = ++this.screenshotCaptureSeq;
+      this.activeCaptureId = captureId;
+      this.isCapturingScreenshot = true;
+
+      emit({
+        type: 'screenshot',
+        timestamp: new Date().toISOString(),
+        message: 'screenshot',
+        data: { status: 'loading', captureId }
+      });
+
+      let slowNoticeSent = false;
+      const slowTimer = setTimeout(() => {
+        if (!this.isCapturingScreenshot) return;
+        if (this.activeCaptureId !== captureId) return;
+        slowNoticeSent = true;
+
+        const now = Date.now();
+        if (now - this.lastScreenshotDelayNoticeAt > 8000) {
+          this.lastScreenshotDelayNoticeAt = now;
+          emit({
+            type: 'log',
+            timestamp: new Date().toISOString(),
+            message: 'Screenshot is taking longer than usual — the page may still be loading. Waiting for it to finish…',
+            data: { kind: 'screenshot_delay', captureId }
+          });
+        }
+
+        emit({
+          type: 'screenshot',
+          timestamp: new Date().toISOString(),
+          message: 'screenshot',
+          data: { status: 'loading', captureId, slow: true }
+        });
+      }, 1500);
+
+      (async () => {
+        try {
+          const result = await this.captureScreenshot();
+          if (this.activeCaptureId !== captureId) return;
+
+          if (result.ok) {
+            emit({
+              type: 'screenshot',
+              timestamp: new Date().toISOString(),
+              message: 'screenshot',
+              data: {
+                status: 'ok',
+                captureId,
+                screenshot: result.screenshot,
+                durationMs: result.durationMs
+              }
+            });
+            return;
+          }
+
+          emit({
+            type: 'screenshot',
+            timestamp: new Date().toISOString(),
+            message: 'screenshot',
+            data: {
+              status: 'error',
+              captureId,
+              error: result.error,
+              timedOut: result.timedOut,
+              durationMs: result.durationMs
+            }
+          });
+
+          // Make sure the user understands this is usually caused by slow/heavy page rendering.
+          const now = Date.now();
+          if (now - this.lastScreenshotErrorNoticeAt > 8000) {
+            this.lastScreenshotErrorNoticeAt = now;
+            emit({
+              type: 'log',
+              timestamp: new Date().toISOString(),
+              message: result.timedOut
+                ? `Screenshot timed out after ~${Math.round(result.durationMs)}ms (page may be loading slowly).`
+                : `Screenshot failed: ${result.error}`,
+              data: { kind: 'screenshot_error', captureId, timedOut: result.timedOut, slowNoticeSent }
+            });
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          emit({
+            type: 'screenshot',
+            timestamp: new Date().toISOString(),
+            message: 'screenshot',
+            data: { status: 'error', captureId, error: msg, timedOut: false }
+          });
+        } finally {
+          clearTimeout(slowTimer);
+          if (this.activeCaptureId === captureId) this.activeCaptureId = 0;
+          this.isCapturingScreenshot = false;
+        }
+      })().catch(() => {});
     }, 250);
   }
 
@@ -41,6 +149,9 @@ export class BrowserManager {
     if (!this.screenshotStreamer) return;
     clearInterval(this.screenshotStreamer);
     this.screenshotStreamer = null;
+    // If a capture was in-flight, ignore its result.
+    this.activeCaptureId = 0;
+    this.isCapturingScreenshot = false;
   }
 
   private get defaultTimeout(): number { return this.config.timeoutMs; }
@@ -233,36 +344,71 @@ export class BrowserManager {
   // ... [type, scroll, smartWait, screenshot, handleCookieBanner, etc. remain unchanged] ...
   // (Include rest of existing methods from provided browserManager.ts here)
   
-  async screenshot(): Promise<string> {
-      const page = this.getPage();
-      if (page.isClosed()) return this.lastScreenshot ?? '';
+  private async captureScreenshot(): Promise<ScreenshotCaptureResult> {
+    const startedAt = Date.now();
 
-      const screenshotTimeout = Math.min(this.config.timeoutMs, 30000); // safety cap
+    let page: Page;
+    try {
+      page = this.getPage();
+    } catch (err) {
+      return {
+        ok: false,
+        screenshot: null,
+        durationMs: Date.now() - startedAt,
+        error: err instanceof Error ? err.message : String(err),
+        timedOut: false
+      };
+    }
 
-      // Try twice before giving up; never throw so callers/agent keep running
-      let lastError: unknown;
-      for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-              const buf = await page.screenshot({
-                  fullPage: false,
-                  timeout: screenshotTimeout,
-                  animations: 'disabled',
-                  caret: 'hide'
-              });
-              const data = `data:image/png;base64,${buf.toString('base64')}`;
-              this.lastScreenshot = data;
-              return data;
-          } catch (err) {
-              lastError = err;
-              // Small delay before retry; swallow error to avoid aborting the flow
-              try {
-                  await page.waitForTimeout(500);
-              } catch {}
-          }
+    if (page.isClosed()) {
+      return {
+        ok: false,
+        screenshot: null,
+        durationMs: Date.now() - startedAt,
+        error: 'Page is closed',
+        timedOut: false
+      };
+    }
+
+    const screenshotTimeout = Math.min(this.config.timeoutMs, 30000); // safety cap
+
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const buf = await page.screenshot({
+          fullPage: false,
+          timeout: screenshotTimeout,
+          animations: 'disabled',
+          caret: 'hide'
+        });
+        const data = `data:image/png;base64,${buf.toString('base64')}`;
+        return { ok: true, screenshot: data, durationMs: Date.now() - startedAt };
+      } catch (err) {
+        lastError = err;
+        try {
+          await page.waitForTimeout(500);
+        } catch {}
       }
+    }
 
-      console.warn('Screenshot failed, reusing last known image (if any).', lastError);
-      return this.lastScreenshot ?? '';
+    const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+    const timedOut =
+      (lastError as any)?.name === 'TimeoutError' ||
+      /timeout/i.test(errorMessage);
+
+    return {
+      ok: false,
+      screenshot: null,
+      durationMs: Date.now() - startedAt,
+      error: errorMessage,
+      timedOut
+    };
+  }
+
+  // Public helper used by tools/agent code. IMPORTANT: do NOT fall back to a previous screenshot.
+  async screenshot(): Promise<string> {
+    const result = await this.captureScreenshot();
+    return result.ok ? result.screenshot : '';
   }
 
   async goto(url: string) {
