@@ -29,6 +29,7 @@ export class McpTools {
   private lastBroadcastAction: string = '';
   private consecutiveNoActionCount: number = 0;
   private currentSopStep: number = 0;
+  private completedSopSteps: Set<number> = new Set();
   private readonly MAX_RETRIES_PER_ACTION = 3;
   private readonly MAX_CONSECUTIVE_NO_ACTION = 5;
 
@@ -47,6 +48,7 @@ export class McpTools {
     this.lastBroadcastAction = '';
     this.consecutiveNoActionCount = 0;
     this.currentSopStep = 0;
+    this.completedSopSteps.clear();
   }
   
   // NEW: Detect and handle action loops
@@ -106,47 +108,88 @@ export class McpTools {
     return { isLoop: false, message: '' };
   }
   
-  // UNIVERSAL: Update and broadcast SOP progress - dynamically from parsed SOP
-  private updateSopProgress(action: SingleAgentAction, broadcast?: (msg: WebSocketMessage) => void): void {
-    if (!this.currentSop?.steps?.length) return;
-    
-    // Universal step detection based on action type and semanticTarget
+  private matchSopStepIndex(action: SingleAgentAction): number {
+    if (!this.currentSop?.steps?.length) return -1;
+
     const actionType = action.type;
-    // Handle semanticTarget safely
     const semanticTarget = 'semanticTarget' in action ? (action.semanticTarget || '') : '';
     const optionValue = 'option' in action ? (action.option || '') : '';
-    
-    // Map action types to SOP steps dynamically
-    let matchedStepIndex = -1;
-    
+
     for (let i = 0; i < this.currentSop.steps.length; i++) {
       const step = this.currentSop.steps[i];
       const stepText = step.raw.toLowerCase();
-      const actionText = `${actionType} ${semanticTarget} ${optionValue}`.toLowerCase();
-      
-      // Check if action matches this step
-      if (step.kind === 'navigate' && actionType === 'navigate') {
-        matchedStepIndex = i;
-        break;
-      }
+
+      if (step.kind === 'navigate' && actionType === 'navigate') return i;
+      if (step.kind === 'scrape' && actionType === 'scrape_data') return i;
+
       if (step.kind === 'click' && actionType === 'click') {
-        if (semanticTarget && stepText.includes(semanticTarget.toLowerCase())) {
-          matchedStepIndex = i;
-          break;
-        }
+        // If the SOP step has a concrete label, match by semanticTarget containment.
+        // If semanticTarget is empty, we cannot reliably map the click to a step.
+        if (semanticTarget && stepText.includes(semanticTarget.toLowerCase())) return i;
       }
+
       if (step.kind === 'select' && (actionType === 'select_option' || actionType === 'click')) {
-        if (optionValue && stepText.includes(optionValue.toLowerCase())) {
-          matchedStepIndex = i;
-          break;
-        }
-      }
-      if (step.kind === 'scrape' && actionType === 'scrape_data') {
-        matchedStepIndex = i;
-        break;
+        // Selection steps usually mention the option; use that when present.
+        if (optionValue && stepText.includes(optionValue.toLowerCase())) return i;
       }
     }
-    
+
+    return -1;
+  }
+
+  private acceptableSopKindsForAction(action: SingleAgentAction): Set<string> {
+    switch (action.type) {
+      case 'navigate': return new Set(['navigate']);
+      case 'type': return new Set(['type']);
+      case 'select_option': return new Set(['select']);
+      case 'scrape_data': return new Set(['scrape']);
+      case 'click':
+        // In many SOPs, "click" is used both for click steps and for opening/selecting dropdowns.
+        return new Set(['click', 'select']);
+      default:
+        return new Set<string>();
+    }
+  }
+
+  private inferNextIncompleteSopStepIndexForAction(action: SingleAgentAction): number {
+    const direct = this.matchSopStepIndex(action);
+    if (direct >= 0) return direct;
+    if (!this.currentSop?.steps?.length) return -1;
+
+    const acceptableKinds = this.acceptableSopKindsForAction(action);
+
+    for (let i = 0; i < this.currentSop.steps.length; i++) {
+      if (this.completedSopSteps.has(i)) continue;
+      if (acceptableKinds.has(this.currentSop.steps[i].kind)) return i;
+    }
+
+    return -1;
+  }
+
+  private inferLikelySopStepIndexForAction(action: SingleAgentAction): number {
+    const direct = this.matchSopStepIndex(action);
+    if (direct >= 0) return direct;
+    if (!this.currentSop?.steps?.length) return -1;
+
+    const acceptableKinds = this.acceptableSopKindsForAction(action);
+    const n = this.currentSop.steps.length;
+    const start = Math.min(Math.max(this.currentSopStep, 0), Math.max(n - 1, 0));
+
+    for (let i = start; i < n; i++) {
+      if (acceptableKinds.has(this.currentSop.steps[i].kind)) return i;
+    }
+    for (let i = 0; i < start; i++) {
+      if (acceptableKinds.has(this.currentSop.steps[i].kind)) return i;
+    }
+
+    return -1;
+  }
+
+  // UNIVERSAL: Update and broadcast SOP progress - dynamically from parsed SOP
+  private updateSopProgress(action: SingleAgentAction, broadcast?: (msg: WebSocketMessage) => void): void {
+    if (!this.currentSop?.steps?.length) return;
+
+    const matchedStepIndex = this.matchSopStepIndex(action);
     if (matchedStepIndex >= 0 && matchedStepIndex !== this.currentSopStep) {
       this.currentSopStep = matchedStepIndex;
       if (broadcast) {
@@ -451,6 +494,14 @@ export class McpTools {
 
         try {
             const res = await this.executeAgentAction(action, elements);
+
+            // Mark SOP step as completed when the action succeeds.
+            // IMPORTANT: This makes the agent step-driven and prevents it from repeating clicks just because
+            // the UI didn't show expected results (unless SOP explicitly asks for verification).
+            if (res.success) {
+              const idx = this.inferNextIncompleteSopStepIndexForAction(action);
+              if (idx >= 0) this.completedSopSteps.add(idx);
+            }
             
             // Track if we just opened a dropdown - detect by semanticTarget containing common dropdown words
             if (action.type === 'click' && action.semanticTarget) {
@@ -724,6 +775,9 @@ export class McpTools {
 
             PROCESSED ITEMS: ${processedItemsList || 'None'}
 
+            COMPLETED_SOP_STEP_INDICES: ${JSON.stringify(Array.from(this.completedSopSteps).sort((a,b)=>a-b))}
+            CURRENT_SOP_STEP_INDEX: ${this.currentSopStep}
+
             UI ELEMENTS:
             ${JSON.stringify(simplified)}
 
@@ -773,19 +827,21 @@ export class McpTools {
 
 
 
-6. **STATE AWARENESS**: Do not click on or interact with items that are listed in PROCESSED ITEMS. If all relevant items on the page have been processed, navigate back or finish the task.
+7. **STATE AWARENESS**: Do not click on or interact with items that are listed in PROCESSED ITEMS.
+
+8. **STEP-DRIVEN EXECUTION (CRITICAL)**:
+- Focus on completing SOP steps in order.
+- If a click/type/select action was executed successfully ONCE for a SOP step, do NOT repeat it just because the page data/result looks empty or unchanged.
+- Only attempt outcome/verification-based retries if the SOP step explicitly asks to "verify", "confirm", "ensure", "wait until", or similar.
+- Use COMPLETED_SOP_STEP_INDICES to avoid repeating steps.
+
+9. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
 
 
 
 
 
-7. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
-
-
-
-
-
-8. RETURN JSON ONLY. Format:
+10. RETURN JSON ONLY. Format:
 
 
 
@@ -1468,6 +1524,10 @@ export class McpTools {
   }
     
   private isActionRedundant(action: SingleAgentAction, history: ExecutionCommand[]): boolean {
+      // If a SOP step is already completed, do not re-run it (outcome-agnostic execution).
+      const sopIdx = this.inferLikelySopStepIndexForAction(action);
+      if (sopIdx >= 0 && this.completedSopSteps.has(sopIdx)) return true;
+
       if (history.length === 0) return false;
       const lastCmd = history[history.length - 1];
 
