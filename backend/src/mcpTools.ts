@@ -23,6 +23,7 @@ export class McpTools {
   private processedItems: Set<string> = new Set(); // Track processed items for state awareness
   private seleniumGenerator: SeleniumGenerator;
   private currentSop: ParsedSop | null = null;
+  private lastExtractedElements: ElementInfo[] = [];
   
   // NEW: Loop detection and progress tracking
   private actionRetryCount: Map<string, number> = new Map();
@@ -319,7 +320,7 @@ export class McpTools {
   // --- AGENT LOGIC ---
 
   async runAutonomousAgent(goal: string, config: AgentConfig = {}): Promise<AgentSessionResult> {
-    const maxSteps = config.maxSteps ?? 30;
+    const maxSteps = config.maxSteps ?? 20;
     const steps: AgentStepResult[] = [];
     const failedElements: Set<string> = new Set();
     const actionHistory: string[] = [];
@@ -396,6 +397,11 @@ export class McpTools {
     // Pre-parse any dropdown instructions from the goal text so we can fall back to a deterministic action
     const dropdownIntent: DropdownIntent | null = parseDropdownInstruction(goal);
     let dropdownSatisfied = false;
+    const normWs = (s: string) => String(s || '').replace(/\s+/g, ' ').trim();
+
+    // Track "no progress" loops so we can finish gracefully instead of thinking forever.
+    let noProgressIterations = 0;
+    let lastCompletedCount = 0;
 
     let stepNumber = 0;
     let isFinished = false;
@@ -406,8 +412,8 @@ export class McpTools {
 
       const extractor = new SelectorExtractor(page);
       const elements = await extractor.extractAllInteractive();
-      const screenshotObj = await this.browser.screenshot();
-      const screenshotBase64 = screenshotObj.replace('data:image/png;base64,', '');
+      this.lastExtractedElements = elements;
+      const screenshotDataUrl = await this.browser.screenshot();
 
       // Broadcast AI thinking
       if (config.broadcast) {
@@ -425,7 +431,7 @@ export class McpTools {
         elements,
         actionHistory,
         failedElements,
-        screenshotBase64,
+        screenshotDataUrl,
         config.modelProvider
       );
       let actionsToExecute = Array.isArray(nextActionsBatch) ? nextActionsBatch : [nextActionsBatch];
@@ -444,10 +450,20 @@ export class McpTools {
           (a.type === 'type' && a.semanticTarget && /drop\s*down/i.test(a.semanticTarget))
         );
 
-        if (wantsToFinishOnly && !hasExplicitDropdownAction) {
-          const optionLabel = dropdownIntent.optionLabel;
+        // Determine if the dropdown intent has already been satisfied (normalize whitespace to avoid "Member\nDirectory" mismatches).
+        const optNorm = normWs(dropdownIntent.optionLabel).toLowerCase();
+        const alreadySelected = this.sessionHistory.some(cmd => {
+          const d = normWs(cmd.description || '').toLowerCase();
+          const t = normWs(cmd.selectors?.text || '').toLowerCase();
+          const v = normWs(cmd.value || '').toLowerCase();
+          return (d && d.includes(optNorm)) || (t && t.includes(optNorm)) || (v && v.includes(optNorm));
+        });
+        if (alreadySelected) dropdownSatisfied = true;
+
+        if (wantsToFinishOnly && !hasExplicitDropdownAction && !dropdownSatisfied) {
+          const optionLabel = normWs(dropdownIntent.optionLabel);
           const dropdownLabel = dropdownIntent.kind === 'open-and-select'
-            ? dropdownIntent.dropdownLabel
+            ? normWs(dropdownIntent.dropdownLabel)
             : undefined;
 
           actionsToExecute = [{
@@ -563,14 +579,24 @@ export class McpTools {
           actionHistory.push(`[SUCCESS] Executed steps`);
           this.agentCommandBuffer = [];
 
+          // Progress tracking for stall prevention
+          if (this.completedSopSteps.size !== lastCompletedCount) {
+            lastCompletedCount = this.completedSopSteps.size;
+            noProgressIterations = 0;
+          } else {
+            noProgressIterations = 0;
+          }
+
           // If we just recorded a command that selected the desired dropdown option,
           // mark the dropdown intent as satisfied so we do not keep forcing it.
           if (dropdownIntent && !dropdownSatisfied) {
-            const opt = dropdownIntent.optionLabel.toLowerCase();
-            dropdownSatisfied = this.sessionHistory.some(cmd =>
-              (cmd.description && cmd.description.toLowerCase().includes(opt)) ||
-              (cmd.selectors?.text && cmd.selectors.text.toLowerCase().includes(opt))
-            );
+            const opt = normWs(dropdownIntent.optionLabel).toLowerCase();
+            dropdownSatisfied = this.sessionHistory.some(cmd => {
+              const d = normWs(cmd.description || '').toLowerCase();
+              const t = normWs(cmd.selectors?.text || '').toLowerCase();
+              const v = normWs(cmd.value || '').toLowerCase();
+              return (d && d.includes(opt)) || (t && t.includes(opt)) || (v && v.includes(opt));
+            });
           }
 
           // Broadcast actions taken
@@ -596,6 +622,34 @@ export class McpTools {
       }
 
       if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
+
+      // If nothing executed (e.g., all actions were skipped as redundant), increment a stall counter.
+      if (batchSuccess && !isFinished && this.agentCommandBuffer.length === 0) {
+        // Only count as "no progress" if SOP completion didn't change.
+        if (this.completedSopSteps.size === lastCompletedCount) {
+          noProgressIterations++;
+        } else {
+          lastCompletedCount = this.completedSopSteps.size;
+          noProgressIterations = 0;
+        }
+      }
+
+      // Universal escape hatch: if we already captured scrape specs (or SOP has no scrape) and we're stalling, finish.
+      if (!isFinished && noProgressIterations >= 3) {
+        const sopHasScrape = !!this.currentSop?.steps?.some(s => s.kind === 'scrape');
+        const didScrape = this.sessionHistory.some(c => c.action === 'scrape_data');
+        if (!sopHasScrape || didScrape) {
+          isFinished = true;
+          actionHistory.push('[AUTO-FINISH] No progress while SOP appears satisfied.');
+          if (config.broadcast) {
+            config.broadcast({
+              type: 'warning',
+              timestamp: new Date().toISOString(),
+              message: 'Auto-finishing: no further SOP actions detected; avoiding a thinking loop.'
+            });
+          }
+        }
+      }
       
       // Wait for visual content to update after actions (ensures preview shows current state)
       if (batchSuccess && !isFinished) {
@@ -835,7 +889,9 @@ export class McpTools {
 - Only attempt outcome/verification-based retries if the SOP step explicitly asks to "verify", "confirm", "ensure", "wait until", or similar.
 - Use COMPLETED_SOP_STEP_INDICES to avoid repeating steps.
 
-9. **COMPLETION**: When you have completed all steps in the goal, return a 'finish' action with an appropriate summary.
+9. **COMPLETION (IMPORTANT)**:
+- As soon as all SOP steps that require browser interaction have been completed ONCE (based on COMPLETED_SOP_STEP_INDICES and PROCESSED ITEMS), you MUST return a 'finish' action.
+- Do NOT keep re-analyzing the same page after SOP completion.
 
 
 
@@ -881,6 +937,19 @@ export class McpTools {
 
         if (provider === 'openai' && this.openai) {
 
+             const contentParts: any[] = [
+                 { type: "text", text: prompt }
+             ];
+
+             // Screenshot can be either a full data URL (data:image/...) or a raw base64 string.
+             // Only include an image if we actually have one.
+             if (screenshot && typeof screenshot === 'string' && screenshot.trim().length > 0) {
+                 const url = screenshot.startsWith('data:image/')
+                   ? screenshot
+                   : `data:image/png;base64,${screenshot}`;
+                 contentParts.push({ type: "image_url", image_url: { url } });
+             }
+
              const completion = await this.openai.chat.completions.create({
 
                  model: "gpt-4o",
@@ -889,13 +958,7 @@ export class McpTools {
 
                      { role: "system", content: "You are a JSON-only bot." },
 
-                     { role: "user", content: [
-
-                         { type: "text", text: prompt },
-
-                         { type: "image_url", image_url: { url: `data:image/png;base64,${screenshot}` } }
-
-                     ]}
+                     { role: "user", content: contentParts }
 
                  ],
 
@@ -909,7 +972,17 @@ export class McpTools {
 
              const parts: any[] = [{ text: prompt }];
 
-             if (screenshot) parts.push({ inlineData: { data: screenshot, mimeType: 'image/png' } });
+             if (screenshot && typeof screenshot === 'string' && screenshot.trim().length > 0) {
+               // Accept either full data URL or raw base64.
+               let mimeType = 'image/png';
+               let data = screenshot;
+               const m = screenshot.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/);
+               if (m) {
+                 mimeType = m[1];
+                 data = m[2];
+               }
+               parts.push({ inlineData: { data, mimeType } });
+             }
 
              const res = await this.gemini.generateContent({ contents: [{ role: 'user', parts }] });
 
@@ -1523,16 +1596,65 @@ export class McpTools {
     return result;
   }
     
+  private actionSelectorSnapshot(action: SingleAgentAction): { css?: string; xpath?: string; id?: string; raw?: string } {
+      // Prefer explicit selector if the model provides it.
+      if ('selector' in action && action.selector) {
+        return { raw: action.selector, css: action.selector };
+      }
+
+      // Resolve elementId against the last extracted element snapshot.
+      if ('elementId' in action && action.elementId && action.elementId.startsWith('el_')) {
+        const idx = Number(action.elementId.split('_')[1]);
+        const el = this.lastExtractedElements[idx];
+        if (el) {
+          return {
+            raw: el.cssSelector || el.selector || el.id || '',
+            css: el.cssSelector || el.selector,
+            xpath: el.xpath,
+            id: el.id,
+          };
+        }
+      }
+
+      return { raw: undefined };
+  }
+
+  private wasActionAlreadyExecuted(action: SingleAgentAction, history: ExecutionCommand[]): boolean {
+      const snap = this.actionSelectorSnapshot(action);
+      const candidates = [snap.css, snap.xpath, snap.id, snap.raw].filter(Boolean) as string[];
+      if (candidates.length === 0) return false;
+
+      const matches = (cmd: ExecutionCommand): boolean => {
+        const t = cmd.target || '';
+        const css = cmd.selectors?.css || '';
+        const xp = cmd.selectors?.xpath || '';
+        const id = cmd.selectors?.id || '';
+        return candidates.some(c => c === t || c === css || c === xp || c === id);
+      };
+
+      // Consider it "executed" if we previously interacted with the same resolved element.
+      return history.some(cmd => (cmd.action === 'click' || cmd.action === 'type') && matches(cmd));
+  }
+
   private isActionRedundant(action: SingleAgentAction, history: ExecutionCommand[]): boolean {
-      // If a SOP step is already completed, do not re-run it (outcome-agnostic execution).
+      // If a SOP step is already completed, skip ONLY if we've already executed this specific action/element.
+      // This prevents "thinking-only" loops where the LLM proposes a corrective click but the engine keeps skipping it.
       const sopIdx = this.inferLikelySopStepIndexForAction(action);
-      if (sopIdx >= 0 && this.completedSopSteps.has(sopIdx)) return true;
+      if (sopIdx >= 0 && this.completedSopSteps.has(sopIdx)) {
+        if (this.wasActionAlreadyExecuted(action, history)) return true;
+      }
 
       if (history.length === 0) return false;
       const lastCmd = history[history.length - 1];
 
       // Allow typing multiple times (filling form)
       if (action.type === 'type') return false;
+
+      // Scrape specs are captured once; repeating scrape_data causes loops.
+      if (action.type === 'scrape_data') {
+        const already = history.some(c => c.action === 'scrape_data');
+        if (already) return true;
+      }
 
       // Prevent selecting the exact same option twice
       if (action.type === 'select_option') {

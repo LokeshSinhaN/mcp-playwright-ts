@@ -179,53 +179,80 @@ export class BrowserManager {
   }
 
   // --- PRIMARY: Periodic screenshot stream (more reliable than CDP screencast) ---
+  // IMPORTANT: Must never overlap screenshot calls (overlap will stall the event loop and the agent).
   startScreenshotStream(broadcast: (message: string) => void) {
     if (this.screenshotStreamer) {
       // Update broadcast function for existing stream
       this.activeBroadcast = broadcast;
       return;
     }
-    
+
     this.activeBroadcast = broadcast;
     this.frameCount = 0;
-    
+
     console.log('[BrowserManager] Starting periodic screenshot stream');
-    
-    this.screenshotStreamer = setInterval(async () => {
+
+    let backoffMs = 350;
+    let failureCount = 0;
+
+    const tick = async () => {
+      // If stopped in-between ticks
+      if (!this.screenshotStreamer) return;
+
+      const started = Date.now();
       try {
         const screenshot = await this.screenshot();
-        if (!screenshot) return;
-        
-        this.frameCount++;
-        this.lastFrameTime = Date.now();
-        
-        // Mark preview as ready after first successful screenshot
-        if (!this._previewReady) {
-          this.setPreviewReady(true);
-          console.log('[BrowserManager] First screenshot captured, preview ready');
+        if (screenshot) {
+          this.frameCount++;
+          this.lastFrameTime = Date.now();
+
+          // Mark preview as ready after first successful screenshot
+          if (!this._previewReady) {
+            this.setPreviewReady(true);
+            console.log('[BrowserManager] First screenshot captured, preview ready');
+            if (this.activeBroadcast) {
+              this.activeBroadcast(JSON.stringify({
+                type: 'preview_ready',
+                data: { ready: true, timestamp: Date.now() }
+              }));
+            }
+          }
+
           if (this.activeBroadcast) {
-            this.activeBroadcast(JSON.stringify({ 
-              type: 'preview_ready', 
-              data: { ready: true, timestamp: Date.now() } 
+            this.activeBroadcast(JSON.stringify({
+              type: 'screenshot',
+              data: { screenshot, timestamp: Date.now() }
             }));
           }
+
+          // Reset backoff on success
+          failureCount = 0;
+          backoffMs = 350;
         }
-        
-        if (this.activeBroadcast) {
-          this.activeBroadcast(JSON.stringify({ 
-            type: 'screenshot', 
-            data: { screenshot, timestamp: Date.now() } 
-          }));
+      } catch (err) {
+        // Avoid log spam; only report intermittently.
+        failureCount++;
+        if (failureCount <= 3 || failureCount % 10 === 0) {
+          console.warn('[BrowserManager] Screenshot stream tick failed (will backoff):', err);
         }
-      } catch (err) { 
-        console.warn('[BrowserManager] Screenshot stream tick failed:', err); 
+
+        // Exponential backoff, capped.
+        const exp = Math.min(failureCount, 5);
+        backoffMs = Math.min(2500, 350 * Math.pow(2, exp));
+      } finally {
+        const elapsed = Date.now() - started;
+        const delay = Math.max(50, backoffMs - elapsed);
+        this.screenshotStreamer = setTimeout(tick, delay) as any;
       }
-    }, 300); // 300ms interval for balance of performance and responsiveness
+    };
+
+    // Start immediately.
+    this.screenshotStreamer = setTimeout(tick, 0) as any;
   }
 
   stopScreenshotStream() {
     if (!this.screenshotStreamer) return;
-    clearInterval(this.screenshotStreamer);
+    clearTimeout(this.screenshotStreamer as any);
     this.screenshotStreamer = null;
     this.setPreviewReady(false);
     console.log('[BrowserManager] Screenshot stream stopped');
@@ -470,36 +497,55 @@ export class BrowserManager {
   // ... [type, scroll, smartWait, screenshot, handleCookieBanner, etc. remain unchanged] ...
   // (Include rest of existing methods from provided browserManager.ts here)
   
+  private async captureScreenshotViaCDP(): Promise<string | null> {
+    const page = this.getPage();
+    if (page.isClosed()) return null;
+
+    // Prefer the existing CDP session if it exists (e.g., when screencast is active).
+    const session = this.cdpSession || await page.context().newCDPSession(page);
+    try {
+      // CDP capture does not block on font readiness like Playwright's page.screenshot().
+      const res = await session.send('Page.captureScreenshot', { format: 'png' }) as { data?: string };
+      const data = res?.data;
+      if (!data) return null;
+      return `data:image/png;base64,${data}`;
+    } finally {
+      // If we created an ad-hoc session, detach it. Don't detach the shared screencast session.
+      if (!this.cdpSession) {
+        await session.detach().catch(() => {});
+      }
+    }
+  }
+
   async screenshot(): Promise<string> {
       const page = this.getPage();
       if (page.isClosed()) return this.lastScreenshot ?? '';
 
-      const screenshotTimeout = Math.min(this.config.timeoutMs, 30000); // safety cap
+      // Keep this small so the agent loop can't get stuck waiting on screenshots.
+      // If it times out (often due to font readiness on some sites), fall back to CDP.
+      const playwrightTimeout = Math.min(Math.max(this.config.timeoutMs, 1500), 3500);
 
-      // Try twice before giving up; never throw so callers/agent keep running
-      let lastError: unknown;
-      for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-              const buf = await page.screenshot({
-                  fullPage: false,
-                  timeout: screenshotTimeout,
-                  animations: 'disabled',
-                  caret: 'hide'
-              });
-              const data = `data:image/png;base64,${buf.toString('base64')}`;
-              this.lastScreenshot = data;
-              return data;
-          } catch (err) {
-              lastError = err;
-              // Small delay before retry; swallow error to avoid aborting the flow
-              try {
-                  await page.waitForTimeout(500);
-              } catch {}
-          }
+      try {
+        const buf = await page.screenshot({
+          fullPage: false,
+          timeout: playwrightTimeout,
+          animations: 'disabled',
+          caret: 'hide'
+        });
+        const data = `data:image/png;base64,${buf.toString('base64')}`;
+        this.lastScreenshot = data;
+        return data;
+      } catch (err) {
+        // Fallback: CDP screenshot (doesn't wait for fonts). Never throw.
+        const cdpShot = await this.captureScreenshotViaCDP().catch(() => null);
+        if (cdpShot) {
+          this.lastScreenshot = cdpShot;
+          return cdpShot;
+        }
+
+        // Final fallback: reuse last frame; avoid spamming logs (the stream already logs failures w/ backoff).
+        return this.lastScreenshot ?? '';
       }
-
-      console.warn('Screenshot failed, reusing last known image (if any).', lastError);
-      return this.lastScreenshot ?? '';
   }
 
   async goto(url: string) {

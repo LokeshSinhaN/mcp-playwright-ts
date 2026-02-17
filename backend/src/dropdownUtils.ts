@@ -802,20 +802,22 @@ export function parseDropdownInstruction(prompt: string): DropdownIntent | null 
     const lower = raw.toLowerCase();
     if (!/\bselect\b/i.test(lower)) return null;
 
+    const norm = (s: string) => String(s || '').replace(/\s+/g, ' ').trim();
+
     let optionLabel = '';
     const selectIdx = lower.indexOf('select');
     if (selectIdx >= 0) {
         const afterSelect = raw.slice(selectIdx + 'select'.length);
         const quotedNearSelect = afterSelect.match(/["\'“”]([^"\'“”]{2,})["\'“”]/);
         if (quotedNearSelect) {
-            optionLabel = quotedNearSelect[1].trim();
+            optionLabel = norm(quotedNearSelect[1]);
         }
     }
 
     if (!optionLabel) {
          // Simple fallback regex
         const m = lower.match(/select\s+(.+?)\s+(?:from|option)/);
-        if (m && m[1]) optionLabel = m[1].trim();
+        if (m && m[1]) optionLabel = norm(m[1]);
     }
 
     if (!optionLabel) return null;
@@ -826,7 +828,7 @@ export function parseDropdownInstruction(prompt: string): DropdownIntent | null 
     if (parts.length > 1 && parts[0].length > 10) {
          // extract label from "Click X dropdown"
          const words = parts[0].split(' ');
-         dropdownLabel = words.slice(-3).join(' ').replace(/click|on|the|open/gi, '').trim();
+         dropdownLabel = norm(words.slice(-3).join(' ').replace(/click|on|the|open/gi, ''));
     }
 
     if (dropdownLabel) {
