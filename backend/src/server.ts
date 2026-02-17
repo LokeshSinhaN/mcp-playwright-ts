@@ -26,15 +26,16 @@ interface ConversationTurn {
  */
 function extractUrlFromPrompt(prompt: string): string | null {
   const trimmed = prompt.trim();
+  const sanitize = (u: string) => u.replace(/[\]\[\)\}\{\"'”“’.,;:]+$/g, '');
 
   // 1) explicit URL with protocol
   const explicit = trimmed.match(/https?:\/\/\S+/i);
-  if (explicit) return explicit[0];
+  if (explicit) return sanitize(explicit[0]);
 
   // 2) bare domain like "mayoclinic.org" or "example.com/path"
   const domain = trimmed.match(/\b[\w.-]+\.(com|org|net|gov|edu|io|ai|co)(?:\S*)/i);
   if (domain) {
-    const candidate = domain[0];
+    const candidate = sanitize(domain[0]);
     return candidate.startsWith('http') ? candidate : `https://${candidate}`;
   }
 

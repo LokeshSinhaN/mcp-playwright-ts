@@ -26,7 +26,9 @@ export interface ParsedSop {
 
 function extractUrl(text: string): string | undefined {
   const m = text.match(/https?:\/\/[^\s,;"')]+/i);
-  return m?.[0];
+  const raw = m?.[0];
+  if (!raw) return undefined;
+  return raw.replace(/[\]\[\)\}\{\"'”“’.,;:]+$/g, '');
 }
 
 function normalizeLine(line: string): string {

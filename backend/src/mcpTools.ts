@@ -621,10 +621,14 @@ export class McpTools {
   // ... [Keep helper methods like extractUrlFromPrompt, executeAgentAction, planNextAgentAction] ...
   
   private extractUrlFromPrompt(prompt: string): string | null {
+    const sanitize = (u: string) => u.replace(/[\]\[\)\}\{\"'”“’.,;:]+$/g, '');
+
     const match = prompt.match(/https?:\/\/[^\s,;"']+/);
-    if (match) return match[0];
+    if (match) return sanitize(match[0]);
+
     const domainMatch = prompt.match(/\b(?:go to|navigate to|open)\s+([a-zA-Z0-9-]+\.[a-zA-Z]{2,})\b/i);
-    if (domainMatch) return `https://${domainMatch[1]}`;
+    if (domainMatch) return `https://${sanitize(domainMatch[1])}`;
+
     return null;
   }
 

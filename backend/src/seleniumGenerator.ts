@@ -19,34 +19,59 @@ export class SeleniumGenerator {
   }
 
   private extractUrlFromPrompt(prompt: string): string | null {
+    const sanitize = (u: string) => u.replace(/[\]\[\)\}\{\"'”“’.,;:]+$/g, '');
+
     const match = prompt.match(/https?:\/\/[^\s,;"']+/);
-    if (match) return match[0];
+    if (match) return sanitize(match[0]);
+
     const domainMatch = prompt.match(/\b(?:go to|navigate to|open)\s+([a-zA-Z0-9-]+\.[a-zA-Z]{2,})\b/i);
-    if (domainMatch) return `https://${domainMatch[1]}`;
+    if (domainMatch) return `https://${sanitize(domainMatch[1])}`;
+
     return null;
   }
 
   private validatePythonOutput(
     python: string,
     allowed: { css: string[]; xpath: string[]; id: string[] },
-    wantsGDriveUpload: boolean
+    wantsGDriveUpload: boolean,
+    expectedTargetUrl?: string
   ): string[] {
     const issues: string[] = [];
 
-    const lower = python.toLowerCase();
     if (!wantsGDriveUpload) {
-      const gdriveMarkers = [
-        'googleapiclient',
-        'google.oauth2',
-        'service_account',
-        'drive',
-        'gdrive',
-        'upload'
-      ];
-
       // Only flag if it looks like Google Drive API usage (not just the word "drive" in a comment).
       if (/googleapiclient|google\.oauth2|service_account\.credentials|build\(['\"]drive['\"]\s*,\s*['\"]v3['\"]/i.test(python)) {
         issues.push('Google Drive upload code detected but SOP does not request upload.');
+      }
+    }
+
+    // Enforce URL correctness so the generated script always starts at the SOP URL.
+    if (expectedTargetUrl) {
+      const targetUrlLine = python.match(/^\s*TARGET_URL\s*=\s*['\"]([^'\"]+)['\"]\s*$/m);
+      if (!targetUrlLine) {
+        issues.push('Missing required TARGET_URL assignment.');
+      } else if (targetUrlLine[1] !== expectedTargetUrl) {
+        issues.push(`TARGET_URL mismatch: expected "${expectedTargetUrl}" but got "${targetUrlLine[1]}".`);
+      }
+
+      // If we know the target URL is not example.com, block accidental example.com leftovers.
+      if (expectedTargetUrl !== 'https://example.com' && /https:\/\/example\.com/i.test(python)) {
+        issues.push('Script still contains https://example.com but SOP specifies a different site.');
+      }
+
+      // Encourage using the constant for the first navigation.
+      if (!/driver\.get\(\s*TARGET_URL\s*\)/.test(python)) {
+        // Not a hard error, but it correlates strongly with wrong-base-url failures.
+        issues.push('Script does not use driver.get(TARGET_URL) for initial navigation.');
+      }
+    }
+
+    // Ensure find_one is not "clickable-only" (clickable can fail for hover menus / overlays / hidden-but-clickable elements).
+    if (/def\s+find_one\s*\(/.test(python)) {
+      const hasClickable = /element_to_be_clickable/.test(python);
+      const hasPresence = /presence_of_element_located/.test(python);
+      if (hasClickable && !hasPresence) {
+        issues.push('find_one() uses element_to_be_clickable only; it must fall back to presence_of_element_located for menu/dropdown elements.');
       }
     }
 
@@ -125,11 +150,19 @@ export class SeleniumGenerator {
       }
     }
 
+    // Add derived-but-still-real selectors to improve robustness without hallucinating.
+    // Example: if a recorded selector is "#menu-item-19279 > a.some-class", also allow "#menu-item-19279".
+    for (const sel of Array.from(css)) {
+      for (const m of sel.matchAll(/#([a-zA-Z0-9_-]+)/g)) {
+        css.add(`#${m[1]}`);
+      }
+    }
+
     // Keep these bounded so prompts don't explode.
     const bounded = (arr: string[], max: number) => arr.slice(0, max);
 
     return {
-      css: bounded(Array.from(css), 300),
+      css: bounded(Array.from(css), 350),
       xpath: bounded(Array.from(xpath), 150),
       id: bounded(Array.from(id), 150)
     };
@@ -325,20 +358,30 @@ REQUIREMENTS:
   c) Tries regular element.click()
   d) If that fails (ElementClickInterceptedException, TimeoutException, StaleElementReferenceException), falls back to JavaScript click: driver.execute_script("arguments[0].click();", element)
 - Use safe_click() for ALL click operations, NOT element.click() directly.
-- For finding elements to click, wait for EC.element_to_be_clickable() instead of just EC.presence_of_element_located().
+- IMPORTANT (universal): for nav/menu/dropdown triggers, elements may be present but not "clickable" yet.
+  Your find_one() MUST try element_to_be_clickable first, and if it times out, fall back to presence_of_element_located.
 
-3) Dropdown selection (IMPORTANT):
+3) Navigation (IMPORTANT):
+- You MUST navigate using the TARGET_URL constant:
+  driver.get(TARGET_URL)
+- Do NOT hardcode the base URL in driver.get("...") if it equals TARGET_URL.
+
+4) Dropdown selection (IMPORTANT):
 - If executionTrace contains a typing step that indicates an Enter press (either data.pressEnter==true or the description contains "press Enter"), treat it as a dropdown selection.
 - Implement as: click/focus the dropdown element -> send_keys(<value>) -> send_keys(Keys.ENTER).
 - Import Keys only when needed.
 - IMPORTANT: Before interacting with dropdowns, scroll them into view using: driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", dropdown)
 
-4) Locator strategy (must be implemented as code):
+5) Locator strategy (must be implemented as code):
 - Create helper functions like find_one(driver, candidates) where candidates is a list of (By, selector).
+- find_one MUST be robust:
+  - It must attempt EC.element_to_be_clickable((By, selector)) briefly.
+  - If that fails, it must fall back to EC.presence_of_element_located((By, selector)) and return the element.
+  - This is required for hover menus / sticky headers / overlays where Selenium's "clickable" heuristic fails.
 - For each action, try recorded CSS, then recorded XPath, then recorded id.
 - IMPORTANT: Do not generate any new selectors. Use only selectors present in allowedSelectors/executionTrace/scrapeSpecs.
 
-3) Scraping:
+6) Scraping:
 - If SOP includes a scrape step, you MUST use scrapeSpecs (captured from the real DOM) for scraping.
 - Prefer scrapeSpecs[0].rootSelector to scope scraping to the directory results area (avoid header/nav).
 - Prefer scrapeSpecs[0].itemSelector for finding items and iterate over ALL items.
@@ -387,16 +430,58 @@ Return ONLY the Python code.
     let code = await runOnce(prompt);
 
     // Basic validation: do not allow unwanted features (like GDrive) and do not allow selector hallucination.
+    // Also enforce correct TARGET_URL and robust find_one behavior.
     const cleanedOnce = code.replace(/```python|```/g, '').trim();
-    const issues = this.validatePythonOutput(cleanedOnce, allowedSelectors, wantsGDriveUpload);
+    const issues = this.validatePythonOutput(cleanedOnce, allowedSelectors, wantsGDriveUpload, extractedUrl);
 
     if (issues.length > 0) {
-      const repairPrompt = `${prompt}\n\nVALIDATION_ERRORS:\n${issues.map(i => `- ${i}`).join('\n')}\n\nREPAIR_INSTRUCTIONS:\n- Regenerate the FULL python script.\n- Fix ALL validation errors.\n- Do not mention the errors; output only python code.`;
+      const repairPrompt = `${prompt}\n\nVALIDATION_ERRORS:\n${issues.map(i => `- ${i}`).join('\n')}\n\nREPAIR_INSTRUCTIONS:\n- Regenerate the FULL python script.\n- Fix ALL validation errors.\n- Output only python code.`;
       code = await runOnce(repairPrompt);
     }
 
+    // Normalize critical invariants defensively (makes output stable even if the LLM partially ignores instructions).
+    const normalized = this.normalizeSmartPythonOutput(code, extractedUrl);
+
     // Strip markdown if the LLM ignores instructions
-    return code.replace(/```python|```/g, '').trim();
+    return normalized.replace(/```python|```/g, '').trim();
+  }
+
+  private normalizeSmartPythonOutput(raw: string, targetUrl: string): string {
+    const stripMd = (s: string) => s.replace(/```python|```/g, '').trim();
+    let code = stripMd(raw);
+
+    const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Ensure TARGET_URL exists and matches.
+    if (/^\s*TARGET_URL\s*=\s*/m.test(code)) {
+      code = code.replace(/^\s*TARGET_URL\s*=\s*['\"][^'\"]*['\"]\s*$/m, `TARGET_URL = "${targetUrl}"`);
+    } else {
+      // Insert after the import block for readability.
+      const lines = code.split(/\r?\n/);
+      let insertAt = 0;
+      for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (/^\s*(import|from)\s+/.test(l)) {
+          insertAt = i + 1;
+          continue;
+        }
+        // Stop at first non-import-ish line after seeing imports.
+        if (insertAt > 0 && l.trim() !== '') break;
+      }
+      lines.splice(insertAt, 0, '', `TARGET_URL = "${targetUrl}"`, '');
+      code = lines.join('\n');
+    }
+
+    // Prefer driver.get(TARGET_URL) over hardcoded URLs (keeps base URL in one place).
+    const targetUrlRe = new RegExp(`driver\\.get\\(\\s*['\"]${escapeRegExp(targetUrl)}['\"]\\s*\\)`, 'g');
+    code = code.replace(targetUrlRe, 'driver.get(TARGET_URL)');
+
+    // If the model leaked example.com, map it to TARGET_URL (only when targetUrl is not example.com).
+    if (targetUrl !== 'https://example.com') {
+      code = code.replace(/driver\.get\(\s*['\"]https:\/\/example\.com['\"]\s*\)/g, 'driver.get(TARGET_URL)');
+    }
+
+    return code;
   }
 
   private generatePython(commands: ExecutionCommand[], startingUrl?: string): string {
@@ -541,13 +626,53 @@ Return ONLY the Python code.
             const pressEnter = (data && typeof data === 'object' && data.pressEnter === true) || /\n\s*$/.test(rawValue);
             const value = pressEnter ? rawValue.replace(/\n\s*$/, '') : rawValue;
 
-            rawBodyLines.push(
-              `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
-              `        safe_clear(elem)`,
-              `        elem.send_keys("${value.replace(/"/g, '\\"')}")`,
-              ...(pressEnter ? ['        elem.send_keys(Keys.ENTER)'] : []),
-              '        time.sleep(0.5)'
-            );
+            // DYNAMIC DROPDOWN DETECTION:
+            // If pressEnter is true, this is likely a dropdown selection.
+            // We need to handle both native <select> and custom dropdowns.
+            if (pressEnter) {
+              const escapedValue = value.replace(/"/g, '\\"');
+              const lowerValue = escapedValue.toLowerCase();
+              rawBodyLines.push(
+                `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
+                `        # Dropdown selection - handle both native <select> and custom dropdowns`,
+                `        elem_tag = elem.tag_name.lower()`,
+                `        if elem_tag == 'select':`,
+                `            # Native <select> element - use Select class`,
+                `            from selenium.webdriver.support.ui import Select`,
+                `            select = Select(elem)`,
+                `            try:`,
+                `                # Try by visible text first (most reliable)`,
+                `                select.select_by_visible_text("${escapedValue}")`,
+                `            except:`,
+                `                try:`,
+                `                    # Fallback: try by value attribute`,
+                `                    select.select_by_value("${escapedValue}")`,
+                `                except:`,
+                `                    try:`,
+                `                        # Final fallback: partial text match`,
+                `                        for option in select.options:`,
+                `                            if "${lowerValue}" in option.text.lower():`,
+                `                                select.select_by_value(option.get_attribute('value'))`,
+                `                                break`,
+                `                    except:`,
+                `                        pass`,
+                `        else:`,
+                `            # Custom dropdown - use keyboard input`,
+                `            safe_click(driver, elem)`,
+                `            time.sleep(0.3)`,
+                `            elem.send_keys("${escapedValue}")`,
+                `            elem.send_keys(Keys.ENTER)`,
+                `        time.sleep(0.5)`
+              );
+            } else {
+              // Regular text input (not a dropdown)
+              rawBodyLines.push(
+                `        elem = wait.until(EC.presence_of_element_located(${selectorCode}))`,
+                `        safe_clear(elem)`,
+                `        elem.send_keys("${value.replace(/"/g, '\\"')}")`,
+                '        time.sleep(0.5)'
+              );
+            }
           break;
         }
 
