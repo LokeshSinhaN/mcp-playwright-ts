@@ -284,6 +284,36 @@ export class McpTools {
     await this.browser.init();
     const page = this.browser.getPage();
 
+    // --- CRITICAL: Ensure preview is active before any actions ---
+    // This prevents actions from running before the user can see what's happening
+    if (config.broadcast) {
+      console.log('[Agent] Ensuring preview is active before starting...');
+      const broadcastFn = (msg: string) => {
+        // Convert string to WebSocket message format
+        try {
+          const parsed = JSON.parse(msg);
+          if (parsed.type === 'screenshot' || parsed.type === 'preview_ready') {
+            // Re-broadcast to all clients
+            config.broadcast!(parsed);
+          }
+        } catch {
+          // Not JSON, ignore
+        }
+      };
+      
+      const previewReady = await this.browser.ensurePreviewActive(broadcastFn, 15000);
+      if (!previewReady) {
+        console.warn('[Agent] Preview not ready after timeout, but continuing...');
+        config.broadcast({
+          type: 'warning',
+          timestamp: new Date().toISOString(),
+          message: '⚠️ Browser preview may not be visible. Actions will proceed anyway.'
+        });
+      } else {
+        console.log('[Agent] Preview is active, proceeding with actions');
+      }
+    }
+
     // Parse SOP early so the agent can follow the execution flow strictly.
     const parsedSop: ParsedSop = parseSopText(goal);
     this.currentSop = parsedSop;
@@ -309,6 +339,11 @@ export class McpTools {
         try {
             console.log(`[Agent] Initializing navigation to: ${urlInGoal}`);
             await this.navigate(urlInGoal);
+            
+            // Wait for visual content to load after navigation
+            console.log('[Agent] Waiting for visual content after navigation...');
+            await this.browser.waitForVisualContent(10000);
+            
             actionHistory.push(`[SUCCESS] Navigated to ${urlInGoal}`);
         } catch (e) {
             console.error("Navigation failed:", e);
@@ -510,7 +545,13 @@ export class McpTools {
       }
 
       if (actionsToExecute.some(a => a.type === 'finish') && batchSuccess) isFinished = true;
-      if (batchSuccess && !isFinished) await this.browser.waitForStability(1500); 
+      
+      // Wait for visual content to update after actions (ensures preview shows current state)
+      if (batchSuccess && !isFinished) {
+        await this.browser.waitForStability(1500);
+        // Also wait for visual content to ensure the preview has updated
+        await this.browser.waitForVisualContent(3000);
+      }
     }
 
     // --- CRITICAL: INTELLIGENT GENERATION ---

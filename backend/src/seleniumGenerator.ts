@@ -318,12 +318,22 @@ REQUIREMENTS:
 - Use webdriver_manager (ChromeDriverManager) and ChromeOptions.
 - Use WebDriverWait + expected_conditions; avoid arbitrary sleeps except for tiny UI settling.
 
-2) Dropdown selection (IMPORTANT):
+2) ROBUST CLICK HANDLING (CRITICAL - prevents "element not interactable" errors):
+- Create a helper function safe_click(driver, element) that:
+  a) First scrolls the element into view using: driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+  b) Waits a tiny moment (0.3s) for scroll to complete
+  c) Tries regular element.click()
+  d) If that fails (ElementClickInterceptedException, TimeoutException, StaleElementReferenceException), falls back to JavaScript click: driver.execute_script("arguments[0].click();", element)
+- Use safe_click() for ALL click operations, NOT element.click() directly.
+- For finding elements to click, wait for EC.element_to_be_clickable() instead of just EC.presence_of_element_located().
+
+3) Dropdown selection (IMPORTANT):
 - If executionTrace contains a typing step that indicates an Enter press (either data.pressEnter==true or the description contains "press Enter"), treat it as a dropdown selection.
 - Implement as: click/focus the dropdown element -> send_keys(<value>) -> send_keys(Keys.ENTER).
 - Import Keys only when needed.
+- IMPORTANT: Before interacting with dropdowns, scroll them into view using: driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", dropdown)
 
-3) Locator strategy (must be implemented as code):
+4) Locator strategy (must be implemented as code):
 - Create helper functions like find_one(driver, candidates) where candidates is a list of (By, selector).
 - For each action, try recorded CSS, then recorded XPath, then recorded id.
 - IMPORTANT: Do not generate any new selectors. Use only selectors present in allowedSelectors/executionTrace/scrapeSpecs.

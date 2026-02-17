@@ -208,7 +208,7 @@ export function createServer(port: number, chromePath?: string) {
 
   // --- ACTION HANDLER ---
   app.post('/api/execute', async (req, res) => {
-    const { action, url, selector, text, commands, prompt, agentConfig } = req.body as {
+    const { action, url, selector, text, commands, prompt, agentConfig, skipPreviewCheck } = req.body as {
       action: string;
       url?: string;
       selector?: string;
@@ -216,11 +216,34 @@ export function createServer(port: number, chromePath?: string) {
       commands?: ExecutionCommand[];
       prompt?: string;
       agentConfig?: Partial<AgentConfig>;
+      skipPreviewCheck?: boolean; // Allow bypassing for internal/health calls
     };
 
     let result: ExecutionResult;
 
     try {
+      // --- PREVIEW READINESS GATE ---
+      // Block actions until the preview is ready (unless explicitly skipped)
+      if (!skipPreviewCheck && !browser.previewReady) {
+        console.log('[Server] Waiting for preview to be ready before executing action...');
+        const isReady = await browser.waitForPreviewReady(15000); // 15s timeout
+        
+        if (!isReady) {
+          broadcast({
+            type: 'warning',
+            timestamp: new Date().toISOString(),
+            message: 'Preview not ready. Please wait for the browser to load.'
+          });
+          result = {
+            success: false,
+            message: 'Preview not ready. Please wait for the browser preview to start before executing actions.',
+            error: 'PREVIEW_NOT_READY'
+          };
+          res.status(503).json(result);
+          return;
+        }
+      }
+
       switch (action) {
         case 'navigate':
           if (!url) throw new Error('url required');
@@ -389,8 +412,17 @@ export function createServer(port: number, chromePath?: string) {
     res.json({ success: true, browserOpen: browser.isOpen() });
   });
 
-  wss.on('connection', (ws) => {
+  // Shared broadcast function that sends to all connected WebSocket clients
+  const wsBroadcast = (payload: string) => {
+    for (const ws of clients) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+    }
+  };
+
+  wss.on('connection', async (ws: WebSocket) => {
     clients.add(ws);
+    console.log(`[Server] WebSocket client connected (total: ${clients.size})`);
+    
     ws.send(
       JSON.stringify({
         type: 'log',
@@ -399,17 +431,52 @@ export function createServer(port: number, chromePath?: string) {
       } satisfies WebSocketMessage)
     );
 
+    // Initialize browser and start streaming if first client
     if (clients.size === 1) {
-      browser.startScreenshotStream((payload: string) => {
-        for (const ws of clients) {
-          if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+      try {
+        await browser.init();
+        console.log('[Server] Browser initialized, navigating to hyprtask.com');
+        
+        // Navigate to hyprtask.com to show the user that browser is ready
+        try {
+          await browser.goto('https://hyprtask.com');
+          console.log('[Server] Navigated to hyprtask.com');
+          
+          // Broadcast that browser is initialized and ready
+          broadcast({
+            type: 'browser_ready',
+            timestamp: new Date().toISOString(),
+            message: 'Browser initialized and ready! You can start your workflow.'
+          });
+        } catch (navError) {
+          console.error('[Server] Failed to navigate to hyprtask.com:', navError);
         }
-      });
+        
+        // Use reliable periodic screenshot stream (CDP screencast can be flaky in headless)
+        browser.startScreenshotStream(wsBroadcast);
+      } catch (e) {
+        console.error('[Server] Failed to initialize browser:', e);
+      }
+    } else {
+      // For subsequent clients, update the broadcast function and send current frame
+      browser.updateBroadcast(wsBroadcast);
+      
+      // Send current screenshot to the new client so they see the current state immediately
+      if (browser.isOpen() && browser.previewReady) {
+        console.log('[Server] Sending current frame to new client');
+        await browser.sendCurrentFrame((payload: string) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+        });
+      }
     }
 
-    ws.on('close', () => {
+    ws.on('close', async () => {
       clients.delete(ws);
+      console.log(`[Server] WebSocket client disconnected (remaining: ${clients.size})`);
+      
       if (clients.size === 0) {
+        // Stop streaming when no clients
+        await browser.stopScreencast();
         browser.stopScreenshotStream();
       }
     });

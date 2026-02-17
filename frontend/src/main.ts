@@ -18,6 +18,23 @@ const wsStatusText = document.getElementById('ws-status-text');
 const modelSelect = document.getElementById('model-provider-select') as HTMLSelectElement | null;
 const uploadPdfBtn = document.getElementById('upload-pdf-btn') as HTMLButtonElement | null;
 const pdfInput = document.getElementById('pdf-upload-input') as HTMLInputElement | null;
+const submitBtn = chatForm.querySelector('button[type="submit"]') as HTMLButtonElement | null;
+
+// Preview readiness state
+let isPreviewReady = false;
+
+function setInputEnabled(enabled: boolean): void {
+  promptInput.disabled = !enabled;
+  if (submitBtn) submitBtn.disabled = !enabled;
+  if (takeScreenshotBtn) takeScreenshotBtn.disabled = !enabled;
+  if (generateScriptBtn) generateScriptBtn.disabled = !enabled;
+  
+  if (!enabled) {
+    promptInput.placeholder = 'Waiting for browser preview to start...';
+  } else {
+    promptInput.placeholder = "https://example.com or 'click login button'";
+  }
+}
 
 function setWsStatus(state: 'connected' | 'disconnected' | 'error', label: string) {
   if (!wsStatusDot || !wsStatusText) return;
@@ -111,9 +128,27 @@ function appendLog(p: WsPayload | { type: string; message: string; timestamp?: s
   chatLog.scrollTop = chatLog.scrollHeight;
 }
 
+// Handle preview readiness changes
+wsClient.onPreviewReady((ready) => {
+  isPreviewReady = ready;
+  setInputEnabled(ready);
+  
+  if (ready) {
+    setWsStatus('connected', 'Preview Ready');
+    // Show a brief notification
+    appendLog({ 
+      type: 'success', 
+      message: 'Browser preview is ready. You can now enter commands.',
+      role: 'system'
+    });
+  } else {
+    setWsStatus('disconnected', 'Waiting for preview...');
+  }
+});
+
 wsClient.on((p) => {
   if (p.type === 'log' || p.type === 'action' || p.type === 'success' || p.type === 'thought' || p.type === 'action_taken' || p.type === 'progress' || p.type === 'warning' || p.type === 'action_success' || p.type === 'action_failed') {
-    setWsStatus('connected', 'Connected');
+    setWsStatus('connected', isPreviewReady ? 'Preview Ready' : 'Connected');
   } else if (p.type === 'error') {
     setWsStatus('error', 'Error');
   } else if (p.type === 'screenshot' && p.data && (p.data as any).screenshot) {
@@ -121,10 +156,14 @@ wsClient.on((p) => {
     screenshotImg.hidden = false;
     placeholder.hidden = true;
     return; // Don't log screenshot messages
+  } else if (p.type === 'preview_ready') {
+    return; // Already handled by onPreviewReady
   }
   appendLog(p);
 });
 
+// Start with input disabled until preview is ready
+setInputEnabled(false);
 wsClient.connect();
 
 // --- PDF UPLOAD LOGIC ---
@@ -186,6 +225,16 @@ chatForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const text = promptInput.value.trim();
   if (!text) return;
+
+  // Block submission if preview is not ready
+  if (!isPreviewReady) {
+    appendLog({ 
+      type: 'warning', 
+      message: 'Please wait for the browser preview to start before executing commands.',
+      role: 'system'
+    });
+    return;
+  }
 
   const provider = modelSelect ? (modelSelect.value as 'gemini' | 'openai') : 'gemini';
 

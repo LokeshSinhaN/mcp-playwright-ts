@@ -1,4 +1,4 @@
-import { chromium, Browser, BrowserContext, Page, Locator, Frame } from 'playwright';
+import { chromium, Browser, BrowserContext, Page, Locator, Frame, CDPSession } from 'playwright';
 import { BrowserConfig, ElementInfo, SessionState, ExecutionResult, StateFingerprint } from './types'; // Updated import
 import { SelectorExtractor } from './selectorExtractor';
 import * as crypto from 'crypto'; // Built-in Node module
@@ -7,9 +7,19 @@ export class BrowserManager {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private cdpSession: CDPSession | null = null;
   private screenshotStreamer: NodeJS.Timeout | null = null;
+  private screencastActive: boolean = false;
   // Cache the last good screenshot so transient failures don't break the agent/stream
   private lastScreenshot: string | null = null;
+  // Preview readiness state - actions are blocked until this is true
+  private _previewReady: boolean = false;
+  private previewReadyResolvers: Array<() => void> = [];
+  // Track the broadcast function for re-sending frames
+  private activeBroadcast: ((message: string) => void) | null = null;
+  // Frame counter to verify screencast is actually working
+  private frameCount: number = 0;
+  private lastFrameTime: number = 0;
   private readonly config: BrowserConfig;
   private readonly state: SessionState = {
     isOpen: false,
@@ -25,22 +35,249 @@ export class BrowserManager {
     };
   }
 
-  // ... [Existing startScreenshotStream, stopScreenshotStream, getters remain unchanged] ...
+  // --- PREVIEW READINESS API ---
+  get previewReady(): boolean {
+    return this._previewReady;
+  }
 
+  private setPreviewReady(ready: boolean): void {
+    this._previewReady = ready;
+    if (ready) {
+      // Resolve all waiting promises
+      for (const resolve of this.previewReadyResolvers) {
+        resolve();
+      }
+      this.previewReadyResolvers = [];
+    }
+  }
+
+  /**
+   * Wait until the preview is ready (screencast is streaming).
+   * Actions should call this before executing.
+   */
+  async waitForPreviewReady(timeoutMs: number = 10000): Promise<boolean> {
+    if (this._previewReady) return true;
+    
+    return new Promise<boolean>((resolve) => {
+      const timeout = setTimeout(() => {
+        // Remove this resolver from the list
+        const idx = this.previewReadyResolvers.indexOf(resolver);
+        if (idx >= 0) this.previewReadyResolvers.splice(idx, 1);
+        resolve(false); // Timeout - preview not ready
+      }, timeoutMs);
+      
+      const resolver = () => {
+        clearTimeout(timeout);
+        resolve(true);
+      };
+      
+      this.previewReadyResolvers.push(resolver);
+    });
+  }
+
+  // --- CDP SCREENCAST (Live Preview) ---
+  // NOTE: CDP screencast can be unreliable in headless mode, prefer startScreenshotStream
+  async startScreencast(
+    broadcast: (message: string) => void,
+    options: { quality?: number; maxWidth?: number; maxHeight?: number } = {}
+  ): Promise<void> {
+    if (this.screencastActive) return;
+    
+    // Store broadcast function for later use
+    this.activeBroadcast = broadcast;
+    this.frameCount = 0;
+    
+    const page = this.getPage();
+    
+    // Create CDP session if not exists
+    if (!this.cdpSession) {
+      this.cdpSession = await page.context().newCDPSession(page);
+    }
+    
+    const { quality = 80, maxWidth = 1600, maxHeight = 900 } = options;
+    
+    // Listen for screencast frames
+    this.cdpSession.on('Page.screencastFrame', async (params) => {
+      const { data, sessionId } = params;
+      
+      // Acknowledge the frame to keep receiving more
+      try {
+        await this.cdpSession?.send('Page.screencastFrameAck', { sessionId });
+      } catch (e) {
+        // Session might be closed
+      }
+      
+      // Track frame stats
+      this.frameCount++;
+      this.lastFrameTime = Date.now();
+      
+      // Cache and broadcast the frame
+      const screenshot = `data:image/jpeg;base64,${data}`;
+      this.lastScreenshot = screenshot;
+      
+      // Mark preview as ready after first frame
+      if (!this._previewReady) {
+        this.setPreviewReady(true);
+        console.log(`[BrowserManager] First screencast frame received, preview ready`);
+      }
+      
+      // Broadcast preview_ready and screenshot
+      if (this.activeBroadcast) {
+        if (this.frameCount === 1) {
+          this.activeBroadcast(JSON.stringify({ 
+            type: 'preview_ready', 
+            data: { ready: true, timestamp: Date.now() } 
+          }));
+        }
+        this.activeBroadcast(JSON.stringify({ 
+          type: 'screenshot', 
+          data: { screenshot, timestamp: Date.now() } 
+        }));
+      }
+    });
+    
+    // Start the screencast
+    await this.cdpSession.send('Page.startScreencast', {
+      format: 'jpeg',
+      quality,
+      maxWidth,
+      maxHeight,
+      everyNthFrame: 1 // Every frame for smooth preview
+    });
+    
+    this.screencastActive = true;
+    console.log('[BrowserManager] CDP screencast started');
+    
+    // Verify frames are actually coming - if not after 2s, fall back to screenshot stream
+    setTimeout(() => {
+      if (this.screencastActive && this.frameCount === 0) {
+        console.warn('[BrowserManager] CDP screencast not delivering frames, falling back to screenshot stream');
+        this.stopScreencast().then(() => {
+          if (this.activeBroadcast) {
+            this.startScreenshotStream(this.activeBroadcast);
+          }
+        });
+      }
+    }, 2000);
+  }
+
+  async stopScreencast(): Promise<void> {
+    if (!this.screencastActive || !this.cdpSession) return;
+    
+    try {
+      await this.cdpSession.send('Page.stopScreencast');
+      // Detach the CDP session to clean up all listeners
+      await this.cdpSession.detach().catch(() => {});
+      this.cdpSession = null;
+    } catch (e) {
+      console.warn('[BrowserManager] Error stopping screencast:', e);
+    }
+    
+    this.screencastActive = false;
+    this.setPreviewReady(false);
+    console.log('[BrowserManager] CDP screencast stopped');
+  }
+
+  // --- PRIMARY: Periodic screenshot stream (more reliable than CDP screencast) ---
   startScreenshotStream(broadcast: (message: string) => void) {
-    if (this.screenshotStreamer) return;
+    if (this.screenshotStreamer) {
+      // Update broadcast function for existing stream
+      this.activeBroadcast = broadcast;
+      return;
+    }
+    
+    this.activeBroadcast = broadcast;
+    this.frameCount = 0;
+    
+    console.log('[BrowserManager] Starting periodic screenshot stream');
+    
     this.screenshotStreamer = setInterval(async () => {
       try {
         const screenshot = await this.screenshot();
-        broadcast(JSON.stringify({ type: 'screenshot', data: { screenshot, timestamp: Date.now() } }));
-      } catch (err) { console.warn('Stream tick failed', err); }
-    }, 250);
+        if (!screenshot) return;
+        
+        this.frameCount++;
+        this.lastFrameTime = Date.now();
+        
+        // Mark preview as ready after first successful screenshot
+        if (!this._previewReady) {
+          this.setPreviewReady(true);
+          console.log('[BrowserManager] First screenshot captured, preview ready');
+          if (this.activeBroadcast) {
+            this.activeBroadcast(JSON.stringify({ 
+              type: 'preview_ready', 
+              data: { ready: true, timestamp: Date.now() } 
+            }));
+          }
+        }
+        
+        if (this.activeBroadcast) {
+          this.activeBroadcast(JSON.stringify({ 
+            type: 'screenshot', 
+            data: { screenshot, timestamp: Date.now() } 
+          }));
+        }
+      } catch (err) { 
+        console.warn('[BrowserManager] Screenshot stream tick failed:', err); 
+      }
+    }, 300); // 300ms interval for balance of performance and responsiveness
   }
 
   stopScreenshotStream() {
     if (!this.screenshotStreamer) return;
     clearInterval(this.screenshotStreamer);
     this.screenshotStreamer = null;
+    this.setPreviewReady(false);
+    console.log('[BrowserManager] Screenshot stream stopped');
+  }
+
+  /**
+   * Update the broadcast function (e.g., when new WebSocket clients connect)
+   */
+  updateBroadcast(broadcast: (message: string) => void): void {
+    this.activeBroadcast = broadcast;
+  }
+
+  /**
+   * Send the current screenshot/preview state to a specific client or via broadcast.
+   * Useful when new clients connect and need the current state.
+   */
+  async sendCurrentFrame(send?: (message: string) => void): Promise<void> {
+    const target = send || this.activeBroadcast;
+    if (!target) return;
+    
+    // Get current screenshot
+    let screenshot = this.lastScreenshot;
+    if (!screenshot) {
+      try {
+        screenshot = await this.screenshot();
+        this.lastScreenshot = screenshot;
+      } catch {
+        return;
+      }
+    }
+    
+    if (screenshot) {
+      // Send preview_ready first
+      target(JSON.stringify({ 
+        type: 'preview_ready', 
+        data: { ready: true, timestamp: Date.now() } 
+      }));
+      // Then send the screenshot
+      target(JSON.stringify({ 
+        type: 'screenshot', 
+        data: { screenshot, timestamp: Date.now() } 
+      }));
+    }
+  }
+
+  /**
+   * Check if preview streaming is active and working
+   */
+  isStreamingActive(): boolean {
+    return (this.screencastActive || this.screenshotStreamer !== null) && 
+           this.frameCount > 0 && 
+           (Date.now() - this.lastFrameTime) < 5000; // Frame within last 5s
   }
 
   private get defaultTimeout(): number { return this.config.timeoutMs; }
@@ -269,6 +506,84 @@ export class BrowserManager {
       const page = this.getPage();
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.config.timeoutMs });
       await this.waitForNetworkIdle(2000);
+      // Wait for visual content to be available
+      await this.waitForVisualContent();
+  }
+
+  /**
+   * Wait until the page has meaningful visual content.
+   * This ensures the preview has something to show before actions proceed.
+   */
+  async waitForVisualContent(timeoutMs: number = 10000): Promise<boolean> {
+    const page = this.getPage();
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < timeoutMs) {
+      try {
+        // Check if page has visible content
+        const hasContent = await page.evaluate(() => {
+          const body = document.body;
+          if (!body) return false;
+          
+          // Check for meaningful content
+          const hasText = body.innerText.trim().length > 50;
+          const hasVisibleElements = document.querySelectorAll('button, a, input, img, h1, h2, p').length > 0;
+          const bodyHeight = body.scrollHeight;
+          
+          return hasText || hasVisibleElements || bodyHeight > 200;
+        });
+        
+        if (hasContent) {
+          console.log('[BrowserManager] Visual content detected');
+          return true;
+        }
+      } catch (e) {
+        // Page might be navigating, continue waiting
+      }
+      
+      await page.waitForTimeout(200);
+    }
+    
+    console.warn('[BrowserManager] Visual content check timed out, proceeding anyway');
+    return false;
+  }
+
+  /**
+   * Ensure the preview/screencast is active before proceeding.
+   * This should be called before starting agent actions.
+   */
+  async ensurePreviewActive(broadcast?: (message: string) => void, timeoutMs: number = 15000): Promise<boolean> {
+    // Use provided broadcast or existing one
+    const broadcastFn = broadcast || this.activeBroadcast;
+    
+    // If already streaming and ready, just verify frames are coming
+    if (this._previewReady && this.isStreamingActive()) {
+      console.log('[BrowserManager] Preview already active and streaming');
+      return true;
+    }
+    
+    // If preview ready but no recent frames, force a screenshot to verify
+    if (this._previewReady && broadcastFn) {
+      console.log('[BrowserManager] Preview ready but verifying with fresh screenshot...');
+      await this.sendCurrentFrame(broadcastFn);
+      return true;
+    }
+    
+    // Not ready, start screenshot stream if we have a broadcast function
+    if (!this.screenshotStreamer && broadcastFn) {
+      console.log('[BrowserManager] Starting screenshot stream in ensurePreviewActive');
+      this.startScreenshotStream(broadcastFn);
+    }
+    
+    // Wait for preview to become ready
+    const ready = await this.waitForPreviewReady(timeoutMs);
+    
+    if (ready && broadcastFn) {
+      // Send a fresh frame to ensure clients have current state
+      await this.sendCurrentFrame(broadcastFn);
+    }
+    
+    return ready;
   }
 
   // ... rest of class
