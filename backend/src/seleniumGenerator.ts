@@ -1,7 +1,7 @@
 import { GenerativeModel } from '@google/generative-ai';
 import OpenAI from 'openai';
 import { ExecutionCommand } from './types';
-import { parseSopText } from './sopParser';
+import { parseSopText, SopStep } from './sopParser';
 
 export class SeleniumGenerator {
   constructor(
@@ -304,6 +304,40 @@ export class SeleniumGenerator {
       data: h.data
     }));
 
+    // CRITICAL: Validate execution trace contains all SOP steps
+    const missingSteps: string[] = [];
+    for (const step of sop.steps) {
+      // Skip non-interactive steps
+      if (step.kind === 'save_excel' || step.kind === 'upload_gdrive' || step.kind === 'other') continue;
+      
+      // Check if step is in execution trace
+      const stepText = step.raw.toLowerCase();
+      const found = history.some(cmd => {
+        const desc = (cmd.description || '').toLowerCase();
+        const value = (cmd.value || '').toLowerCase();
+        
+        // For select steps, check both dropdown name and option
+        if (step.kind === 'select') {
+          const dropdownMatch = stepText.match(/\b(\w+)\s+drop\s*down/);
+          const optionMatch = stepText.match(/select\s+["']?([\w\s]+)["']?(?:\s+option)?/);
+          const dropdownName = dropdownMatch ? dropdownMatch[1].toLowerCase() : '';
+          const optionValue = optionMatch ? optionMatch[1].toLowerCase().trim() : '';
+          
+          const hasDropdown = dropdownName && (desc.includes(dropdownName) || value.includes(dropdownName));
+          const hasOption = optionValue && (desc.includes(optionValue) || value.includes(optionValue));
+          
+          return hasDropdown && hasOption;
+        }
+        
+        // For other steps, basic keyword matching
+        return desc.includes(step.kind) || value.includes(step.kind);
+      });
+      
+      if (!found) {
+        missingSteps.push(`Step ${step.index + 1}: ${step.raw}`);
+      }
+    }
+
     const automationSpec = {
       preferences: {
         selectorPriority: 'recorded-only',
@@ -317,6 +351,7 @@ export class SeleniumGenerator {
       sop: {
         raw: goal,
         parsed: sop,
+        missingSteps: missingSteps.length > 0 ? missingSteps : undefined
       },
       targetUrl: extractedUrl,
       allowedSelectors,

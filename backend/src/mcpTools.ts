@@ -4,7 +4,7 @@ import OpenAI from 'openai';
 import { BrowserManager } from './browserManager';
 import { SelectorExtractor } from './selectorExtractor';
 import { SeleniumGenerator } from './seleniumGenerator';
-import { parseSopText, ParsedSop } from './sopParser';
+import { parseSopText, ParsedSop, SopStep } from './sopParser';
 import {
   ExecutionCommand,
   ExecutionResult,
@@ -129,9 +129,18 @@ export class McpTools {
         if (semanticTarget && stepText.includes(semanticTarget.toLowerCase())) return i;
       }
 
+      // ENHANCED: Better matching for select/dropdown steps
       if (step.kind === 'select' && (actionType === 'select_option' || actionType === 'click')) {
-        // Selection steps usually mention the option; use that when present.
+        // Match by option value mentioned in step
         if (optionValue && stepText.includes(optionValue.toLowerCase())) return i;
+        
+        // CRITICAL FIX: Also match by dropdown name/label (e.g., "distance", "gender", "language")
+        // This catches cases where we select from a dropdown even if option isn't in action yet
+        if (semanticTarget && stepText.includes(semanticTarget.toLowerCase())) return i;
+        
+        // Extract dropdown keywords from step text (e.g., "Distance drop down" -> "distance")
+        const dropdownMatch = stepText.match(/\b(\w+)\s+drop\s*down/);
+        if (dropdownMatch && semanticTarget.toLowerCase().includes(dropdownMatch[1])) return i;
       }
     }
 
@@ -201,6 +210,114 @@ export class McpTools {
           message: `📍 Step ${matchedStepIndex + 1}/${this.currentSop.steps.length}: ${stepInfo.raw}`
         });
       }
+    }
+  }
+
+  // CRITICAL NEW METHOD: Find SOP steps that were marked complete but not actually executed
+  private findMissingSopSteps(): SopStep[] {
+    if (!this.currentSop?.steps?.length) return [];
+
+    const missing: SopStep[] = [];
+    const history = this.sessionHistory;
+
+    for (const step of this.currentSop.steps) {
+      // Skip non-interactive steps (they don't need browser actions)
+      if (step.kind === 'save_excel' || step.kind === 'upload_gdrive' || step.kind === 'other') {
+        continue;
+      }
+
+      // Check if this step was actually executed by examining history
+      const wasExecuted = this.verifyStepExecution(step, history);
+
+      if (!wasExecuted) {
+        missing.push(step);
+      }
+    }
+
+    return missing;
+  }
+
+  // CRITICAL: Verify a specific SOP step was actually executed (not just marked complete)
+  private verifyStepExecution(step: SopStep, history: ExecutionCommand[]): boolean {
+    const stepText = step.raw.toLowerCase();
+
+    switch (step.kind) {
+      case 'navigate':
+        // Check if we navigated to the URL mentioned in the step
+        if (step.url) {
+          return history.some(cmd => cmd.action === 'navigate' && cmd.target?.includes(step.url!));
+        }
+        return history.some(cmd => cmd.action === 'navigate');
+
+      case 'click':
+        // Extract the target name from step text (e.g., "Click on FILTER button" -> "filter")
+        const clickTargetMatch = stepText.match(/click\s+(?:on\s+)?(?:the\s+)?["']?([\w\s]+?)(?:["']?\s+button|["']?\s+link|["']?\s*$)/);
+        if (clickTargetMatch) {
+          const targetKeywords = clickTargetMatch[1].trim().toLowerCase();
+          return history.some(cmd => 
+            cmd.action === 'click' && 
+            (cmd.description?.toLowerCase().includes(targetKeywords) ||
+             cmd.selectors?.text?.toLowerCase().includes(targetKeywords) ||
+             cmd.target?.toLowerCase().includes(targetKeywords))
+          );
+        }
+        // Fallback: check if any click happened
+        return history.some(cmd => cmd.action === 'click');
+
+      case 'select':
+        // CRITICAL: For dropdown/select steps, verify BOTH the dropdown name AND the option value
+        // Extract dropdown name (e.g., "Distance drop down" -> "distance")
+        const dropdownMatch = stepText.match(/\b(\w+)\s+drop\s*down/);
+        // Extract option value (e.g., "select 50 miles" -> "50 miles")
+        const optionMatch = stepText.match(/select\s+["']?([\w\s]+)["']?(?:\s+option)?/);
+        
+        const dropdownName = dropdownMatch ? dropdownMatch[1].toLowerCase() : '';
+        const optionValue = optionMatch ? optionMatch[1].toLowerCase().trim() : '';
+
+        // Check if BOTH dropdown and option are in history
+        let foundDropdown = false;
+        let foundOption = false;
+
+        for (const cmd of history) {
+          const desc = (cmd.description || '').toLowerCase();
+          const value = (cmd.value || '').toLowerCase();
+          const target = (cmd.target || '').toLowerCase();
+          const text = (cmd.selectors?.text || '').toLowerCase();
+
+          // Check for dropdown interaction
+          if (dropdownName && (desc.includes(dropdownName) || target.includes(dropdownName) || text.includes(dropdownName))) {
+            foundDropdown = true;
+          }
+
+          // Check for option selection
+          if (optionValue && (desc.includes(optionValue) || value.includes(optionValue) || text.includes(optionValue))) {
+            foundOption = true;
+          }
+        }
+
+        // REQUIRE BOTH dropdown and option to be found (stricter validation)
+        if (dropdownName && optionValue) {
+          return foundDropdown && foundOption;
+        } else if (optionValue) {
+          return foundOption;
+        } else if (dropdownName) {
+          return foundDropdown;
+        }
+        
+        // Fallback: any select/type action
+        return history.some(cmd => cmd.action === 'type' || cmd.action === 'click');
+
+      case 'type':
+        // Check if any typing action occurred
+        return history.some(cmd => cmd.action === 'type');
+
+      case 'scrape':
+        // Check if scraping was executed
+        return history.some(cmd => cmd.action === 'scrape_data');
+
+      default:
+        // For unknown step kinds, assume executed if completedSopSteps includes it
+        return this.completedSopSteps.has(step.index);
     }
   }
   
@@ -634,18 +751,48 @@ export class McpTools {
         }
       }
 
-      // Universal escape hatch: if we already captured scrape specs (or SOP has no scrape) and we're stalling, finish.
+      // CRITICAL: Validate ALL SOP steps are actually completed before auto-finishing
       if (!isFinished && noProgressIterations >= 3) {
         const sopHasScrape = !!this.currentSop?.steps?.some(s => s.kind === 'scrape');
         const didScrape = this.sessionHistory.some(c => c.action === 'scrape_data');
-        if (!sopHasScrape || didScrape) {
-          isFinished = true;
-          actionHistory.push('[AUTO-FINISH] No progress while SOP appears satisfied.');
+        
+        // NEW: Verify all browser interaction steps from SOP are actually executed
+        const missingSteps = this.findMissingSopSteps();
+        
+        if (missingSteps.length > 0) {
+          // NOT READY TO FINISH - there are missing steps
           if (config.broadcast) {
             config.broadcast({
               type: 'warning',
               timestamp: new Date().toISOString(),
-              message: 'Auto-finishing: no further SOP actions detected; avoiding a thinking loop.'
+              message: `⚠️  VALIDATION FAILURE: ${missingSteps.length} SOP step(s) not executed yet. Re-analyzing...`
+            });
+            
+            // Log which steps are missing
+            for (const step of missingSteps) {
+              config.broadcast({
+                type: 'warning',
+                timestamp: new Date().toISOString(),
+                message: `   Missing Step ${step.index + 1}: ${step.raw}`
+              });
+            }
+          }
+          
+          // Force re-analysis with emphasis on missing steps
+          this.currentSopStep = missingSteps[0].index;
+          noProgressIterations = 0; // Reset counter to allow retry
+          continue; // Go back to thinking loop
+        }
+        
+        // All steps validated OR no scrape required
+        if (!sopHasScrape || didScrape) {
+          isFinished = true;
+          actionHistory.push('[AUTO-FINISH] All SOP steps validated and completed.');
+          if (config.broadcast) {
+            config.broadcast({
+              type: 'success',
+              timestamp: new Date().toISOString(),
+              message: '✅ All SOP steps validated successfully. Auto-finishing.'
             });
           }
         }
@@ -816,6 +963,12 @@ export class McpTools {
   
 
                 const processedItemsList = Array.from(this.processedItems).join(', ');
+                
+                // CRITICAL: Identify which SOP steps are still missing from execution
+                const missingSteps = this.findMissingSopSteps();
+                const missingStepsWarning = missingSteps.length > 0 
+                  ? `\n\n⚠️  CRITICAL WARNING - MISSING STEPS NOT YET EXECUTED:\n${missingSteps.map(s => `  Step ${s.index + 1}: ${s.raw}`).join('\n')}\n\nYou MUST execute these missing steps before proposing 'finish'!\n`
+                  : '';
 
                 const prompt = `
             SYSTEM: You are an expert RPA Agent that behaves exactly like a human interacting with a browser.
@@ -824,13 +977,17 @@ export class McpTools {
             GOAL (raw SOP text): "${goal}"
 
             SOP (structured): ${JSON.stringify(sop.steps)}
-
+            ${missingStepsWarning}
             HISTORY: ${history.slice(-8).join('; ')}
 
             PROCESSED ITEMS: ${processedItemsList || 'None'}
 
             COMPLETED_SOP_STEP_INDICES: ${JSON.stringify(Array.from(this.completedSopSteps).sort((a,b)=>a-b))}
             CURRENT_SOP_STEP_INDEX: ${this.currentSopStep}
+            
+            ⚠️  VALIDATION RULE:
+            Before returning 'finish', verify ALL browser interaction steps from the SOP have been executed.
+            Check the HISTORY to confirm each step's presence. If ANY step is missing, execute it first!
 
             UI ELEMENTS:
             ${JSON.stringify(simplified)}
@@ -1637,11 +1794,29 @@ export class McpTools {
   }
 
   private isActionRedundant(action: SingleAgentAction, history: ExecutionCommand[]): boolean {
-      // If a SOP step is already completed, skip ONLY if we've already executed this specific action/element.
-      // This prevents "thinking-only" loops where the LLM proposes a corrective click but the engine keeps skipping it.
+      // CRITICAL: Be more careful about marking steps redundant
+      // Only skip if BOTH:
+      // 1. SOP step is marked complete
+      // 2. Action was actually executed (not just assumed)
       const sopIdx = this.inferLikelySopStepIndexForAction(action);
       if (sopIdx >= 0 && this.completedSopSteps.has(sopIdx)) {
-        if (this.wasActionAlreadyExecuted(action, history)) return true;
+        // ENHANCED: Verify the action was truly executed by checking execution history
+        const wasExecuted = this.wasActionAlreadyExecuted(action, history);
+        
+        // ADDITIONAL CHECK: For select/dropdown actions, verify the value is in history
+        if (action.type === 'select_option') {
+          const optionValue = action.option?.toLowerCase() || '';
+          const foundInHistory = history.some(cmd => 
+            (cmd.action === 'type' || cmd.action === 'click') && 
+            (cmd.value?.toLowerCase().includes(optionValue) || 
+             cmd.description?.toLowerCase().includes(optionValue))
+          );
+          if (!foundInHistory) {
+            return false; // NOT redundant - option was never actually selected
+          }
+        }
+        
+        if (wasExecuted) return true;
       }
 
       if (history.length === 0) return false;
