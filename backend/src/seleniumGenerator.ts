@@ -385,16 +385,34 @@ REQUIREMENTS:
 1) Selenium setup:
 - Use webdriver_manager (ChromeDriverManager) and ChromeOptions.
 - Use WebDriverWait + expected_conditions; avoid arbitrary sleeps except for tiny UI settling.
+- Import ActionChains for hover interactions: from selenium.webdriver.common.action_chains import ActionChains
 
 2) ROBUST CLICK HANDLING (CRITICAL - prevents "element not interactable" errors):
 - Create a helper function safe_click(driver, element) that:
   a) First scrolls the element into view using: driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-  b) Waits a tiny moment (0.3s) for scroll to complete
+  b) Waits a tiny moment (0.5s) for scroll to complete
   c) Tries regular element.click()
   d) If that fails (ElementClickInterceptedException, TimeoutException, StaleElementReferenceException), falls back to JavaScript click: driver.execute_script("arguments[0].click();", element)
 - Use safe_click() for ALL click operations, NOT element.click() directly.
+
+2a) NAVIGATION MENU HANDLING (CRITICAL - prevents "element not interactable" for hover menus):
+- For navigation menu clicks (detected by selectors containing 'menu', 'nav', or descriptions containing 'menu'):
+  a) FIRST check if element has child <a> tag and use that instead: elem.find_element(By.TAG_NAME, 'a')
+  b) Use ActionChains to hover before clicking: ActionChains(driver).move_to_element(elem).pause(0.3).click().perform()
+  c) Wait for submenu to appear after hover: time.sleep(0.5)
+- This ensures hover-based navigation menus work correctly.
+
+2b) PAGE LOAD WAIT STRATEGY (CRITICAL):
+- After driver.get(TARGET_URL), MUST wait for page to be fully loaded:
+  WebDriverWait(driver, 10).until(lambda d: d.execute_script('return document.readyState') == 'complete')
+- After any navigation or page change, wait brief moment: time.sleep(1)
+
+2c) ELEMENT FINDER (find_one):
 - IMPORTANT (universal): for nav/menu/dropdown triggers, elements may be present but not "clickable" yet.
-  Your find_one() MUST try element_to_be_clickable first, and if it times out, fall back to presence_of_element_located.
+- Your find_one() MUST:
+  1. Try element_to_be_clickable with SHORT timeout (3s)
+  2. If times out, fall back to presence_of_element_located with LONGER timeout (5s)
+  3. Return None if both fail (let caller handle gracefully)
 
 3) Navigation (IMPORTANT):
 - You MUST navigate using the TARGET_URL constant:
